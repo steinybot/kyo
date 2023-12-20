@@ -1,7 +1,6 @@
 package kyo
 
 import kyo._
-import kyo.concurrent.Joins
 import kyo.concurrent.fibers._
 import kyo.envs._
 import kyo.ios._
@@ -19,7 +18,7 @@ object requests {
 
   type Requests >: Requests.Effects <: Requests.Effects
 
-  object Requests extends Joins[Requests] {
+  object Requests {
 
     type Effects = Envs[Backend] with Fibers
 
@@ -59,16 +58,6 @@ object requests {
           case Right(value) =>
             value
         }
-      }
-
-    def race[T](l: Seq[T < Requests])(implicit f: Flat[T < Requests]): T < Requests =
-      envs.get.map { b =>
-        Fibers.race(l.map(Requests.run(b)(_)))
-      }
-
-    def parallel[T](l: Seq[T < Requests])(implicit f: Flat[T < Requests]): Seq[T] < Requests =
-      envs.get.map { b =>
-        Fibers.parallel(l.map(Requests.run(b)(_)))
       }
   }
 }
