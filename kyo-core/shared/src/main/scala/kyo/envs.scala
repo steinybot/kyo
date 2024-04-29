@@ -19,12 +19,13 @@ object Envs:
         ): T < (Envs[V] & S) =
             self.suspend[V, T, S]((), f)
 
-        def run[T: Flat, S, VS, VR](env: V)(value: T < (Envs[VS] & S))(
+        def run[T, S, VS, VR](env: V)(value: T < (Envs[VS] & S))(
             using
-            HasEnvs[V, VS] { type Remainder = VR },
-            Tag[Envs[V]]
+            ev: HasEnvs[V, VS] { type Remainder = VR },
+            tag: Tag[Envs[V]],
+            flat: Flat[T]
         ): T < (S & VR) =
-            Envs[V].handle(handler[V])(env, value).asInstanceOf[T < (S & VR)]
+            Envs[V].handle(handler[V])(env, value.asInstanceOf[T < (Envs[V] & S & VR)])
 
     end extension
 

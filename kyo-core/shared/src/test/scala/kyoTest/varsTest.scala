@@ -46,6 +46,7 @@ class varsTest extends KyoTest:
                     }
             }
         }
+        succeed
     }
 
     "string value" in {

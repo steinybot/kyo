@@ -12,8 +12,10 @@ class Sums[V] extends Effect[Sums[V]]:
     def add(v: V)(using Tag[Sums[V]]): Unit < Sums[V] =
         this.suspend[Unit](v)
 
-    def run[T: Flat, S](v: T < (Sums[V] & S))(
-        using Tag[Sums[V]]
+    def run[T, S](v: T < (Sums[V] & S))(
+        using
+        Tag[Sums[V]],
+        Flat[T]
     ): (Chunk[V], T) < S =
         this.handle(handler)(Chunks.init, v)
 

@@ -100,8 +100,8 @@ object core:
                                 l: Locals.State
                             ) =
                                 resultLoop(kyo(v, s, l))
-                    case r: Result[T] @unchecked =>
-                        r
+                    case r =>
+                        r.asInstanceOf[Result[T]]
             handleLoop(state, value)
         end handle
     end extension

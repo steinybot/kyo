@@ -34,9 +34,12 @@ class sumsTest extends KyoTest:
                 _ <- Sums[Int].add(1)
                 _ <- Sums[String].add("3")
             yield "a"
-        val res: (Chunk[String], (Chunk[Int], String)) =
-            Sums[String].run(Sums[Int].run(v)).pure
-        assert(res == (Chunks.init("1", "2", "3"), (Chunks.init(3, 2, 1), "a")))
+        // summon[Flat[String < (Sums[Int] & Sums[String])]]
+        val v2: (Chunk[Int], String < (Sums[Int] & Sums[String])) < Any = Sums[Int].run[String < (Sums[Int] & Sums[String]), Any](v)
+        // val res: (Chunk[String], (Chunk[Int], String)) =
+        //     Sums[String].run(Sums[Int].run(v)).pure
+        // assert(res == (Chunks.init("1", "2", "3"), (Chunks.init(3, 2, 1), "a")))
+        ???
     }
 
     "no values" in {

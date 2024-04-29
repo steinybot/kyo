@@ -1,6 +1,6 @@
 import sys.process.*
 
-val scala3Version   = "3.4.1"
+val scala3Version   = "3.3.3"
 val scala212Version = "2.12.19"
 val scala213Version = "2.13.13"
 
@@ -227,8 +227,8 @@ lazy val `kyo-bench` =
             libraryDependencies += "org.typelevel"       %% "log4cats-slf4j"     % "2.6.0",
             libraryDependencies += "dev.zio"             %% "zio-logging"        % "2.2.3",
             libraryDependencies += "dev.zio"             %% "zio-logging-slf4j2" % "2.2.3",
-            libraryDependencies += "dev.zio"             %% "zio"                % "2.1.0-RC3",
-            libraryDependencies += "dev.zio"             %% "zio-concurrent"     % "2.1.0-RC3",
+            libraryDependencies += "dev.zio"             %% "zio"                % "2.0.22",
+            libraryDependencies += "dev.zio"             %% "zio-concurrent"     % "2.0.22",
             libraryDependencies += "dev.zio"             %% "zio-prelude"        % "1.0.0-RC23",
             libraryDependencies += "com.softwaremill.ox" %% "core"               % "0.0.25",
             libraryDependencies += "co.fs2"              %% "fs2-core"           % "3.10.2",

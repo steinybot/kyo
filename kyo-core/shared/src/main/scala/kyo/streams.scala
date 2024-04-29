@@ -289,7 +289,7 @@ object Streams:
         Tag[Streams[V]]
     ): Unit < (Streams[V] & Fibers) =
         ch.take.map {
-            case e if e.equals(Stream.Done) =>
+            case _: Stream.Done =>
                 ()
             case v: Chunk[V] @unchecked =>
                 emitChunkAndThen(v)(emitChannel(ch))
