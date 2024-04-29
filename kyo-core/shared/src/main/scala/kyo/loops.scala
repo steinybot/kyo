@@ -42,8 +42,8 @@ object Loops:
     ): Output < S =
         def _loop(input: Input): Output < S =
             loop(input)
-        def loop(input: Input): Output < S =
-            inline run(input) match
+        @tailrec def loop(input: Input): Output < S =
+            run(input) match
                 case next: Continue[Input] @unchecked =>
                     loop(next.input)
                 case kyo: Kyo[Output | Continue[Input], S] @unchecked =>
@@ -66,8 +66,8 @@ object Loops:
     ): Output < S =
         def _loop(input1: Input1, input2: Input2): Output < S =
             loop(input1, input2)
-        def loop(input1: Input1, input2: Input2): Output < S =
-            inline run(input1, input2) match
+        @tailrec def loop(input1: Input1, input2: Input2): Output < S =
+            run(input1, input2) match
                 case next: Continue2[Input1, Input2] @unchecked =>
                     loop(next.input1, next.input2)
                 case kyo: Kyo[Output | Continue2[Input1, Input2], S] @unchecked =>
@@ -91,8 +91,8 @@ object Loops:
     ): Output < S =
         def _loop(input1: Input1, input2: Input2, input3: Input3): Output < S =
             loop(input1, input2, input3)
-        def loop(input1: Input1, input2: Input2, input3: Input3): Output < S =
-            inline run(input1, input2, input3) match
+        @tailrec def loop(input1: Input1, input2: Input2, input3: Input3): Output < S =
+            run(input1, input2, input3) match
                 case next: Continue3[Input1, Input2, Input3] @unchecked =>
                     loop(next.input1, next.input2, next.input3)
                 case kyo: Kyo[Output | Continue3[Input1, Input2, Input3], S] @unchecked =>
@@ -112,8 +112,8 @@ object Loops:
     ): Output < S =
         def _loop(idx: Int): Output < S =
             loop(idx)
-        def loop(idx: Int): Output < S =
-            inline run(idx) match
+        @tailrec def loop(idx: Int): Output < S =
+            run(idx) match
                 case next: Continue[Unit] @unchecked =>
                     loop(idx + 1)
                 case kyo: Kyo[Output | Continue[Unit], S] @unchecked =>
@@ -135,8 +135,8 @@ object Loops:
     ): Output < S =
         def _loop(idx: Int, input: Input): Output < S =
             loop(idx, input)
-        def loop(idx: Int, input: Input): Output < S =
-            inline run(idx, input) match
+        @tailrec def loop(idx: Int, input: Input): Output < S =
+            run(idx, input) match
                 case next: Continue[Input] @unchecked =>
                     loop(idx + 1, next.input)
                 case kyo: Kyo[Output | Continue[Input], S] @unchecked =>
@@ -159,8 +159,8 @@ object Loops:
     ): Output < S =
         def _loop(idx: Int, input1: Input1, input2: Input2): Output < S =
             loop(idx, input1, input2)
-        def loop(idx: Int, input1: Input1, input2: Input2): Output < S =
-            inline run(idx, input1, input2) match
+        @tailrec def loop(idx: Int, input1: Input1, input2: Input2): Output < S =
+            run(idx, input1, input2) match
                 case next: Continue2[Input1, Input2] @unchecked =>
                     loop(idx + 1, next.input1, next.input2)
                 case kyo: Kyo[Output | Continue2[Input1, Input2], S] @unchecked =>
@@ -184,8 +184,8 @@ object Loops:
     ): Output < S =
         def _loop(idx: Int, input1: Input1, input2: Input2, input3: Input3): Output < S =
             loop(idx, input1, input2, input3)
-        def loop(idx: Int, input1: Input1, input2: Input2, input3: Input3): Output < S =
-            inline run(idx, input1, input2, input3) match
+        @tailrec def loop(idx: Int, input1: Input1, input2: Input2, input3: Input3): Output < S =
+            run(idx, input1, input2, input3) match
                 case next: Continue3[Input1, Input2, Input3] @unchecked =>
                     loop(idx + 1, next.input1, next.input2, next.input3)
                 case kyo: Kyo[Output | Continue3[Input1, Input2, Input3], S] @unchecked =>
@@ -205,8 +205,8 @@ object Loops:
     ): Unit < S =
         def _loop(): Unit < S =
             loop()
-        def loop(): Unit < S =
-            inline run match
+        @tailrec def loop(): Unit < S =
+            run match
                 case next: Continue[Unit] @unchecked =>
                     loop()
                 case kyo: Kyo[Unit | Continue[Unit], S] @unchecked =>

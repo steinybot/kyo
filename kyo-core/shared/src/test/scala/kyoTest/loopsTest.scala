@@ -506,7 +506,7 @@ class loopsTest extends KyoTest:
             var entered = false
             Loops.foreach {
                 entered = true
-                Loops.done(())
+                Loops.done: Loops.Result[Unit, Unit]
             }.pure
             assert(entered)
         }
