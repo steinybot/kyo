@@ -4,6 +4,60 @@ import kyo.core.*
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
+object aborts2:
+    class Aborts[-V] extends Effect[Aborts[V]]:
+        opaque type Command[T] = Left[V, ?]
+        private[Aborts] def command(v: Left[V, ?]): Command[Nothing] = v
+        private[Aborts] def run[T, S](v: T < (Aborts[V] & S))(using ct: ClassTag[V], tag: Tag[Aborts[V]]): Either[V, T] < S =
+            this.handle(handler)(ct, v)
+
+        private val handler =
+            new ResultHandler[ClassTag[V], Const[Left[V, ?]], Aborts[V], [T] =>> Either[V, T], Any]:
+                def done[T](st: ClassTag[V], v: T) = Right(v)
+
+                override def failed(st: ClassTag[V], ex: Throwable)(using tag: Tag[Aborts[V]]) =
+                    ex match
+                        case ex: V => Aborts.fail[V](ex)
+                        case _     => throw ex
+                end failed
+
+                def resume[T, U: Flat, S2](st: ClassTag[V], command: Left[V, ?], k: T => U < (Aborts[V] & S2)) =
+                    command.asInstanceOf[Either[V, U]]
+        end handler
+
+    end Aborts
+
+    object Aborts:
+        private case object aborts extends Aborts[Any]
+        private def aborts[V]: Aborts[V] = aborts.asInstanceOf[Aborts[V]]
+
+        def fail[V](v: V)(using Tag[Aborts[V]]): Nothing < Aborts[V] =
+            val a = aborts[V]
+            a.suspend(a.command(Left(v)))
+
+        def when[V](b: Boolean)(value: => V)(using Tag[Aborts[V]]): Unit < Aborts[V] =
+            if b then fail(value)
+            else ()
+
+        def get[V, T](e: Either[V, T])(using Tag[Aborts[V]]): T < Aborts[V] =
+            e match
+                case Right(v) => v
+                case Left(v)  => fail(v)
+
+        // class RunDsl[V]:
+        //     def apply[V0 <: V, T: Flat, S, VS, VR](v: T < (Aborts[VS] & S))(
+        //         using
+        //         h: HasAborts[V0, VS] { type Remainder = VR },
+        //         ct: ClassTag[V0]
+        //     ): Either[V, T] < (VR & S) =
+        //         DoAbort.handle(handler)(ct, v).asInstanceOf[Either[V, T] < (VR & S)]
+        // end RunDsl
+
+        // def run[V]: RunDsl[V] = RunDsl[V]
+
+    end Aborts
+end aborts2
+
 // Can't use an opaque type because
 // kyo-direct tests crash the compiler.
 type Aborts[-V] //= DoAbort

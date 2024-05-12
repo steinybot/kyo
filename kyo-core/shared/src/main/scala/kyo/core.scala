@@ -61,13 +61,13 @@ object core:
         )(
             state: State,
             value: T < (E & S2)
-        )(using inline tag: Tag[E], inline flat: Flat[T]): Result[T] < (S & S2) =
+        )(using inline effectTag: Tag[E], inline flat: Flat[T]): Result[T] < (S & S2) =
             def _handleLoop(st: State, value: T < (E & S & S2)): Result[T] < (S & S2) =
                 handleLoop(st, value)
             @tailrec def handleLoop(st: State, value: T < (E & S & S2)): Result[T] < (S & S2) =
                 value match
                     case kyo: Suspend[e.Command, Any, T, S2] @unchecked
-                        if tag =:= kyo.tag && handler.accepts(st, kyo.command) =>
+                        if effectTag >:> kyo.tag && handler.accepts(st, kyo.command) =>
                         handler.resume(st, kyo.command, kyo) match
                             case r: handler.Resume[T, S & S2] @unchecked =>
                                 handleLoop(r.st, r.v)
@@ -83,7 +83,7 @@ object core:
                                     try kyo(v, s, l)
                                     catch
                                         case ex if NonFatal(ex) =>
-                                            handler.failed(st, ex)
+                                            handler.failed(st, ex)(using effectTag)
                                 _handleLoop(st, r)
                             end apply
                     case v =>
@@ -132,7 +132,7 @@ object core:
 
         def done[T](st: State, v: T): Result[T] < S
 
-        def failed(st: State, ex: Throwable): Nothing < (E & S) = throw ex
+        def failed(st: State, ex: Throwable)(using Tag[E]): Nothing < (E & S) = throw ex
 
         def resume[T, U: Flat, S2](
             st: State,
