@@ -91,8 +91,9 @@ lazy val `kyo-scheduler` =
             ),
             scalacOptions += "-Xsource:3",
             crossScalaVersions                      := List(scala3Version, scala212Version, scala213Version),
-            libraryDependencies += "org.scalatest" %%% "scalatest"       % "3.2.16" % Test,
-            libraryDependencies += "ch.qos.logback"  % "logback-classic" % "1.5.5"  % Test
+            libraryDependencies += "org.scala-js"  %%% "scala-js-macrotask-executor" % "1.0.0",
+            libraryDependencies += "org.scalatest" %%% "scalatest"                   % "3.2.16" % Test,
+            libraryDependencies += "ch.qos.logback"  % "logback-classic"             % "1.5.5"  % Test
         )
         .jsSettings(`js-settings`)
 
