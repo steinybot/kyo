@@ -19,6 +19,13 @@ class Layer[-Pending, +Resolved, S]:
         Tag[R2]
     ): Layer[P, Resolved & R2, S & S2] =
         ???
+
+    def add[R, P, R2, S2](f: R => R2 < S2)(
+        using
+        Resolved <:< P,
+        Tag[R2]
+    ): Layer[P, Resolved & R2, S & S2] =
+        ???
 end Layer
 
 object Layers:
