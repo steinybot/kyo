@@ -25,6 +25,8 @@ import zio.UIO
 @BenchmarkMode(Array(Mode.Throughput))
 abstract class Bench[T](val expectedResult: T):
 
+    val cores = Runtime.getRuntime().availableProcessors()
+
     lazy val zioRuntime =
         val replaceZioExecutor =
             System.getProperty("replaceZioExecutor", "false") == "true"
