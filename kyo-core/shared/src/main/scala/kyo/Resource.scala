@@ -42,14 +42,16 @@ object Resource:
     object Finalizer:
         sealed abstract class Awaitable extends Finalizer:
             def close(using Frame): Unit < IO
-            def await(using Frame): Unit < Async
+            def await(using Frame): Unit < (Async & Abort[Throwable])
 
         object Awaitable:
             object Unsafe:
                 def init(parallelism: Int)(using frame: Frame, u: AllowUnsafe): Awaitable =
                     new Awaitable:
                         val queue   = Queue.Unbounded.Unsafe.init[Unit < (Async & Abort[Throwable])](Access.MultiProducerSingleConsumer)
-                        val promise = Promise.Unsafe.init[Nothing, Unit]().safe
+                        // TODO: Why do we have this?
+                        // TODO: Why not use Promise.init?
+                        val promise = Promise.Unsafe.init[Nothing, Chunk[Result[Throwable, Unit]]]().safe
 
                         def ensure(v: => Any < (Async & Abort[Throwable]))(using Frame): Unit < IO =
                             IO.Unsafe {
@@ -67,20 +69,27 @@ object Resource:
                             IO.Unsafe {
                                 queue.close() match
                                     case Absent =>
+                                        // TODO: Should this be KyoBug?
                                         Abort.panic(new Closed("Resource finalizer queue already closed.", frame))
                                     case Present(tasks) =>
                                         if tasks.isEmpty then
-                                            promise.completeDiscard(Result.unit)
+                                            promise.completeDiscard(Result(Chunk.empty))
                                         else
-                                            Async.foreachDiscard(tasks, parallelism) { task =>
+                                            Async.foreach(tasks, parallelism) { task =>
                                                 Abort.run[Throwable](task)
-                                                    .map(_.foldError(_ => (), ex => Log.error("Resource finalizer failed", ex.exception)))
                                             }
-                                                .handle(Async.run[Nothing, Unit, Any])
+                                                .handle(Async.run[Nothing, Chunk[Result[Throwable, Unit]], Any])
                                                 .map(promise.becomeDiscard)
                             }
 
-                        def await(using Frame): Unit < Async = promise.get
+                        def await(using Frame): Unit < (Async & Abort[Throwable]) =
+                            promise.get.map { results =>
+                                results.headMaybe.fold(Kyo.unit) {
+                                    case Result.Failure(ex) => Abort.fail(ex)
+                                    case Result.Panic(ex) => Abort.panic(ex)
+                                    case Result.Success(_) => ()
+                                }
+                            }
                 end init
             end Unsafe
         end Awaitable
@@ -138,7 +147,7 @@ object Resource:
       * @return
       *   The result of the effect wrapped in Async and S effects.
       */
-    def run[A, S](v: A < (Resource & S))(using frame: Frame): A < (Async & S) =
+    def run[A, S](v: A < (Resource & S))(using frame: Frame): A < (Async & Abort[Throwable] & S) =
         run(1)(v)
 
     /** Runs a resource-managed effect with specified parallelism for cleanup.
@@ -156,7 +165,7 @@ object Resource:
       * @return
       *   The result of the effect wrapped in Async and S effects.
       */
-    def run[A, S](closeParallelism: Int)(v: A < (Resource & S))(using frame: Frame): A < (Async & S) =
+    def run[A, S](closeParallelism: Int)(v: A < (Resource & S))(using frame: Frame): A < (Async & Abort[Throwable] & S) =
         IO.Unsafe {
             val finalizer = Finalizer.Awaitable.Unsafe.init(closeParallelism)
             ContextEffect.handle(Tag[Resource], finalizer, _ => finalizer)(v)

@@ -227,27 +227,33 @@ class ResourceTest extends Test:
         "release fails" taggedAs jvmOnly in run {
             var acquired = false
             var released = false
+            val ex = TestException
             val io = Resource.acquireRelease(IO { acquired = true; "resource" }) { _ =>
                 IO {
                     released = true
-                    throw TestException
+                    throw ex
                 }
             }
             Resource.run(io)
                 .handle(
                     Async.runAndBlock(timeout),
                     Abort.run
-                ).map { _ =>
+                ).map { result =>
                     assert(acquired && released)
+                    assert(result.failure.get == ex)
                 }
         }
 
         "ensure fails" in run {
             var ensureCalled = false
-            val io           = Resource.ensure(IO { ensureCalled = true; throw TestException })
+            val ex = TestException
+            val io           = Resource.ensure(IO { ensureCalled = true; throw ex })
             Resource.run(io)
-                .map(_ => assert(ensureCalled))
-
+                .handle(Abort.run)
+                .map { result =>
+                    assert(ensureCalled)
+                    assert(result.failure.get == ex)
+                }
         }
 
         "fiber escapes the scope of Resource.run" in run {

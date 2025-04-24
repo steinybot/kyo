@@ -253,7 +253,7 @@ class AsyncTest extends Test:
         def loop(ref: AtomicInt): Unit < Async =
             ref.incrementAndGet.map(_ => loop(ref))
 
-        def task(started: Latch, done: Latch): Unit < Async =
+        def task(started: Latch, done: Latch): Unit < (Async & Abort[Throwable]) =
             Resource.run {
                 Resource.ensure(done.release).map { _ =>
                     started.release.andThen(AtomicInt.init(0).map(loop))
@@ -312,7 +312,7 @@ class AsyncTest extends Test:
         "mixed" in run {
             val resource1 = new TestResource
             val resource2 = new TestResource
-            val io1: Set[Int] < (Resource & Async) =
+            val io1: Set[Int] < (Resource & Async & Abort[Throwable]) =
                 for
                     r  <- Resource.acquire(resource1)
                     v1 <- IO(r.incrementAndGet())
