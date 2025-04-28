@@ -341,7 +341,7 @@ sealed abstract class Stream[V, -S] extends Serializable:
 
     def filter(f: V => Boolean)(using
         tag: Tag[Emit[Chunk[V]]],
-        discr: Flat[Boolean],
+        discr: Stream.Dummy,
         frame: Frame
     ): Stream[V, S] =
         Stream[V, S](ArrowEffect.handleState(tag, (), emit)(
@@ -720,6 +720,10 @@ object Stream:
                         end if
                     }
                 }
+
+    // TODO: Name?
+    def embed[V, S1, S2](stream: Stream[V, S1] < S2)(using Frame): Stream[V, S1 & S2] =
+        Stream(stream.map(_.emit))
 
     /** A dummy type that can be used as implicit evidence to help the compiler discriminate between overloaded methods.
       */

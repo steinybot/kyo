@@ -3,14 +3,15 @@ import org.scalajs.jsenv.nodejs.*
 import org.typelevel.scalacoptions.ScalacOption
 import org.typelevel.scalacoptions.ScalacOptions
 import org.typelevel.scalacoptions.ScalaVersion
+import protocbridge.Target
 import sbtdynver.DynVerPlugin.autoImport.*
 
 val scala3Version   = "3.6.4"
 val scala212Version = "2.12.20"
-val scala213Version = "2.13.15"
+val scala213Version = "2.13.16"
 
-val zioVersion       = "2.1.14"
-val catsVersion      = "3.5.7"
+val zioVersion       = "2.1.17"
+val catsVersion      = "3.6.1"
 val scalaTestVersion = "3.2.19"
 
 val compilerOptionFailDiscard = "-Wconf:msg=(unused.*value|discarded.*value|pure.*statement):error"
@@ -56,16 +57,17 @@ lazy val `kyo-settings` = Seq(
     crossScalaVersions := List(scala3Version),
     scalacOptions ++= scalacOptionTokens(compilerOptions).value,
     Test / scalacOptions --= scalacOptionTokens(Set(ScalacOptions.warnNonUnitStatement)).value,
-    scalafmtOnCompile := true,
+//    scalafmtOnCompile := true,
+    scalafmtOnCompile := false,
     scalacOptions += compilerOptionFailDiscard,
     Test / testOptions += Tests.Argument("-oDG"),
     ThisBuild / versionScheme               := Some("early-semver"),
     libraryDependencies += "org.scalatest" %%% "scalatest" % scalaTestVersion % Test,
     Test / javaOptions += "--add-opens=java.base/java.lang=ALL-UNNAMED",
-    Test / forkOptions := (Test / forkOptions).value
-        .withOutputStrategy(
-            OutputStrategy.CustomOutput(java.io.OutputStream.nullOutputStream)
-        )
+//    Test / forkOptions := (Test / forkOptions).value
+//        .withOutputStrategy(
+//            OutputStrategy.CustomOutput(java.io.OutputStream.nullOutputStream)
+//        )
 )
 
 Global / onLoad := {
@@ -95,7 +97,10 @@ lazy val kyoJVM = project
     .in(file("."))
     .settings(
         name := "kyoJVM",
-        `kyo-settings`
+        `kyo-settings`,
+        commands += Command.command("testOnlyUntilFailed") { state =>
+            "kyo-grpc/testOnly kyo.grpc.ServiceTest -- -z \"FOO\"" :: "testOnlyUntilFailed" :: state
+        }
     )
     .disablePlugins(MimaPlugin)
     .aggregate(
@@ -126,8 +131,8 @@ lazy val kyoJVM = project
         `kyo-combinators`.jvm,
         `kyo-playwright`.jvm,
         `kyo-examples`.jvm,
-        `kyo-monix`.jvm,
-        `kyo-actor`.jvm
+        `kyo-actor`.jvm,
+        `kyo-grpc`.jvm
     )
 
 lazy val kyoJS = project
@@ -151,7 +156,8 @@ lazy val kyoJS = project
         `kyo-zio`.js,
         `kyo-cats`.js,
         `kyo-combinators`.js,
-        `kyo-actor`.js
+        `kyo-actor`.js,
+	`kyo-grpc`.js
     )
 
 lazy val kyoNative = project
@@ -185,7 +191,7 @@ lazy val `kyo-scheduler` =
             `kyo-settings`,
             scalacOptions ++= scalacOptionToken(ScalacOptions.source3).value,
             crossScalaVersions                     := List(scala3Version, scala212Version, scala213Version),
-            libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.5.16" % Test
+            libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.5.18" % Test
         )
         .jvmSettings(mimaCheck(false))
         .nativeSettings(
@@ -285,7 +291,7 @@ lazy val `kyo-data` =
         .settings(
             `kyo-settings`,
             libraryDependencies += "com.lihaoyi" %%% "pprint"        % "0.9.0",
-            libraryDependencies += "dev.zio"     %%% "izumi-reflect" % "2.3.10" % Test
+            libraryDependencies += "dev.zio"     %%% "izumi-reflect" % "3.0.2" % Test
         )
         .jvmSettings(mimaCheck(false))
         .nativeSettings(`native-settings`)
@@ -314,7 +320,7 @@ lazy val `kyo-prelude` =
         .in(file("kyo-prelude"))
         .settings(
             `kyo-settings`,
-            libraryDependencies += "dev.zio" %%% "zio-laws-laws" % "1.0.0-RC36" % Test,
+            libraryDependencies += "dev.zio" %%% "zio-laws-laws" % "1.0.0-RC39" % Test,
             libraryDependencies += "dev.zio" %%% "zio-test-sbt"  % zioVersion   % Test
         )
         .jvmSettings(mimaCheck(false))
@@ -330,10 +336,9 @@ lazy val `kyo-core` =
         .in(file("kyo-core"))
         .settings(
             `kyo-settings`,
-            libraryDependencies += "org.jctools"    % "jctools-core"    % "4.0.5",
-            libraryDependencies += "org.slf4j"      % "slf4j-api"       % "2.0.16",
+            libraryDependencies += "org.slf4j"      % "slf4j-api"       % "2.0.17",
             libraryDependencies += "dev.dirs"       % "directories"     % "26",
-            libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.5.16" % Test
+            libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.5.18" % Test
         )
         .jvmSettings(mimaCheck(false))
         .nativeSettings(`native-settings`)
@@ -363,7 +368,7 @@ lazy val `kyo-direct` =
         .dependsOn(`kyo-core`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "com.github.rssh" %%% "dotty-cps-async" % "0.9.23"
+            libraryDependencies += "io.github.dotty-cps-async" %%% "dotty-cps-async" % "1.0.0"
         )
         .jvmSettings(mimaCheck(false))
         .nativeSettings(`native-settings`)
@@ -414,8 +419,8 @@ lazy val `kyo-stats-otel` =
         .dependsOn(`kyo-core`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "io.opentelemetry" % "opentelemetry-api"                % "1.46.0",
-            libraryDependencies += "io.opentelemetry" % "opentelemetry-sdk"                % "1.46.0" % Test,
+            libraryDependencies += "io.opentelemetry" % "opentelemetry-api"                % "1.49.0",
+            libraryDependencies += "io.opentelemetry" % "opentelemetry-sdk"                % "1.49.0" % Test,
             libraryDependencies += "io.opentelemetry" % "opentelemetry-exporters-inmemory" % "0.9.1"  % Test
         )
         .jvmSettings(mimaCheck(false))
@@ -428,7 +433,7 @@ lazy val `kyo-cache` =
         .dependsOn(`kyo-core`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "com.github.ben-manes.caffeine" % "caffeine" % "3.1.8"
+            libraryDependencies += "com.github.ben-manes.caffeine" % "caffeine" % "3.2.0"
         )
         .jvmSettings(mimaCheck(false))
 
@@ -472,7 +477,7 @@ lazy val `kyo-sttp` =
         .dependsOn(`kyo-core`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "com.softwaremill.sttp.client3" %%% "core" % "3.10.2"
+            libraryDependencies += "com.softwaremill.sttp.client3" %%% "core" % "3.11.0"
         )
         .jsSettings(`js-settings`)
         .nativeSettings(`native-settings`)
@@ -487,8 +492,8 @@ lazy val `kyo-tapir` =
         .dependsOn(`kyo-sttp`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-core"         % "1.11.12",
-            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-netty-server" % "1.11.12"
+            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-core"         % "1.11.25",
+            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-netty-server" % "1.11.25"
         )
         .jvmSettings(mimaCheck(false))
 
@@ -504,8 +509,8 @@ lazy val `kyo-caliban` =
         .dependsOn(`kyo-sttp`)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "com.github.ghostdogpr" %% "caliban"       % "2.9.1",
-            libraryDependencies += "com.github.ghostdogpr" %% "caliban-tapir" % "2.9.1"
+            libraryDependencies += "com.github.ghostdogpr" %% "caliban"       % "2.10.0",
+            libraryDependencies += "com.github.ghostdogpr" %% "caliban-tapir" % "2.10.0"
         )
         .jvmSettings(mimaCheck(false))
 
@@ -554,20 +559,132 @@ lazy val `kyo-cats` =
         )
         .jsSettings(
             `js-settings`
-        )
-        .jvmSettings(mimaCheck(false))
+        ).jvmSettings(mimaCheck(false))
 
-lazy val `kyo-monix` =
-    crossProject(JVMPlatform)
+lazy val `kyo-grpc` =
+    crossProject(JVMPlatform, JSPlatform)
+        .withoutSuffixFor(JVMPlatform)
+        .settings(
+            crossScalaVersions := Seq.empty,
+            publishArtifact    := false,
+            publish            := {},
+            publishLocal       := {}
+        )
+        .aggregate(
+            `kyo-grpc-core`,
+            `kyo-grpc-code-gen`,
+            `kyo-grpc-e2e`
+        )
+
+lazy val `kyo-grpc-jvm` =
+    `kyo-grpc`
+        .jvm
+        .aggregate(`protoc-gen-kyo-grpc`.componentProjects.map(p => p: ProjectReference) *)
+
+// TODO: Split this into client and server
+lazy val `kyo-grpc-core` =
+    crossProject(JVMPlatform, JSPlatform)
         .withoutSuffixFor(JVMPlatform)
         .crossType(CrossType.Full)
-        .in(file("kyo-monix"))
+        .in(file("kyo-grpc") / "core")
         .dependsOn(`kyo-core`)
+        .settings(`kyo-settings`)
+        .settings(
+            libraryDependencies += "org.scalamock" %% "scalamock" % "7.3.0" % Test
+        )
+        .jvmSettings(
+            libraryDependencies ++= Seq(
+                "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % scalapb.compiler.Version.scalapbVersion,
+                "io.grpc"               % "grpc-api"             % "1.64.0",
+                // It is a little unusual to include this here but it greatly reduces the amount of generated code.
+                "io.grpc" % "grpc-stub" % "1.64.0",
+                "ch.qos.logback" % "logback-classic" % "1.5.18" % Test
+            )
+        ).jsSettings(
+            `js-settings`,
+            libraryDependencies ++= Seq( //
+                "com.thesamet.scalapb.grpcweb" %%% "scalapb-grpcweb" % "0.7.0")
+        )
+
+// TODO: Split this into shared, client, and server
+// TODO: Do we need code gen for JS?
+lazy val `kyo-grpc-code-gen` =
+    crossProject(JVMPlatform, JSPlatform)
+        .withoutSuffixFor(JVMPlatform)
+        .crossType(CrossType.Full)
+        .in(file("kyo-grpc") / "code-gen")
+        .enablePlugins(BuildInfoPlugin)
         .settings(
             `kyo-settings`,
-            libraryDependencies += "io.monix" %% "monix" % "3.4.1"
+            buildInfoKeys := Seq[BuildInfoKey](name, organization, version, scalaVersion, sbtVersion),
+            // TODO: What package to use here?
+            buildInfoPackage := "kyo.grpc.compiler",
+            // TODO: Which versions should this be for?
+            crossScalaVersions := List(scala212Version, scala213Version, scala3Version),
+            scalacOptions ++= scalacOptionToken(ScalacOptions.source3).value,
+            libraryDependencies ++= Seq(
+                "com.thesamet.scalapb"    %% "compilerplugin"          % scalapb.compiler.Version.scalapbVersion,
+                "org.scala-lang.modules" %%% "scala-collection-compat" % "2.12.0",
+                "org.typelevel"          %%% "paiges-core"             % "0.4.3"
+            )
+        ).jsSettings(
+            `js-settings`
         )
-        .jvmSettings(mimaCheck(false))
+
+lazy val `kyo-grpc-code-gen_2.12` =
+    `kyo-grpc-code-gen`
+        .jvm
+        .settings(scalaVersion := scala212Version)
+
+lazy val `kyo-grpc-code-genJS_2.12` =
+    `kyo-grpc-code-gen`
+        .js
+        .settings(scalaVersion := scala212Version)
+
+// TODO: Why this name?
+// TODO: Can these meta projects be in the sub directory?
+lazy val `protoc-gen-kyo-grpc` =
+    protocGenProject("protoc-gen-kyo-grpc", `kyo-grpc-code-gen_2.12`)
+        .settings(
+            `kyo-settings`,
+            scalaVersion       := scala212Version,
+            crossScalaVersions := Seq(scala212Version),
+            // TODO: Does it not auto-discover it?
+            Compile / mainClass := Some("kyo.grpc.compiler.CodeGenerator")
+        )
+        .aggregateProjectSettings(
+            scalaVersion       := scala212Version,
+            crossScalaVersions := Seq(scala212Version)
+        )
+
+lazy val `kyo-grpc-e2e` =
+    crossProject(JVMPlatform, JSPlatform)
+        .withoutSuffixFor(JVMPlatform)
+        .crossType(CrossType.Full)
+        .in(file("kyo-grpc") / "e2e")
+        .enablePlugins(LocalCodeGenPlugin)
+        .dependsOn(`kyo-grpc-core`)
+        .settings(
+            `kyo-settings`,
+            publish / skip := true,
+            Compile / PB.protoSources += sharedSourceDir("main").value / "protobuf",
+            Compile / PB.targets := Seq(
+                scalapb.gen() -> (Compile / sourceManaged).value / "scalapb",
+                // TODO: Make this nicer. Like scalapb.zio_grpc.ZioCodeGenerator.
+                genModule("kyo.grpc.compiler.CodeGenerator$") -> (Compile / sourceManaged).value / "scalapb"
+            ),
+            Compile / scalacOptions ++= scalacOptionToken(ScalacOptions.warnOption("conf:src=.*/src_managed/main/scalapb/kgrpc/.*:silent")).value
+        ).jvmSettings(
+            codeGenClasspath := (`kyo-grpc-code-gen_2.12` / Compile / fullClasspath).value,
+            libraryDependencies ++= Seq(
+                "io.grpc" % "grpc-netty-shaded" % "1.64.0",
+                "ch.qos.logback" % "logback-classic" % "1.5.18" % Test
+            )
+        ).jsSettings(
+            `js-settings`,
+            codeGenClasspath := (`kyo-grpc-code-genJS_2.12` / Compile / fullClasspath).value,
+            libraryDependencies += "com.thesamet.scalapb.grpcweb" %%% "scalapb-grpcweb" % "0.7.0"
+        )
 
 lazy val `kyo-combinators` =
     crossProject(JSPlatform, JVMPlatform, NativePlatform)
@@ -611,7 +728,7 @@ lazy val `kyo-examples` =
                 "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
             ),
             Compile / doc / sources                              := Seq.empty,
-            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-json-zio" % "1.11.12"
+            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-json-zio" % "1.11.25"
         )
         .jvmSettings(mimaCheck(false))
 
@@ -620,15 +737,31 @@ lazy val `kyo-bench` =
         .withoutSuffixFor(JVMPlatform)
         .crossType(CrossType.Pure)
         .in(file("kyo-bench"))
-        .enablePlugins(JmhPlugin)
-        .dependsOn(`kyo-core`)
-        .dependsOn(`kyo-sttp`)
-        .dependsOn(`kyo-stm`)
-        .dependsOn(`kyo-scheduler-zio`)
-        .dependsOn(`kyo-scheduler-cats`)
+        .enablePlugins(Fs2Grpc, JmhPlugin, LocalCodeGenPlugin)
+        .dependsOn(
+            `kyo-core`,
+            `kyo-grpc-core`,
+            `kyo-scheduler-cats`,
+            `kyo-scheduler-zio`,
+            `kyo-stm`,
+            `kyo-sttp`
+        )
         .disablePlugins(MimaPlugin)
         .settings(
             `kyo-settings`,
+            publish / skip := true,
+            Compile / PB.protoSources += baseDirectory.value.getParentFile / "src" / "main" / "protobuf",
+            Compile / PB.targets := {
+                val scalapbDir = (Compile / sourceManaged).value / "scalapb"
+                // This includes the base scalapb.gen.
+                val catsGen = Fs2GrpcPlugin.autoImport.scalapbCodeGenerators.value
+                catsGen ++ Seq[Target](
+                    scalapb.zio_grpc.ZioCodeGenerator             -> scalapbDir,
+                    genModule("kyo.grpc.compiler.CodeGenerator$") -> scalapbDir
+                )
+            },
+            codeGenClasspath          := (`kyo-grpc-code-gen_2.12` / Compile / fullClasspath).value,
+            Compile / scalacOptions ++= scalacOptionToken(ScalacOptions.warnOption("conf:src=.*/src_managed/main/scalapb/kgrpc/.*:silent")).value,
             Test / testForkedParallel := true,
             // Forks each test suite individually
             Test / testGrouping := {
@@ -652,26 +785,27 @@ lazy val `kyo-bench` =
                     )
                 }
             },
-            libraryDependencies += "dev.zio"              %% "izumi-reflect"       % "2.3.10",
+            libraryDependencies += "dev.zio"              %% "izumi-reflect"       % "3.0.2",
             libraryDependencies += "org.typelevel"        %% "cats-effect"         % catsVersion,
             libraryDependencies += "org.typelevel"        %% "log4cats-core"       % "2.7.0",
             libraryDependencies += "org.typelevel"        %% "log4cats-slf4j"      % "2.7.0",
             libraryDependencies += "org.typelevel"        %% "cats-mtl"            % "1.5.0",
-            libraryDependencies += "org.typelevel"        %% "cats-mtl"            % "1.5.0",
             libraryDependencies += "io.github.timwspence" %% "cats-stm"            % "0.13.5",
             libraryDependencies += "com.47deg"            %% "fetch"               % "3.1.2",
-            libraryDependencies += "dev.zio"              %% "zio-logging"         % "2.4.0",
-            libraryDependencies += "dev.zio"              %% "zio-logging-slf4j2"  % "2.4.0",
+            libraryDependencies += "dev.zio"              %% "zio-logging"         % "2.5.0",
+            libraryDependencies += "dev.zio"              %% "zio-logging-slf4j2"  % "2.5.0",
             libraryDependencies += "dev.zio"              %% "zio"                 % zioVersion,
             libraryDependencies += "dev.zio"              %% "zio-concurrent"      % zioVersion,
-            libraryDependencies += "dev.zio"              %% "zio-query"           % "0.7.6",
-            libraryDependencies += "dev.zio"              %% "zio-prelude"         % "1.0.0-RC36",
-            libraryDependencies += "co.fs2"               %% "fs2-core"            % "3.11.0",
-            libraryDependencies += "org.http4s"           %% "http4s-ember-client" % "0.23.30",
-            libraryDependencies += "org.http4s"           %% "http4s-dsl"          % "0.23.30",
-            libraryDependencies += "dev.zio"              %% "zio-http"            % "3.0.1",
-            libraryDependencies += "io.vertx"              % "vertx-core"          % "5.0.0.CR3",
-            libraryDependencies += "io.vertx"              % "vertx-web"           % "5.0.0.CR3"
+            libraryDependencies += "dev.zio"              %% "zio-query"           % "0.7.7",
+            libraryDependencies += "dev.zio"              %% "zio-prelude"         % "1.0.0-RC39",
+            libraryDependencies += "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % scalapb.compiler.Version.scalapbVersion,
+            libraryDependencies += "co.fs2"               %% "fs2-core"            % "3.12.0",
+            libraryDependencies += "org.http4s"           %% "http4s-ember-client" % "1.0.0-M44",
+            libraryDependencies += "org.http4s"           %% "http4s-dsl"          % "1.0.0-M44",
+            libraryDependencies += "dev.zio"              %% "zio-http"            % "3.2.0",
+            libraryDependencies += "io.grpc"               % "grpc-netty-shaded"   % "1.64.0",
+            libraryDependencies += "io.vertx"              % "vertx-core"          % "5.0.0.CR6",
+            libraryDependencies += "io.vertx"              % "vertx-web"           % "5.0.0.CR6"
         )
 
 lazy val rewriteReadmeFile = taskKey[Unit]("Rewrite README file")
@@ -684,6 +818,7 @@ lazy val readme =
         .crossType(CrossType.Full)
         .in(file("target/readme"))
         .enablePlugins(MdocPlugin)
+        .disablePlugins(ProtocPlugin)
         .settings(
             `kyo-settings`,
             mdocIn  := new File("./../../README-in.md"),
@@ -708,9 +843,6 @@ lazy val readme =
             `kyo-cats`,
             `kyo-caliban`,
             `kyo-combinators`
-        )
-        .settings(
-            libraryDependencies += "com.softwaremill.sttp.tapir" %% "tapir-json-zio" % "1.10.7"
         )
 
 lazy val `native-settings` = Seq(
@@ -743,3 +875,7 @@ def mimaCheck(failOnProblem: Boolean) =
         mimaBinaryIssueFilters ++= Seq(),
         mimaFailOnProblem := failOnProblem
     )
+
+def sharedSourceDir(conf: String) = Def.setting {
+    CrossType.Full.sharedSrcDir(baseDirectory.value, conf).get.getParentFile
+}
