@@ -1,0 +1,69 @@
+package kgrpc.test
+
+trait UtilityService extends _root_.kyo.grpc.Service {
+  
+  override def definition: _root_.io.grpc.ServerServiceDefinition = UtilityService.service(this)
+  
+  def health(
+    request: kgrpc.test.Request
+  ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcResponse]
+  def monitor(
+    request: kgrpc.test.Request
+  ): _root_.kyo.<[_root_.kyo.Stream[kgrpc.test.Response, _root_.kyo.grpc.GrpcResponse], _root_.kyo.grpc.GrpcResponse]
+  def batch(
+    requests: _root_.kyo.Stream[kgrpc.test.Request, _root_.kyo.grpc.GrpcRequest]
+  ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcResponse]
+}
+
+object UtilityService {
+  
+  def service(serviceImpl: UtilityService): _root_.io.grpc.ServerServiceDefinition = {
+    _root_.io.grpc.ServerServiceDefinition.builder(_root_.kgrpc.test.UtilityServiceGrpc.SERVICE)
+    .addMethod(
+      _root_.kgrpc.test.UtilityServiceGrpc.METHOD_HEALTH,
+      _root_.kyo.grpc.ServerHandler.unary(serviceImpl.health)
+    )
+    .addMethod(
+      _root_.kgrpc.test.UtilityServiceGrpc.METHOD_MONITOR,
+      _root_.kyo.grpc.ServerHandler.serverStreaming(serviceImpl.monitor)
+    )
+    .addMethod(
+      _root_.kgrpc.test.UtilityServiceGrpc.METHOD_BATCH,
+      _root_.kyo.grpc.ServerHandler.clientStreaming(serviceImpl.batch)
+    )
+    .build()
+  }
+  
+  def client(
+    channel: _root_.io.grpc.Channel,
+    options: _root_.io.grpc.CallOptions = _root_.io.grpc.CallOptions.DEFAULT
+  ): Client = ClientImpl(channel, options)
+  
+  trait Client {
+    def health(
+      request: kgrpc.test.Request
+    ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest]
+    def monitor(
+      request: kgrpc.test.Request
+    ): _root_.kyo.Stream[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest]
+    def batch(
+      requests: _root_.kyo.Stream[kgrpc.test.Request, _root_.kyo.grpc.GrpcRequest]
+    ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest]
+  }
+  
+  class ClientImpl(channel: _root_.io.grpc.Channel, options: _root_.io.grpc.CallOptions)
+      extends Client {
+    override def health(
+      request: kgrpc.test.Request
+    ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest] =
+      _root_.kyo.grpc.ClientCall.unary(channel, _root_.kgrpc.test.UtilityServiceGrpc.METHOD_HEALTH, options, request)
+    override def monitor(
+      request: kgrpc.test.Request
+    ): _root_.kyo.Stream[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest] =
+      _root_.kyo.grpc.ClientCall.serverStreaming(channel, _root_.kgrpc.test.UtilityServiceGrpc.METHOD_MONITOR, options, request)
+    override def batch(
+      requests: _root_.kyo.Stream[kgrpc.test.Request, _root_.kyo.grpc.GrpcRequest]
+    ): _root_.kyo.<[kgrpc.test.Response, _root_.kyo.grpc.GrpcRequest] =
+      _root_.kyo.grpc.ClientCall.clientStreaming(channel, _root_.kgrpc.test.UtilityServiceGrpc.METHOD_BATCH, options, requests)
+  }
+}
