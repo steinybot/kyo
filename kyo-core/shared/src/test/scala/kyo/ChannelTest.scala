@@ -420,30 +420,6 @@ class ChannelTest extends Test:
         "race with close and zero capacity" in run {
             verifyRaceDrainWithClose(0, _.drainUpTo(Int.MaxValue), _.close)
         }
-        "keeps remainder of batch in order" in run {
-            for
-                c  <- Channel.init[Int](4)
-                _  <- Async.run(c.putBatch(1 to 4))
-                _  <- Async.run(c.putBatch(5 to 8))
-                t1 <- c.take
-                r1 <- c.drainUpTo(2)
-                t2 <- c.take
-                t3 <- c.take
-                r2 <- c.drain
-            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8))
-        }
-        "keeps remainder of batch in order - zero capacity" in run {
-            for
-                c  <- Channel.init[Int](0)
-                _  <- Async.run(c.putBatch(1 to 4))
-                _  <- Async.run(c.putBatch(5 to 8))
-                t1 <- c.take
-                r1 <- c.drainUpTo(2)
-                t2 <- c.take
-                t3 <- c.take
-                r2 <- c.drain
-            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8))
-        }
     }
     "close" - {
         "empty" in run {
@@ -777,6 +753,69 @@ class ChannelTest extends Test:
                 .andThen(succeed)
         }
 
+        "putBatch and drainUpTo" in run {
+            (for
+                c  <- Channel.init[Int](10)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- IO(Thread.sleep(100))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                _  <- IO(Thread.sleep(100))
+                r1 <- c.drainUpTo(2)
+                t2 <- c.take
+                t3 <- c.take
+                r2 <- c.drain
+            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8)))
+                .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                .andThen(succeed)
+        }
+
+        "putBatch and drainUpTo - zero capacity" in run {
+            (for
+                c  <- Channel.init[Int](0)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- IO(Thread.sleep(100))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                _  <- IO(Thread.sleep(100))
+                r1 <- c.drainUpTo(2)
+                t2 <- c.take
+                t3 <- c.take
+                r2 <- c.drain
+            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8)))
+                .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                .andThen(succeed)
+        }
+
+        "putBatch and poll" in run {
+            (for
+                c  <- Channel.init[Int](10)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- IO(Thread.sleep(100))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                _  <- IO(Thread.sleep(100))
+                p1 <- c.poll
+                t2 <- c.takeExactly(6)
+            yield assert(t1 == 1 && p1 == Maybe(2) && t2 == (3 to 8)))
+                .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                .andThen(succeed)
+        }
+
+        "putBatch and poll - zero capacity" in run {
+            (for
+                c  <- Channel.init[Int](0)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- IO(Thread.sleep(100))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                _  <- IO(Thread.sleep(100))
+                p1 <- c.poll
+                t2 <- c.takeExactly(6)
+            yield assert(t1 == 1 && p1 == Maybe(2) && t2 == (3 to 8)))
+                .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                .andThen(succeed)
+        }
     }
 
     "stream" - {
