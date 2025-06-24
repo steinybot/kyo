@@ -420,6 +420,30 @@ class ChannelTest extends Test:
         "race with close and zero capacity" in run {
             verifyRaceDrainWithClose(0, _.drainUpTo(Int.MaxValue), _.close)
         }
+        "keeps remainder of batch in order" in run {
+            for
+                c  <- Channel.init[Int](4)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                r1 <- c.drainUpTo(2)
+                t2 <- c.take
+                t3 <- c.take
+                r2 <- c.drain
+            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8))
+        }
+        "keeps remainder of batch in order - zero capacity" in run {
+            for
+                c  <- Channel.init[Int](0)
+                _  <- Async.run(c.putBatch(1 to 4))
+                _  <- Async.run(c.putBatch(5 to 8))
+                t1 <- c.take
+                r1 <- c.drainUpTo(2)
+                t2 <- c.take
+                t3 <- c.take
+                r2 <- c.drain
+            yield assert(t1 == 1 && r1 == (2 to 3) && t2 == 4 && t3 == 5 && r2 == (6 to 8))
+        }
     }
     "close" - {
         "empty" in run {
