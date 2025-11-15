@@ -695,6 +695,16 @@ class AbortTest extends Test:
                     val r = Abort.run(Abort.catching(throw new RuntimeException)).eval
                     assert(r.isPanic)
                 }
+                "Panic" in pendingUntilFixed {
+                    class Distinct1 extends Throwable derives CanEqual
+
+                    val d1: Distinct1                 = new Distinct1
+                    val a: Boolean < Abort[Distinct1] = Abort.catching[Distinct1](Abort.panic(d1)).andThen(true)
+                    val r: Result[Distinct1, Boolean] = Abort.run(a).eval
+
+                    assert(r == Result.fail(d1))
+                    ()
+                }
             }
             "with other effect" - {
                 def test(v: Int < Env[Int]): Int < Env[Int] =
@@ -955,7 +965,7 @@ class AbortTest extends Test:
 
     "Abort.run with parametrized type" in pendingUntilFixed {
         class Test[A]
-        assertCompiles("Abort.run(Abort.fail(new Test[Int]))")
+        typeCheck("Abort.run(Abort.fail(new Test[Int]))")
     }
 
     "Abort.run with type unions" - {
@@ -1081,7 +1091,7 @@ class AbortTest extends Test:
             "removes Abort from the effect set" in {
                 val computation = Abort.fail(CustomError("Expected error"))
                 val recovered   = Abort.recover[CustomError](_ => 42, _ => -1)(computation)
-                assertCompiles("val _: Int < Any = recovered")
+                typeCheck("val _: Int < Any = recovered")
             }
         }
 

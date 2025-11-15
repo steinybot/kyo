@@ -219,20 +219,50 @@ object Channel:
         /** Closes the channel and asynchronously waits until it's empty.
           *
           * This method closes the channel to new elements and returns a computation that completes when all elements have been consumed.
-          * Unlike the regular `close` method, this allows consumers to process all remaining elements before considering the channel fully
-          * closed.
+          * Unlike the regular [[close]] method, this allows consumers to process all remaining elements before considering the channel
+          * fully closed.
           *
           * @return
-          *   true if the channel was successfully closed and emptied, false if it was already closed
+          *   `true` if the channel was successfully closed and emptied, `false` if it was already closed
           */
         def closeAwaitEmpty(using Frame): Boolean < Async = Sync.Unsafe(self.closeAwaitEmpty().safe.get)
 
-        /** Checks if the channel is closed.
+        // TODO: I think this can be removed now.
+        /** Closes the channel and returns the [[Fiber]] waits until it's empty.
+          *
+          * This method closes the channel to new elements and returns a `Fiber` that completes when all elements have been consumed. Unlike
+          * the regular [[close]] method, this allows consumers to process all remaining elements before considering the channel fully
+          * closed.
+          *
+          * This differs from [[closeAwaitEmpty]] in that once the `Fiber` has been obtained it guarantees to have begun closing the channel
+          * and future offers to the channel will abort with [[Closed]] even if the channel is not yet completely closed. On the other hand,
+          * when handling the `Async` effect from `closeAwaitEmpty` the `Fiber` it returns may not have started closing the channel yet.
           *
           * @return
-          *   true if the channel is closed, false otherwise
+          *   a `Fiber` that completes with `true` if the channel was successfully closed and emptied, `false` if it was already closed
+          */
+        def closeAwaitEmptyFiber(using Frame): Fiber[Boolean, Any] < Sync = Sync.Unsafe(self.closeAwaitEmpty().safe)
+
+        /** Checks if the channel is closed.
+          *
+          * A channel is considered closed if it has fully closed, i.e. it is not open and it is empty.
+          *
+          * This will always be `true` after [[close]]. In the case of [[closeAwaitEmpty]] and [[closeAwaitEmptyFiber]], it will only be
+          * `true` once the channel has been emptied.
+          *
+          * @return
+          *   `true` if the channel is closed, `false` otherwise
           */
         def closed(using Frame): Boolean < Sync = Sync.Unsafe(self.closed())
+
+        /** Checks if the channel is open.
+          *
+          * A channel is considered open if it has not begun closing, and it may still accept new elements (although it might be full).
+          *
+          * @return
+          *   `true` if the channel is open, `false` otherwise
+          */
+        def open(using Frame): Boolean < Sync = Sync.Unsafe(self.open())
 
         /** Checks if the channel is empty.
           *
@@ -318,7 +348,7 @@ object Channel:
       * @warning
       *   The actual capacity may be larger than the specified capacity due to rounding.
       */
-    def init[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Channel[A] < Sync =
+    def init[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Channel[A] < (Sync & Scope) =
         initWith[A](capacity, access)(identity)
 
     /** Uses a new Channel with the provided configuration.
@@ -329,8 +359,60 @@ object Channel:
       */
     inline def initWith[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](
         inline f: Channel[A] => B < S
+    )(using inline frame: Frame): B < (S & Sync & Scope) =
+        Sync.Unsafe:
+            val channel = Unsafe.init[A](capacity, access)
+            Scope.ensure(Channel.close(channel)).andThen:
+                f(channel)
+
+    /** Uses a new Channel with the provided configuration, closing the channel after usage.
+      * @param f
+      *   The function to apply to the new Channel
+      * @return
+      *   The result of applying the function
+      */
+    inline def use[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](
+        inline f: Channel[A] => B < S
     )(using inline frame: Frame): B < (S & Sync) =
-        Sync.Unsafe(f(Unsafe.init(capacity, access)))
+        Sync.Unsafe:
+            val channel = Unsafe.init[A](capacity, access)
+            Sync.ensure(Channel.close(channel)):
+                f(channel)
+
+    /** Initializes a new Channel without guaranteeing eventual cleanup.
+      *
+      * @param capacity
+      *   The capacity of the channel. Note that this will be rounded up to the next power of two.
+      * @param access
+      *   The access mode for the channel (default is MPMC)
+      * @tparam A
+      *   The type of elements in the channel
+      * @return
+      *   A new Channel instance
+      *
+      * @note
+      *   The actual capacity will be rounded up to the next power of two.
+      * @note
+      *   The channel should be manually cleaned up when no longer needed using [[close]]
+      * @warning
+      *   The actual capacity may be larger than the specified capacity due to rounding.
+      */
+    def initUnscoped[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Channel[A] < Sync =
+        initUnscopedWith[A](capacity, access)(identity)
+
+    /** Uses a new Channel with the provided configuration without guaranteeing eventual cleanup.
+      *
+      * @param f
+      *   The function to apply to the new Channel
+      * @note
+      *   The channel should be manually cleaned up when no longer needed using [[close]]
+      * @return
+      *   The result of applying the function
+      */
+    inline def initUnscopedWith[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](
+        inline f: Channel[A] => B < S
+    )(using inline frame: Frame): B < (S & Sync) =
+        Sync.Unsafe(f(Unsafe.init[A](capacity, access)))
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
     sealed abstract class Unsafe[A] extends Serializable:
@@ -343,18 +425,19 @@ object Channel:
         def offerAll(values: Seq[A])(using AllowUnsafe, Frame): Result[Closed, Chunk[A]]
         def poll()(using AllowUnsafe, Frame): Result[Closed, Maybe[A]]
 
-        def putFiber(value: A)(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, Unit]
-        def putBatchFiber(values: Seq[A])(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, Unit]
-        def takeFiber()(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, A]
+        def putFiber(value: A)(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Abort[Closed]]
+        def putBatchFiber(values: Seq[A])(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Abort[Closed]]
+        def takeFiber()(using AllowUnsafe, Frame): Fiber.Unsafe[A, Abort[Closed]]
 
         def drain()(using AllowUnsafe, Frame): Result[Closed, Chunk[A]]
         def drainUpTo(max: Int)(using AllowUnsafe, Frame): Result[Closed, Chunk[A]]
         def close()(using Frame, AllowUnsafe): Maybe[Seq[A]]
-        def closeAwaitEmpty()(using Frame, AllowUnsafe): Fiber.Unsafe[Nothing, Boolean]
+        def closeAwaitEmpty()(using Frame, AllowUnsafe): Fiber.Unsafe[Boolean, Any]
 
         def empty()(using AllowUnsafe, Frame): Result[Closed, Boolean]
         def full()(using AllowUnsafe, Frame): Result[Closed, Boolean]
         def closed()(using AllowUnsafe): Boolean
+        def open()(using AllowUnsafe): Boolean
 
         def safe: Channel[A] = this
     end Unsafe
@@ -369,35 +452,35 @@ object Channel:
             else NonZeroCapacityUnsafe(capacity, access)
 
         private[Unsafe] enum Put[A]:
-            val promise: Promise.Unsafe[Closed, Unit]
-            case Batch(batch: Chunk[A], override val promise: Promise.Unsafe[Closed, Unit])
-            case Value(value: A, override val promise: Promise.Unsafe[Closed, Unit])
+            val promise: Promise.Unsafe[Unit, Abort[Closed]]
+            case Batch(batch: Chunk[A], override val promise: Promise.Unsafe[Unit, Abort[Closed]])
+            case Value(value: A, override val promise: Promise.Unsafe[Unit, Abort[Closed]])
         end Put
 
         sealed abstract class BaseUnsafe[A] extends Unsafe[A]:
-            val takes = new MpmcUnboundedXaddArrayQueue[Promise.Unsafe[Closed, A]](8)
+            val takes = new MpmcUnboundedXaddArrayQueue[Promise.Unsafe[A, Abort[Closed]]](8)
             val puts  = new MpmcUnboundedXaddArrayQueue[Put[A]](8)
 
             protected def flush()(using Frame): Unit
 
-            final def putFiber(value: A)(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, Unit] =
-                val promise = Promise.Unsafe.init[Closed, Unit]()
+            final def putFiber(value: A)(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Abort[Closed]] =
+                val promise = Promise.Unsafe.init[Unit, Abort[Closed]]()
                 val put     = Put.Value(value, promise)
                 puts.add(put)
                 flush()
                 promise
             end putFiber
 
-            final def putBatchFiber(values: Seq[A])(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, Unit] =
-                val promise = Promise.Unsafe.init[Closed, Unit]()
+            final def putBatchFiber(values: Seq[A])(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Abort[Closed]] =
+                val promise = Promise.Unsafe.init[Unit, Abort[Closed]]()
                 val put     = Put.Batch(Chunk.from(values), promise)
                 puts.add(put)
                 flush()
                 promise
             end putBatchFiber
 
-            final def takeFiber()(using AllowUnsafe, Frame): Fiber.Unsafe[Closed, A] =
-                val promise = Promise.Unsafe.init[Closed, A]()
+            final def takeFiber()(using AllowUnsafe, Frame): Fiber.Unsafe[A, Abort[Closed]] =
+                val promise = Promise.Unsafe.init[A, Abort[Closed]]()
                 takes.add(promise)
                 flush()
                 promise
@@ -473,17 +556,17 @@ object Channel:
                         case Absent =>
                             Absent
                         case Present(Put.Value(value, promise)) =>
-                            discard(promise.complete(Result.unit))
+                            promise.completeUnitDiscard()
                             flush()
                             Present(value)
                         case Present(Put.Batch(batch, promise)) =>
                             val result = batch.headMaybe match
                                 case Absent =>
-                                    discard(promise.complete(Result.unit))
+                                    promise.completeUnitDiscard()
                                     Absent
                                 case Present(value) =>
                                     if batch.tail.nonEmpty then discard(puts.offer(Put.Batch(batch.tail, promise)))
-                                    else discard(promise.complete(Result.unit))
+                                    else promise.completeUnitDiscard()
                                     Present(value)
                             flush()
                             result
@@ -500,7 +583,7 @@ object Channel:
                                 flush()
                                 succeedIfNonEmptyOrOpen(current)
                             case Present(Put.Value(value, promise)) =>
-                                discard(promise.complete(Result.unit))
+                                promise.completeUnitDiscard()
                                 loop(current.appended(value), i - 1)
                             case Present(Put.Batch(batch, promise)) =>
                                 val taken     = batch.take(i)
@@ -510,7 +593,7 @@ object Channel:
                                     flush()
                                     succeedIfNonEmptyOrOpen(current.concat(taken))
                                 else
-                                    discard(promise.complete(Result.unit))
+                                    promise.completeUnitDiscard()
                                     loop(current.concat(taken), i - taken.length)
                                 end if
                         end match
@@ -527,10 +610,10 @@ object Channel:
                         case Absent =>
                             succeedIfNonEmptyOrOpen(current)
                         case Present(Put.Value(value, promise)) =>
-                            discard(promise.complete(Result.unit))
+                            promise.completeUnitDiscard()
                             loop(current.appended(value))
                         case Present(Put.Batch(batch, promise)) =>
-                            discard(promise.complete(Result.unit))
+                            promise.completeUnitDiscard()
                             loop(current.concat(batch))
                     end match
                 end loop
@@ -551,6 +634,7 @@ object Channel:
             def empty()(using AllowUnsafe, Frame) = succeedIfOpen(true)
             def full()(using AllowUnsafe, Frame)  = succeedIfOpen(true)
             def closed()(using AllowUnsafe)       = isClosed.get()
+            def open()(using AllowUnsafe)         = !isClosed.get()
 
             @tailrec protected def flush()(using Frame): Unit =
                 // This method ensures that all values are processed
@@ -570,7 +654,7 @@ object Channel:
                                 Maybe(takes.poll()) match
                                     case Present(takePromise) if takePromise.complete(Result.succeed(value)) =>
                                         // Value transfered, complete put
-                                        promise.completeDiscard(Result.unit)
+                                        promise.completeUnitDiscard()
 
                                     case _ =>
                                         // Take promise was interrupted, return put to the queue
@@ -584,7 +668,7 @@ object Channel:
                                 def loop(i: Int): Unit =
                                     if i >= chunk.length then
                                         // All items transfered, complete put
-                                        promise.completeDiscard(Result.unit)
+                                        promise.completeUnitDiscard()
                                     else
                                         Maybe(takes.poll()) match
                                             case Present(takePromise) =>
@@ -707,6 +791,7 @@ object Channel:
             def empty()(using AllowUnsafe, Frame) = queue.empty()
             def full()(using AllowUnsafe, Frame)  = queue.full()
             def closed()(using AllowUnsafe)       = queue.closed()
+            def open()(using AllowUnsafe)         = queue.open()
 
             @tailrec protected def flush()(using Frame): Unit =
                 // This method ensures that all values are processed
@@ -720,7 +805,7 @@ object Channel:
                     // Queue is closed, drain all takes and puts
                     val fail = queue.size() // Obtain the failed Result
                     takes.drain(_.completeDiscard(fail.asInstanceOf[Result[Closed, Nothing]]))
-                    puts.drain(_.promise.completeDiscard(fail.unit))
+                    puts.drain(_.promise.completeDiscard(fail.map(_ => ())))
                     flush()
                 else if queueSize > 0 && !takesEmpty then
                     // Attempt to transfer a value from the queue to
@@ -732,7 +817,7 @@ object Channel:
                                     // If completing the take fails and the queue
                                     // cannot accept the value back, enqueue a
                                     // placeholder put operation
-                                    val placeholder = Promise.Unsafe.init[Closed, Unit]()
+                                    val placeholder = Promise.Unsafe.init[Unit, Abort[Closed]]()
                                     discard(puts.add(Put.Value(value, placeholder)))
                             case _ =>
                                 // Queue became empty, enqueue the take again
@@ -750,7 +835,7 @@ object Channel:
                             def loop(i: Int): Unit =
                                 if i >= chunk.length then
                                     // All items offered, complete put
-                                    promise.completeDiscard(Result.unit)
+                                    promise.completeUnitDiscard()
                                 else if !queue.offer(chunk(i)).contains(true) then
                                     // Queue became full, add pending put for the rest of the batch
                                     discard(puts.add(Put.Batch(chunk.dropLeft(i), promise)))
@@ -761,7 +846,7 @@ object Channel:
                         case put @ Put.Value(value, promise) =>
                             if queue.offer(value).contains(true) then
                                 // Queue accepted the value, complete the put
-                                promise.completeDiscard(Result.unit)
+                                promise.completeUnitDiscard()
                             else
                                 // Queue became full, enqueue the put again
                                 discard(puts.add(put))
@@ -777,7 +862,7 @@ object Channel:
                                 Maybe(takes.poll()) match
                                     case Present(takePromise) if takePromise.complete(Result.succeed(value)) =>
                                         // Value transfered, complete put
-                                        promise.completeDiscard(Result.unit)
+                                        promise.completeUnitDiscard()
 
                                     case _ =>
                                         // Take promise was interrupted, return put to the queue
@@ -790,7 +875,7 @@ object Channel:
                                 def loop(i: Int): Unit =
                                     if i >= chunk.length then
                                         // All items transfered, complete put
-                                        promise.completeDiscard(Result.unit)
+                                        promise.completeUnitDiscard()
                                     else
                                         Maybe(takes.poll()) match
                                             case Present(takePromise) =>

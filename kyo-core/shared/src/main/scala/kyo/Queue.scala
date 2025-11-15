@@ -124,21 +124,50 @@ object Queue:
         /** Closes the queue and asynchronously waits until it's empty.
           *
           * This method closes the queue to new elements and returns a computation that completes when all elements have been consumed.
-          * Unlike the regular `close` method, this allows consumers to process all remaining elements before considering the queue fully
+          * Unlike the regular [[close]] method, this allows consumers to process all remaining elements before considering the queue fully
           * closed.
           *
           * @return
-          *   true if the queue was successfully closed and emptied, false if it was already closed or another closeAwaitEmpty is already
-          *   running.
+          *   `true` if the queue was successfully closed and emptied, `false` if it was already closed or another `closeAwaitEmpty` is
+          *   already running.
           */
         def closeAwaitEmpty(using Frame): Boolean < Async = Sync.Unsafe(self.closeAwaitEmpty().safe.get)
 
-        /** Checks if the queue is closed.
+        /** Closes the queue and returns the [[Fiber]] waits until it's empty.
+          *
+          * This method closes the queue to new elements and returns a `Fiber` that completes when all elements have been consumed. Unlike
+          * the regular [[close]] method, this allows consumers to process all remaining elements before considering the queue fully closed.
+          *
+          * This differs from [[closeAwaitEmpty]] in that once the `Fiber` has been obtained it guarantees to have begun closing the queue
+          * and future offers to the queue will abort with [[Closed]] even if the queue is not yet completely closed. On the other hand,
+          * when handling the `Async` effect from `closeAwaitEmpty` the `Fiber` it returns may not have started closing the queue yet.
           *
           * @return
-          *   true if the queue is closed, false otherwise
+          *   A `Fiber` that completes with `true` if the queue was successfully closed and emptied, `false` if it was already closed or
+          *   another `closeAwaitEmpty` is already running.
+          */
+        def closeAwaitEmptyFiber(using Frame): Fiber[Boolean, Any] < Sync = Sync.Unsafe(self.closeAwaitEmpty().safe)
+
+        /** Checks if the queue is closed.
+          *
+          * A queue is considered closed if it has fully closed, i.e. it is not open and it is empty.
+          *
+          * This will always be `true` after [[close]]. In the case of [[closeAwaitEmpty]] and [[closeAwaitEmptyFiber]], it will only be
+          * `true` once the queue has been emptied.
+          *
+          * @return
+          *   `true` if the queue is closed, `false` otherwise
           */
         def closed(using Frame): Boolean < Sync = Sync.Unsafe(self.closed())
+
+        /** Checks if the queue is open.
+          *
+          * A queue is considered open if it has not begun closing, and it may still accept new elements (although it might be full).
+          *
+          * @return
+          *   `true` if the queue is open, `false` otherwise
+          */
+        def open(using Frame): Boolean < Sync = Sync.Unsafe(self.open())
 
         /** Returns the unsafe version of the queue.
           *
@@ -163,7 +192,7 @@ object Queue:
       * @warning
       *   The actual capacity may be larger than the specified capacity due to rounding.
       */
-    def init[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Queue[A] < Sync =
+    def init[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Queue[A] < (Sync & Scope) =
         initWith[A](capacity, access)(identity)
 
     /** Uses a new Queue with the provided count.
@@ -177,6 +206,57 @@ object Queue:
       *   The result of applying the function
       */
     inline def initWith[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](inline f: Queue[A] => B < S)(
+        using inline frame: Frame
+    ): B < (Sync & S & Scope) =
+        initUnscopedWith[A](capacity, access): queue =>
+            Scope.ensure(Queue.close(queue)).andThen(f(queue))
+
+    /** Uses a new Queue with the provided count, closing the queue after usage.
+      *
+      * @param capacity
+      *   the desired capacity of the queue. Note that this will be rounded up to the next power of two.
+      * @param access
+      *   the access pattern (default is MPMC)
+      * @param f
+      *   The function to apply to the new Queue
+      * @return
+      *   The result of applying the function
+      */
+    def use[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](f: Queue[A] => B < S)(
+        using frame: Frame
+    ): B < (Sync & S) =
+        initUnscopedWith[A](capacity, access): queue =>
+            Sync.ensure(Queue.close(queue))(f(queue))
+
+    /** Initializes a new queue with the specified capacity and access pattern without guaranteeing cleanup. The actual capacity will be
+      * rounded up to the next power of two.
+      *
+      * @param capacity
+      *   the desired capacity of the queue. Note that this will be rounded up to the next power of two.
+      * @param access
+      *   the access pattern (default is MPMC)
+      * @return
+      *   a new Queue instance with a capacity that is the next power of two greater than or equal to the specified capacity
+      *
+      * @note
+      *   The actual capacity will be rounded up to the next power of two.
+      * @warning
+      *   The actual capacity may be larger than the specified capacity due to rounding.
+      */
+    def initUnscoped[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Queue[A] < Sync =
+        initUnscopedWith[A](capacity, access)(identity)
+
+    /** Uses a new Queue with the provided count without guaranteeing cleanup.
+      * @param capacity
+      *   the desired capacity of the queue. Note that this will be rounded up to the next power of two.
+      * @param access
+      *   the access pattern (default is MPMC)
+      * @param f
+      *   The function to apply to the new Queue
+      * @return
+      *   The result of applying the function
+      */
+    inline def initUnscopedWith[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](inline f: Queue[A] => B < S)(
         using inline frame: Frame
     ): B < (Sync & S) =
         Sync.Unsafe(f(Unsafe.init(capacity, access)))
@@ -209,7 +289,7 @@ object Queue:
           * @return
           *   a new Unbounded Queue instance
           */
-        def init[A](access: Access = Access.MultiProducerMultiConsumer, chunkSize: Int = 8)(using Frame): Unbounded[A] < Sync =
+        def init[A](access: Access = Access.MultiProducerMultiConsumer, chunkSize: Int = 8)(using Frame): Unbounded[A] < (Sync & Scope) =
             initWith[A](access, chunkSize)(identity)
 
         /** Uses a new unbounded Queue with the provided count.
@@ -221,6 +301,52 @@ object Queue:
           *   The result of applying the function
           */
         inline def initWith[A](
+            access: Access = Access.MultiProducerMultiConsumer,
+            chunkSize: Int = 8
+        )[B, S](inline f: Unbounded[A] => B < S)(
+            using inline frame: Frame
+        ): B < (Sync & S & Scope) =
+            initUnscopedWith[A](access, chunkSize): queue =>
+                Scope.ensure(Queue.close(queue)).andThen(f(queue))
+
+        /** Uses a new unbounded Queue with the provided count, closing the queue after usage.
+          * @param count
+          *   The initial count for the latch
+          * @param f
+          *   The function to apply to the new Queue
+          * @return
+          *   The result of applying the function
+          */
+        def use[A](
+            access: Access = Access.MultiProducerMultiConsumer,
+            chunkSize: Int = 8
+        )[B, S](f: Unbounded[A] => B < S)(
+            using frame: Frame
+        ): B < (Sync & S) =
+            initUnscopedWith[A](access, chunkSize): queue =>
+                Sync.ensure(Queue.close(queue))(f(queue))
+
+        /** Initializes a new unbounded queue with the specified access pattern and chunk size without guaranteeing cleanup.
+          *
+          * @param access
+          *   the access pattern (default is MPMC)
+          * @param chunkSize
+          *   the chunk size for internal array allocation (default is 8)
+          * @return
+          *   a new Unbounded Queue instance
+          */
+        def initUnscoped[A](access: Access = Access.MultiProducerMultiConsumer, chunkSize: Int = 8)(using Frame): Unbounded[A] < Sync =
+            initUnscopedWith[A](access, chunkSize)(identity)
+
+        /** Uses a new unbounded Queue with the provided count without guaranteeing cleanup.
+          * @param count
+          *   The initial count for the latch
+          * @param f
+          *   The function to apply to the new Queue
+          * @return
+          *   The result of applying the function
+          */
+        inline def initUnscopedWith[A](
             access: Access = Access.MultiProducerMultiConsumer,
             chunkSize: Int = 8
         )[B, S](inline f: Unbounded[A] => B < S)(
@@ -242,7 +368,49 @@ object Queue:
           * @warning
           *   The actual capacity may be larger than the specified capacity due to rounding.
           */
-        def initDropping[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Unbounded[A] < Sync =
+        def initDropping[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using
+            Frame
+        ): Unbounded[A] < (Scope & Sync) =
+            initDroppingUnscoped[A](capacity, access).map: queue =>
+                Scope.ensure(Queue.close(queue)).andThen(queue)
+
+        /** Uses a new dropping queue with the specified capacity and access pattern, closing queue after usage.
+          *
+          * @param capacity
+          *   the capacity of the queue. Note that this will be rounded up to the next power of two.
+          * @param access
+          *   the access pattern (default is MPMC)
+          * @return
+          *   a new Unbounded Queue instance that drops elements when full
+          *
+          * @note
+          *   The actual capacity will be rounded up to the next power of two.
+          * @warning
+          *   The actual capacity may be larger than the specified capacity due to rounding.
+          */
+        def useDropping[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](f: Unbounded[A] => B < S)(
+            using Frame
+        ): B < (Sync & S) =
+            initDroppingUnscoped[A](capacity, access).map: queue =>
+                Sync.ensure(Queue.close(queue))(f(queue))
+
+        /** Initializes a new dropping queue with the specified capacity and access pattern without guaranteeing cleanup.
+          *
+          * @param capacity
+          *   the capacity of the queue. Note that this will be rounded up to the next power of two.
+          * @param access
+          *   the access pattern (default is MPMC)
+          * @return
+          *   a new Unbounded Queue instance that drops elements when full
+          *
+          * @note
+          *   The actual capacity will be rounded up to the next power of two.
+          * @warning
+          *   The actual capacity may be larger than the specified capacity due to rounding.
+          */
+        def initDroppingUnscoped[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(
+            using Frame
+        ): Unbounded[A] < Sync =
             Sync.Unsafe(Unsafe.initDropping(capacity, access))
 
         /** Initializes a new sliding queue with the specified capacity and access pattern.
@@ -259,7 +427,48 @@ object Queue:
           * @warning
           *   The actual capacity may be larger than the specified capacity due to rounding.
           */
-        def initSliding[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using Frame): Unbounded[A] < Sync =
+        def initSliding[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(using
+            Frame
+        ): Unbounded[A] < (Scope & Sync) =
+            Scope.acquireRelease(initSlidingUnscoped[A](capacity, access))(Queue.close(_))
+
+        /** Uses a new sliding queue with the specified capacity and access pattern, closing queue after usage.
+          *
+          * @param capacity
+          *   the capacity of the queue. Note that this will be rounded up to the next power of two.
+          * @param access
+          *   the access pattern (default is MPMC)
+          * @return
+          *   a new Unbounded Queue instance that slides elements when full
+          *
+          * @note
+          *   The actual capacity will be rounded up to the next power of two.
+          * @warning
+          *   The actual capacity may be larger than the specified capacity due to rounding.
+          */
+        def useSliding[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)[B, S](f: Unbounded[A] => B < S)(
+            using Frame
+        ): B < (Sync & S) =
+            initSlidingUnscoped[A](capacity, access).map: queue =>
+                Sync.ensure(Queue.close(queue))(f(queue))
+
+        /** Initializes a new sliding queue with the specified capacity and access pattern without guaranteeing cleanup.
+          *
+          * @param capacity
+          *   the capacity of the queue. Note that this will be rounded up to the next power of two.
+          * @param access
+          *   the access pattern (default is MPMC)
+          * @return
+          *   a new Unbounded Queue instance that slides elements when full
+          *
+          * @note
+          *   The actual capacity will be rounded up to the next power of two.
+          * @warning
+          *   The actual capacity may be larger than the specified capacity due to rounding.
+          */
+        def initSlidingUnscoped[A](capacity: Int, access: Access = Access.MultiProducerMultiConsumer)(
+            using Frame
+        ): Unbounded[A] < Sync =
             Sync.Unsafe(Unsafe.initSliding(capacity, access))
 
         /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
@@ -304,6 +513,7 @@ object Queue:
                     def close()(using Frame, AllowUnsafe)           = underlying.close()
                     def closeAwaitEmpty()(using Frame, AllowUnsafe) = underlying.closeAwaitEmpty()
                     def closed()(using AllowUnsafe): Boolean        = underlying.closed()
+                    def open()(using AllowUnsafe): Boolean          = underlying.open()
                 end new
             end initDropping
 
@@ -336,6 +546,7 @@ object Queue:
                     def close()(using Frame, AllowUnsafe)           = underlying.close()
                     def closeAwaitEmpty()(using Frame, AllowUnsafe) = underlying.closeAwaitEmpty()
                     def closed()(using AllowUnsafe): Boolean        = underlying.closed()
+                    def open()(using AllowUnsafe): Boolean          = underlying.open()
                 end new
             end initSliding
         end Unsafe
@@ -353,8 +564,9 @@ object Queue:
         def peek()(using AllowUnsafe): Result[Closed, Maybe[A]]
         def drain()(using AllowUnsafe): Result[Closed, Chunk[A]]
         def close()(using Frame, AllowUnsafe): Maybe[Seq[A]]
-        def closeAwaitEmpty()(using Frame, AllowUnsafe): Fiber.Unsafe[Nothing, Boolean]
+        def closeAwaitEmpty()(using Frame, AllowUnsafe): Fiber.Unsafe[Boolean, Any]
         def closed()(using AllowUnsafe): Boolean
+        def open()(using AllowUnsafe): Boolean
         final def safe: Queue[A] = this
     end Unsafe
 
@@ -363,7 +575,7 @@ object Queue:
 
         private enum State derives CanEqual:
             case Open
-            case HalfOpen(p: Promise.Unsafe[Nothing, Boolean], r: Result.Error[Closed])
+            case HalfOpen(p: Promise.Unsafe[Boolean, Any], r: Result.Error[Closed])
             case FullyClosed(r: Result.Error[Closed])
         end State
 
@@ -376,9 +588,9 @@ object Queue:
                 Maybe.when(state.compareAndSet(State.Open, State.FullyClosed(fail)))(_drain())
             end close
 
-            final def closeAwaitEmpty()(using frame: Frame, allow: AllowUnsafe): Fiber.Unsafe[Nothing, Boolean] =
+            final def closeAwaitEmpty()(using frame: Frame, allow: AllowUnsafe): Fiber.Unsafe[Boolean, Any] =
                 val fail = Result.Failure(Closed("Queue", initFrame))
-                val p    = Promise.Unsafe.init[Nothing, Boolean]()
+                val p    = Promise.Unsafe.init[Boolean, Any]()
                 if state.compareAndSet(State.Open, State.HalfOpen(p, fail)) then
                     handleHalfOpen()
                     p
@@ -389,6 +601,9 @@ object Queue:
 
             final def closed()(using AllowUnsafe) =
                 state.get().isInstanceOf[State.FullyClosed]
+
+            final def open()(using AllowUnsafe) =
+                state.get() eq State.Open
 
             final def drainUpTo(max: Int)(using AllowUnsafe): Result[Closed, Chunk[A]] = pollOp(_drain(Maybe.Present(max)))
 

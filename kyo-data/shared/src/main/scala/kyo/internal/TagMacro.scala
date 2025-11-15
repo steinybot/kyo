@@ -11,16 +11,13 @@ import scala.collection.immutable.HashMap
 import scala.quoted.{Type as SType, *}
 
 private[kyo] object TagMacro:
-
-    private val compactNames = true
-
-    def deriveImpl[A: SType](using Quotes): Expr[String | Tag.internal.Dynamic] =
+    def deriveImpl[A: SType](allowDynamic: Boolean)(using Quotes): Expr[String | Tag.internal.Dynamic] =
         import quotes.reflect.*
         val (staticDB, dynamicDB) = deriveDB[A]
         val encoded               = Expr(Tag.internal.encode(staticDB))
         if dynamicDB.isEmpty then
             encoded
-        else if FindEnclosing.isInternal then
+        else if !allowDynamic && FindEnclosing.isInternal then
             val missing =
                 dynamicDB.map {
                     case (_, (tpe, _)) =>
@@ -73,10 +70,10 @@ private[kyo] object TagMacro:
                         case tpe if tpe =:= TypeRepr.of[Null]    => NullEntry
 
                         case tpe @ AndType(_, _) =>
-                            IntersectionEntry(KArray.from(flattenAnd(tpe).map(visit)))
+                            IntersectionEntry(Span.from(flattenAnd(tpe).map(visit)))
 
                         case tpe @ OrType(_, _) =>
-                            UnionEntry(KArray.from(flattenOr(tpe).map(visit)))
+                            UnionEntry(Span.from(flattenOr(tpe).map(visit)))
 
                         case tpe @ ConstantType(const) =>
                             LiteralEntry(visit(tpe.widen), const.value.toString())
@@ -93,9 +90,9 @@ private[kyo] object TagMacro:
                                 case TypeBounds(low, high) => visit(high)
                             }
                             LambdaEntry(
-                                KArray.from(params),
-                                KArray.from(lowerBounds),
-                                KArray.from(higherBounds),
+                                Span.from(params),
+                                Span.from(lowerBounds),
+                                Span.from(higherBounds),
                                 visit(body)
                             )
 
@@ -111,12 +108,15 @@ private[kyo] object TagMacro:
                                     else Present(Variance.Invariant)
                                     end if
                                 }
-                            require(params.size == variances.size)
+                            require(
+                                params.size == variances.size,
+                                s"Found ${params.size} type parameters but ${variances.size} variances. TypeRepr: ${tpe.show}"
+                            )
                             ClassEntry(
                                 name,
-                                KArray.from(variances),
-                                KArray.from(params),
-                                KArray.from(immediateParents(tpe).map(visit))
+                                Span.from(variances),
+                                Span.from(params),
+                                Span.from(immediateParents(tpe).map(visit))
                             )
 
                         case tpe if tpe.typeSymbol.flags.is(Flags.Opaque) && tpe.typeSymbol.isTypeDef =>
@@ -133,8 +133,11 @@ private[kyo] object TagMacro:
                                             else Present(Variance.Invariant)
                                             end if
                                         }
-                                    require(params.size == variances.size)
-                                    OpaqueEntry(name, visit(lower), visit(upper), KArray.from(variances), KArray.from(params))
+                                    require(
+                                        params.size == variances.size,
+                                        s"Found ${params.size} type parameters but ${variances.size} variances. TypeRepr: ${tpe.show}"
+                                    )
+                                    OpaqueEntry(name, visit(lower), visit(upper), Span.from(variances), Span.from(params))
                             end match
 
                         case tpe =>

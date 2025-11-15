@@ -32,10 +32,10 @@ class ProducerConsumerBench extends ArenaBench.ForkOnly(()):
             if n <= 1 then io
             else io.flatMap(_ => repeat(n - 1)(io))
 
-        Channel.init[Unit](depth / 2, Access.SingleProducerSingleConsumer).flatMap { q =>
+        Channel.initUnscoped[Unit](depth / 2, Access.SingleProducerSingleConsumer).flatMap { q =>
             for
-                producer <- Fiber.run(repeat(depth)(q.put(())))
-                consumer <- Fiber.run(repeat(depth)(q.take))
+                producer <- Fiber.initUnscoped(repeat(depth)(q.put(())))
+                consumer <- Fiber.initUnscoped(repeat(depth)(q.take))
                 _        <- producer.get
                 _        <- consumer.get
             yield {}

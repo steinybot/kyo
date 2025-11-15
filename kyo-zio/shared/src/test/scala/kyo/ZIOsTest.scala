@@ -4,7 +4,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kyo.*
 import kyo.ZIOs.*
-import kyo.kernel.Platform
+import kyo.internal.Platform
 import org.scalatest.compatible.Assertion
 import org.scalatest.concurrent.Eventually.*
 import scala.concurrent.Future
@@ -94,25 +94,25 @@ class ZIOsTest extends Test:
         "basic interop" in runKyo {
             for
                 v1 <- ZIOs.get(ZIO.succeed(1))
-                v2 <- Fiber.run(2).map(_.get)
+                v2 <- Fiber.initUnscoped(2).map(_.get)
                 v3 <- ZIOs.get(ZIO.succeed(3))
             yield assert(v1 == 1 && v2 == 2 && v3 == 3)
         }
 
         "nested Kyo in ZIO" in runKyo {
             ZIOs.get(ZIO.suspendSucceed {
-                val kyoComputation = Fiber.run(42).map(_.get)
+                val kyoComputation = Fiber.initUnscoped(42).map(_.get)
                 ZIOs.run(kyoComputation)
             }).map(v => assert(v == 42))
         }
 
         "nested ZIO in Kyo" in runKyo {
-            Fiber.run(ZIOs.get(ZIOs.run(42))).map(_.get)
+            Fiber.initUnscoped(ZIOs.get(ZIOs.run(42))).map(_.get)
                 .map(v => assert(v == 42))
         }
 
         "complex nested pattern with parallel and race" in runKyo {
-            def kyoTask(i: Int): Int < (Abort[Nothing] & Async)   = Fiber.run(i * 2).map(_.get)
+            def kyoTask(i: Int): Int < (Abort[Nothing] & Async)   = Fiber.initUnscoped(i * 2).map(_.get)
             def zioTask(i: Int): Int < (Abort[Throwable] & Async) = ZIOs.get(ZIO.succeed(i + 1))
 
             for
@@ -178,7 +178,7 @@ class ZIOsTest extends Test:
                     val v =
                         for
                             _ <- ZIOs.get(zioLoop(started, done))
-                            _ <- Fiber.run(kyoLoop(started, done))
+                            _ <- Fiber.initUnscoped(kyoLoop(started, done))
                         yield ()
                     for
                         f <- ZIOs.run(v).fork
@@ -235,7 +235,7 @@ class ZIOsTest extends Test:
                     val done    = new CountDownLatch(1)
                     val panic   = Result.Panic(new Exception)
                     for
-                        f <- Fiber.run(ZIOs.get(zioLoop(started, done)))
+                        f <- Fiber.initUnscoped(ZIOs.get(zioLoop(started, done)))
                         _ <- Sync.defer(started.await(100, TimeUnit.MILLISECONDS))
                         _ <- f.interrupt(panic)
                         r <- f.getResult
@@ -253,7 +253,7 @@ class ZIOsTest extends Test:
                             _ <- kyoLoop(started, done)
                         yield ()
                     for
-                        f <- Fiber.run(v)
+                        f <- Fiber.initUnscoped(v)
                         _ <- Sync.defer(started.await(100, TimeUnit.MILLISECONDS))
                         _ <- f.interrupt
                         r <- f.getResult
@@ -271,7 +271,7 @@ class ZIOsTest extends Test:
                         Async.zip[Throwable, Unit, Unit, Any](loop1, loop2)
                     end parallelEffect
                     for
-                        f <- Fiber.run(parallelEffect)
+                        f <- Fiber.initUnscoped(parallelEffect)
                         _ <- Sync.defer(started.await(100, TimeUnit.MILLISECONDS))
                         _ <- f.interrupt
                         r <- f.getResult
@@ -289,7 +289,7 @@ class ZIOsTest extends Test:
                         Async.race(loop1, loop2)
                     end raceEffect
                     for
-                        f <- Fiber.run(raceEffect)
+                        f <- Fiber.initUnscoped(raceEffect)
                         _ <- Sync.defer(started.await(100, TimeUnit.MILLISECONDS))
                         _ <- f.interrupt
                         r <- f.getResult
@@ -394,8 +394,8 @@ class ZIOsTest extends Test:
 
         "Interrupt" in runKyo {
             Cause.interrupt(zio.FiberId.None).toError match
-                case Result.Panic(e: Fiber.Interrupted) => succeed
-                case _                                  => fail("Expected Result.Panic with Fiber.Interrupted")
+                case Result.Panic(e: Interrupted) => succeed
+                case _                            => fail("Expected Result.Panic with Fiber.Interrupted")
             end match
         }
 

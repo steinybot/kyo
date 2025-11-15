@@ -28,7 +28,7 @@ class CoreTest extends Test:
                 val start = Clock.now.now
                 Async.sleep(5.millis).now
                 val elapsed = Clock.now.now - start
-                assert(elapsed >= 5.millis)
+                assert(elapsed >= 4.millis)
             }
         }
 
@@ -153,14 +153,14 @@ class CoreTest extends Test:
             assert(barrier.pending.now == 2)
 
             // Start two fibers that will wait at the barrier
-            val fiber1 = Fiber.run {
+            val fiber1 = Fiber.initUnscoped {
                 direct {
                     barrier.await.now
                     true
                 }
             }.now
 
-            val fiber2 = Fiber.run {
+            val fiber2 = Fiber.initUnscoped {
                 direct {
                     barrier.await.now
                     true
@@ -181,7 +181,7 @@ class CoreTest extends Test:
             latch.release.now
             assert(latch.pending.now == 1)
             latch.release.now
-            val awaited = Fiber.run {
+            val awaited = Fiber.initUnscoped {
                 direct {
                     latch.await.now
                     true

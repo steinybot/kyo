@@ -67,8 +67,8 @@ object STM:
       * @return
       *   The result of the computation if successful
       */
-    def run[E: SafeClassTag, A, S](
-        using Isolate.Stateful[S, Async & Abort[E | FailedTransaction]]
+    def run[E: ConcreteTag, A, S](
+        using Isolate[S, Async & Abort[E | FailedTransaction], S]
     )(v: A < (STM & Abort[E] & Async & S))(using frame: Frame): A < (S & Async & Abort[E | FailedTransaction]) =
         run(defaultRetrySchedule)(v)
 
@@ -81,8 +81,8 @@ object STM:
       * @return
       *   The result of the computation if successful
       */
-    def run[E: SafeClassTag, A, S](
-        using isolate: Isolate.Stateful[S, Async & Abort[E | FailedTransaction]]
+    def run[E: ConcreteTag, A, S](
+        using isolate: Isolate[S, Async & Abort[E | FailedTransaction], S]
     )(retrySchedule: Schedule)(v: A < (STM & Abort[E] & Async & S))(
         using frame: Frame
     ): A < (S & Async & Abort[E | FailedTransaction]) =
@@ -90,7 +90,7 @@ object STM:
             isolate.restore(run(retrySchedule)(isolate.isolate(st, v)))
         }
 
-    private def run[E: SafeClassTag, A](retrySchedule: Schedule)(v: A < (STM & Abort[E] & Async))(
+    private def run[E: ConcreteTag, A](retrySchedule: Schedule)(v: A < (STM & Abort[E] & Async))(
         using Frame
     ): A < (Async & Abort[E | FailedTransaction]) =
         TID.useIO {

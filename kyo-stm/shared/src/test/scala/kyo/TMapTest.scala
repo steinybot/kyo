@@ -389,7 +389,7 @@ class TMapTest extends Test:
                 map   <- STM.run(TMap.init[Int, Int]())
                 latch <- Latch.init(1)
 
-                writeFiber <- Fiber.run(
+                writeFiber <- Fiber.initUnscoped(
                     latch.await.andThen(
                         Async.foreach(1 to size, size)(i =>
                             STM.run(map.put(i, i * 2))
@@ -397,7 +397,7 @@ class TMapTest extends Test:
                     )
                 )
 
-                readFiber <- Fiber.run(
+                readFiber <- Fiber.initUnscoped(
                     latch.await.andThen(
                         Async.foreach(1 to size, size)(i =>
                             STM.run(map.get(i))
