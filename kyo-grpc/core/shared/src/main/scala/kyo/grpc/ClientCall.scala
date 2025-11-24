@@ -17,16 +17,18 @@ type GrpcRequestCompletion = Unit < (Env[CallClosed] & Async)
 private[grpc] type GrpcResponsesAwaitingCompletion[MaybeResponses] = MaybeResponses < (Emit[GrpcRequestCompletion] & Async)
 
 // Unary and server streaming method calls do not flush the request headers so they are only sent when the request is
-// sent. That means that they cannot be used in the creation of the request and can only be provided to the application
-// when the response is received.
-// TODO: Singular vs plural is confusing here.
-type GrpcRequest[Requests] = Requests < (Emit[GrpcRequestCompletion] & Async)
-
-type GrpcRequestsPendingHeaders[Requests] = Requests < (Env[Metadata] & Emit[GrpcRequestCompletion] & Async)
-
-type GrpcRequestsInit[Requests] = GrpcRequestsPendingHeaders[Requests] < (Emit[RequestOptions] & Async)
+// sent. See io.grpc.MethodDescriptor.MethodType.clientSendsOneMessage.
+// Likewise, unary and client streaming server calls do not flush the response headers so they are only sent when the
+// response is sent. See io.grpc.MethodDescriptor.MethodType.serverSendsOneMessage.
+// That means that headers cannot be used in the creation of the request and can only be provided to the application
+// when the response is received. If you need this then bidirectional is your only option.
+type GrpcRequest[Request] = Request < (Emit[GrpcRequestCompletion] & Async)
 
 type GrpcRequestInit[Request] = GrpcRequest[Request] < (Emit[RequestOptions] & Async)
+
+type GrpcRequestBidi[Request] = Request < (Env[Metadata] & Emit[GrpcRequestCompletion] & Async)
+
+type GrpcRequestBidiInit[Request] = GrpcRequestBidi[Request] < (Emit[RequestOptions] & Async)
 
 /** Provides client-side gRPC call implementations for different RPC patterns.
   *
@@ -140,7 +142,7 @@ object ClientCall:
         channel: io.grpc.Channel,
         method: MethodDescriptor[Request, Response],
         options: CallOptions,
-        requestsInit: GrpcRequestsInit[Stream[Request, Grpc]]
+        requestsInit: GrpcRequestInit[Stream[Request, Grpc]]
     )(using Frame, Tag[Emit[Chunk[Request]]]): Response < Grpc =
         def start(call: ClientCall[Request, Response], options: RequestOptions): UnaryClientCallListener[Response] < Sync =
             for
@@ -151,14 +153,18 @@ object ClientCall:
                 listener = UnaryClientCallListener(headersPromise, responsePromise, completionPromise, readySignal)
                 _ <- Sync.defer(call.start(listener, options.headers.getOrElse(Metadata())))
                 _ <- Sync.defer(options.messageCompression.foreach(call.setMessageCompression))
+                // TODO: Add tests that ensure that we request the right amount.
+                _ <- Sync.defer(call.request(Math.max(1, options.responseCapacityOrDefault)))
             yield listener
         end start
 
         def processHeaders(
             listener: UnaryClientCallListener[Response],
-            requestsEffect: GrpcRequestsPendingHeaders[Stream[Request, Grpc]]
-        ): GrpcRequest[Stream[Request, Grpc]] =
-            listener.headersPromise.get.map(Env.run(_)(requestsEffect))
+            requestsEffect: GrpcRequest[Stream[Request, Grpc]]
+        ): GrpcRequest[Stream[Request, Grpc]] = {
+            Console.printLine("Awaiting headers").andThen:
+              listener.headersPromise.get.map(Env.run(_)(requestsEffect))
+        }
 
         def sendAndClose(
             call: ClientCall[Request, Response],
@@ -197,7 +203,7 @@ object ClientCall:
         ): GrpcResponsesAwaitingCompletion[Result[GrpcFailure, Response]] =
             for
                 requests   <- requestsEffect
-                _          <- Sync.defer(call.request(1))
+//                _          <- Sync.defer(call.request(1))
                 sendResult <- sendAndClose(call, listener, requests)
                 result <-
                     sendResult match
@@ -212,18 +218,23 @@ object ClientCall:
             Response
         ]])
             : Response < Grpc =
-            Emit.runForeach(completionEffect)(handler =>
-                listener.completionPromise.get.map(Env.run(_)(handler))
-            ).map(Abort.get)
+            Emit.run[GrpcRequestCompletion](completionEffect).map: (handlers, result) =>
+                Console.printLine("processCompletion: start").andThen:
+                  listener.completionPromise.get.map: callClosed =>
+                      val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
+                          acc.andThen(Env.run(callClosed)(handler))
+                      Console.printLine(s"processCompletion: callClosed=${callClosed.status.isOk}").andThen:
+                        completed.andThen:
+                            if !callClosed.status.isOk then
+                                Abort.fail(callClosed.asException)
+                            else
+                                Abort.get(result)
 
         def run(call: ClientCall[Request, Response]): Response < Grpc =
             RequestOptions.run(requestsInit).map: (options, requestsEffect) =>
                 for
                     listener <- start(call, options)
-                    response <- (for
-                        requestsWithHeaders <- processHeaders(listener, requestsEffect)
-                        response            <- sendAndReceive(call, listener, requestsWithHeaders)
-                    yield response).handle(
+                    response <- sendAndReceive(call, listener, requestsEffect).handle(
                         processCompletion(listener),
                         cancelOnError(call),
                         cancelOnInterrupt(call)
@@ -344,7 +355,7 @@ object ClientCall:
         channel: io.grpc.Channel,
         method: MethodDescriptor[Request, Response],
         options: CallOptions,
-        requestsInit: GrpcRequestsInit[Stream[Request, Grpc]]
+        requestsInit: GrpcRequestBidiInit[Stream[Request, Grpc]]
     )(using Frame, Tag[Emit[Chunk[Request]]], Tag[Emit[Chunk[Response]]]): Stream[Response, Grpc] =
         def start(call: ClientCall[Request, Response], options: RequestOptions): ServerStreamingClientCallListener[Response] < Sync =
             for
@@ -362,7 +373,7 @@ object ClientCall:
 
         def processHeaders(
             listener: ServerStreamingClientCallListener[Response],
-            requestsEffect: GrpcRequestsPendingHeaders[Stream[Request, Grpc]]
+            requestsEffect: GrpcRequestBidi[Stream[Request, Grpc]]
         ): GrpcRequest[Stream[Request, Grpc]] =
             listener.headersPromise.get.map(Env.run(_)(requestsEffect))
 

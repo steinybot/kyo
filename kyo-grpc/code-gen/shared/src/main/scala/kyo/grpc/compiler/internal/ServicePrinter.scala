@@ -199,10 +199,12 @@ private[compiler] case class ServicePrinter(
 
     private def clientMethodParameters(method: MethodDescriptor): Seq[Parameter] = {
         def requestParameter  = "request" :- Types.grpcRequestInit(method.inputType.scalaType)
-        def requestsParameter = "requests" :- Types.grpcRequestsInit(Types.streamGrpcRequest(method.inputType.scalaType))
+        def requestsParameter  = "requests" :- Types.grpcRequestInit(Types.streamGrpcRequest(method.inputType.scalaType))
+        def requestBidiParameter = "requests" :- Types.grpcRequestBidiInit(Types.streamGrpcRequest(method.inputType.scalaType))
         method.streamType match {
-            case StreamType.Unary | StreamType.ServerStreaming         => Seq(requestParameter)
-            case StreamType.ClientStreaming | StreamType.Bidirectional => Seq(requestsParameter)
+            case StreamType.Unary | StreamType.ServerStreaming => Seq(requestParameter)
+            case StreamType.ClientStreaming                    => Seq(requestsParameter)
+            case StreamType.Bidirectional                      => Seq(requestBidiParameter)
         }
     }
 

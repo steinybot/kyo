@@ -21,8 +21,11 @@ private[grpc] class ClientStreamingServerCallHandler[Request, Response](f: GrpcH
             Sync.defer(call.request(chunk.size))
 
         for
+            _ <- Console.printLine("ClientStreamingServerCallHandler: getting response from channel")
             response <- handler(channel.streamUntilClosed().tapChunk(onChunk))
+            _ <- Console.printLine("ClientStreamingServerCallHandler: sending response")
             _        <- Sync.defer(call.sendMessage(response))
+            _ <- Console.printLine("ClientStreamingServerCallHandler: response sent")
         yield Status.OK
         end for
     end send

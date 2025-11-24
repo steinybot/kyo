@@ -36,7 +36,7 @@ private[compiler] object Types {
 
     def grpcRequestInit(request: String) = s"_root_.kyo.grpc.GrpcRequestInit[$request]"
 
-    def grpcRequestsInit(request: String) = s"_root_.kyo.grpc.GrpcRequestsInit[$request]"
+    def grpcRequestBidiInit(request: String) = s"_root_.kyo.grpc.GrpcRequestBidiInit[$request]"
 
     val serverCallHandlers = "_root_.kyo.grpc.ServerCallHandlers"
 

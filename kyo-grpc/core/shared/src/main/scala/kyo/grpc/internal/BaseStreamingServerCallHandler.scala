@@ -23,6 +23,8 @@ abstract private[grpc] class BaseStreamingServerCallHandler[Request, Response, H
         // WARNING: headers are definitely not thread-safe.
         // This handler has ownership of the call and headers, so we can use them with care.
 
+        println("BaseStreamingServerCallHandler.startCall")
+
         def sendAndClose(handler: Handler, channel: Channel[Request], ready: SignalRef[Boolean]) =
             for
                 (trailers, status) <-
@@ -50,14 +52,19 @@ abstract private[grpc] class BaseStreamingServerCallHandler[Request, Response, H
         val init =
             for
                 // Request 1 up front to ensure that we get the headers.
+                _ <- Console.printLine("BaseStreamingServerCallHandler: Requesting 1")
                 _ <- Sync.defer(call.request(1))
+                _ <- Console.printLine("BaseStreamingServerCallHandler: Handling headers")
                 (options, handler) <- f.handle(
                     Env.run(headers),
                     ResponseOptions.run
                 )
                 requestBuffer = options.requestBufferOrDefault
+                _ <- Console.printLine("BaseStreamingServerCallHandler: Sending headers")
                 _ <- options.sendHeaders(call)
+                _ <- Console.printLine("BaseStreamingServerCallHandler: Headers sent")
                 // Request the remaining messages to fill the request buffer.
+                _ <- Console.printLine("BaseStreamingServerCallHandler: Requesting more")
                 _         <- Sync.defer(if requestBuffer > 1 then call.request(requestBuffer - 1) else ())
                 ready     <- Signal.initRef(false)
                 channel   <- Channel.initUnscoped[Request](capacity = requestBuffer, access = Access.SingleProducerSingleConsumer)

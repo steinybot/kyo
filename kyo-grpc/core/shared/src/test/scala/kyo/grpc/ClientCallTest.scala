@@ -74,15 +74,15 @@ class ClientCallTest extends Test:
                 succeed
             }
 
-            "GrpcRequests type alias exists" in {
+            "GrpcRequestsPendingHeaders type alias exists" in {
                 // Verify the type alias compiles
-                def test(r: GrpcRequestsPendingHeaders[TestRequest]): Unit = ()
+                def test(r: GrpcRequestBidi[TestRequest]): Unit = ()
                 succeed
             }
 
-            "GrpcRequestsInit type alias exists" in {
+            "GrpcRequestBidiInit type alias exists" in {
                 // Verify the type alias compiles
-                def test(r: GrpcRequestsInit[TestRequest]): Unit = ()
+                def test(r: GrpcRequestBidiInit[TestRequest]): Unit = ()
                 succeed
             }
         }

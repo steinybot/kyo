@@ -96,21 +96,20 @@ class ServiceTest extends Test:
 
         "fail" - {
             "producing stream" in {
-//                forEvery(notOKStatusCodes) { code =>
-                val code = Status.Code.INTERNAL
-                run {
-                    val message  = "Yeah nah bro"
-                    val status   = code.toStatus.withDescription(message)
-                    val request  = Fail(message, status.getCode.value, outside = true)
-                    val expected = status.asException(emptyTrailers)
-                    for
-                        client   <- createClientAndServer
-                        // TODO: Can we avoid the lift here?
-                        response <- Abort.run[StatusException](client.oneToMany(Kyo.lift(request)).take(1).run)
-                    yield assertStatusException(response, expected)
-                    end for
+                forEvery(notOKStatusCodes) { code =>
+                    run {
+                        val message  = "Yeah nah bro"
+                        val status   = code.toStatus.withDescription(message)
+                        val request  = Fail(message, status.getCode.value, outside = true)
+                        val expected = status.asException(emptyTrailers)
+                        for
+                            client   <- createClientAndServer
+                            // TODO: Can we avoid the lift here?
+                            response <- Abort.run[StatusException](client.oneToMany(Kyo.lift(request)).take(1).run)
+                        yield assertStatusException(response, expected)
+                        end for
+                    }
                 }
-//                }
             }
 
             "first element" in {
