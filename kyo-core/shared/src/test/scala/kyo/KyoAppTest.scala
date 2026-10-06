@@ -1,11 +1,28 @@
 package kyo
 
-import Tagged.*
-import org.scalatest.compatible.Assertion
+import kyo.internal.Platform
 import scala.collection.mutable.ListBuffer
 import scala.util.Try
 
-class KyoAppTest extends Test:
+class KyoAppTest extends kyo.test.Test[Any]:
+
+    // Leaves drive full KyoApp runs via blocking KyoApp.Unsafe.runAndBlock plus Clock/Async timers.
+    // Run them sequentially so concurrent leaves don't starve the scheduler and exceed the per-leaf
+    // timeout under CI load (consistent with ClockTest/ChannelTest).
+    override def config = super.config.sequential
+
+    "activates the classpath-present stats providers before running the app's own code" in {
+        // The application entrypoint is where kyo-core reaches kyo.Stat, and the only place it does: an app
+        // whose own code never mentions a metric still gets a classpath-present host sampler collecting from
+        // the start. Any hook broad enough to cover a non-KyoApp process would have to sit on the
+        // fiber-creation path, which is not somewhere a stats concern belongs; such a host calls
+        // Stat.activate() itself.
+        val before = Stat.activationCount
+        val app    = new KyoApp:
+            run(Sync.defer("done"))
+        app.main(Array.empty)
+        assert(Stat.activationCount > before)
+    }
 
     "main" in {
         val app = new KyoApp:
@@ -16,35 +33,43 @@ class KyoAppTest extends Test:
             }
 
         app.main(Array("arg1", "arg2"))
-        succeed
+        succeed("main completes without error")
     }
 
-    "multiple runs" in runNotJS {
-        for
-            ref <- AtomicInt.init(0)
-            app = new KyoApp:
-                run { ref.getAndIncrement }
-                run { ref.getAndIncrement }
-                run { ref.getAndIncrement }
+    // KyoApp.main on Native initializes the full runtime per call — "ordered runs"
+    // takes ~10 min on Windows Native, so 3 sequential main() calls exceed the timeout.
+    "multiple runs".notJs in {
+        assume(!Platform.isNative, "KyoApp.main too slow on Native for repeated calls")
+        {
+            for
+                ref <- AtomicInt.init(0)
+                app = new KyoApp:
+                    run { ref.getAndIncrement }
+                    run { ref.getAndIncrement }
+                    run { ref.getAndIncrement }
 
-            _    <- Sync.defer(app.main(Array.empty))
-            runs <- ref.get
-        yield assert(runs == 3)
+                _    <- Sync.defer(app.main(Array.empty))
+                runs <- ref.get
+            yield assert(runs == 3)
+        }
     }
 
+    // KyoApp.main on Native initializes the full runtime per call — takes
+    // ~10 minutes on Windows Native, which is prohibitively expensive.
     "ordered runs" in {
+        assume(!Platform.isNative, "KyoApp.main too slow on Native")
         val x       = new ListBuffer[Int]
-        val promise = scala.concurrent.Promise[Assertion]()
-        val app = new KyoApp:
+        val promise = scala.concurrent.Promise[Unit]()
+        val app     = new KyoApp:
             run { Async.delay(10.millis)(Sync.defer(x += 1)) }
             run { Async.delay(10.millis)(Sync.defer(x += 2)) }
             run { Async.delay(10.millis)(Sync.defer(x += 3)) }
             run { Sync.defer(promise.complete(Try(assert(x.toList == List(1, 2, 3))))) }
         app.main(Array.empty)
-        promise.future
+        Async.fromFuture(promise.future)
     }
 
-    "effects" in runNotJS {
+    "effects".notJs in {
         def run: Int < (Async & Scope & Abort[Throwable]) =
             for
                 _ <- Clock.repeatAtInterval(1.second, 1.second)(())
@@ -59,9 +84,9 @@ class KyoAppTest extends Test:
         assert(KyoApp.Unsafe.runAndBlock(Duration.Infinity)(run) == Result.succeed(1))
     }
 
-    "effects in JS" in runNotJS {
-        val promise = scala.concurrent.Promise[Assertion]()
-        val app = new KyoApp:
+    "effects in JS".notJs in {
+        val promise = scala.concurrent.Promise[Unit]()
+        val app     = new KyoApp:
             run {
                 for
                     _ <- Clock.repeatAtInterval(1.second, 1.second)(())
@@ -70,14 +95,14 @@ class KyoAppTest extends Test:
                     _ <- Clock.now
                     _ <- Scope.ensure(())
                     _ <- Async.sleep(1.second)
-                yield promise.complete(Try(succeed))
+                yield promise.complete(Try(()))
             }
         app.main(Array.empty)
-        promise.future
+        Async.fromFuture(promise.future).map(_ => succeed("all effects complete without error"))
     }
 
-    "exit on error" in runNotJS {
-        var exitCode = -1
+    "exit on error".notJs in {
+        var exitCode                   = -1
         def app(fail: Boolean): KyoApp = new KyoApp:
             override def exit(code: Int)(using AllowUnsafe): Unit = exitCode = code
             run(Abort.when(fail)(new IllegalArgumentException("Aborts!")))
@@ -89,7 +114,7 @@ class KyoAppTest extends Test:
         assert(exitCode == -1)
     }
 
-    "failing effects" in runNotJS {
+    "failing effects".notJs in {
         def run: Unit < (Async & Scope & Abort[Throwable]) =
             for
                 _ <- Clock.now
@@ -101,6 +126,57 @@ class KyoAppTest extends Test:
         KyoApp.Unsafe.runAndBlock(Duration.Infinity)(run) match
             case Result.Failure(exception: RuntimeException) => assert(exception.getMessage == "Aborts!")
             case _                                           => fail("Unexpected Success...")
+    }
+
+    "non-throwable aborts".notJs in {
+        val app = new KyoApp:
+            run(Abort.fail("Aborts!"))
+
+        assert(Result.catching[KyoApp.FailureException](app.main(Array.empty)).isFailure)
+    }
+
+    "unsafe non-throwable aborts".notJs in {
+        def run: Unit < (Async & Scope & Abort[String]) =
+            for
+                _ <- Clock.now
+                _ <- Random.nextInt
+                _ <- Abort.fail("Aborts!")
+            yield ()
+
+        import AllowUnsafe.embrace.danger
+        KyoApp.Unsafe.runAndBlock(Duration.Infinity)(run) match
+            case Result.Failure(exception: KyoApp.FailureException) => assert(exception.error.toString == "Aborts!")
+            case _                                                  => fail("Unexpected Success...")
+    }
+
+    // An application's stdout is its output contract, so a failure the run block did not catch belongs on stderr. It used to be rendered
+    // to stdout, which put a non-JSON line on the channel a stdio server's host was parsing, and made the host's first read of the
+    // connection garbage. No discipline in the run block avoided it: this is the framework's own terminal reporting.
+    // notJs / notWasm: on those platforms KyoApp.main cannot block, so it returns before the run block writes anything and the redirect
+    // scope has already closed. The reporting itself is shared, platform-independent code in KyoAppRunner.onResult; only observing it from
+    // inside the same process needs main to have finished.
+    "an uncaught failure renders to stderr, leaving stdout untouched".notJs.notWasm in {
+        assume(!Platform.isNative, "KyoApp.main too slow on Native")
+        val out = new java.io.ByteArrayOutputStream
+        val err = new java.io.ByteArrayOutputStream
+        val app = new KyoApp:
+            run { Abort.fail("no url") }
+        // main rethrows the failure as a FailureException after reporting it; the rethrow is the process's non-zero exit and is not what
+        // this case is about.
+        discard(Try(scala.Console.withOut(out)(scala.Console.withErr(err)(app.main(Array.empty)))))
+        assert(out.toString == "")
+        assert(err.toString.contains("no url"))
+    }
+
+    "a run block's value still renders to stdout".notJs.notWasm in {
+        assume(!Platform.isNative, "KyoApp.main too slow on Native")
+        val out = new java.io.ByteArrayOutputStream
+        val err = new java.io.ByteArrayOutputStream
+        val app = new KyoApp:
+            run { "the value" }
+        scala.Console.withOut(out)(scala.Console.withErr(err)(app.main(Array.empty)))
+        assert(out.toString.contains("the value"))
+        assert(err.toString == "")
     }
 
     "effect mismatch" in {
@@ -119,6 +195,26 @@ class KyoAppTest extends Test:
         """)(
             "Found:    Int < kyo.Var[Int]"
         )
+    }
+
+    // The body releases a latch as it starts and owes
+    // a finalizer, so the check is on that finalizer once the body has started. The timeout is a real one because the
+    // block parks the calling thread (nothing asserts on elapsed time).
+    "runAndBlock's timeout does not leave the forked computation running".notJs.notWasm in {
+        for
+            gate     <- Promise.init[Unit, Any]
+            started  <- Latch.init(1)
+            released <- AtomicBoolean.init(false)
+            result   <- Abort.run[Timeout](KyoApp.runAndBlock(10.millis)(
+                Sync.ensure(released.set(true))(started.release.andThen(gate.get))
+            ))
+            _ = assert(result.failure.exists(_.isInstanceOf[Timeout]), s"the block must report the timeout, got $result")
+            // A body the deadline beat to its first step owes nothing, and "never started" has no event to wait on, so this
+            // one wait is bounded. A body that did start must run its finalizer, which the leaf timeout reports otherwise.
+            ran <- Abort.run[Timeout](Async.timeout(2.seconds)(started.await))
+            _   <- if ran.isSuccess then assertEventually(released.get) else Kyo.unit
+        yield succeed
+        end for
     }
 
 end KyoAppTest

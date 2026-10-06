@@ -5,6 +5,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.LongAdder
 import kyo.scheduler.top.WorkerStatus
+import kyo.scheduler.util.ThreadUserTime
 import scala.annotation.nowarn
 import scala.util.control.NonFatal
 
@@ -17,36 +18,41 @@ import scala.util.control.NonFatal
   *   - Thread state monitoring and stall detection
   *   - Performance metrics collection
   *
-  * ==Task Execution==
+  * #### Task Execution
   *
   * Workers maintain a priority queue of pending tasks and execute them according to their priority ordering. Each task runs until either:
   *   - It completes naturally
   *   - It exceeds its time slice and is preempted
   *   - The worker is instructed to stop
   *
-  * ==Preemption==
+  * #### Preemption
   *
   * The worker monitors task execution time and preempts long-running tasks that exceed the configured time slice. Preempted tasks are
   * re-queued to allow other tasks to execute, implementing fair scheduling. This prevents individual tasks from monopolizing the worker
   * thread.
   *
-  * ==Work Stealing==
+  * #### Work Stealing
   *
   * When a worker's queue is empty, it attempts to steal tasks from other workers that have higher load. The stealing mechanism uses atomic
   * batch transfers to move multiple tasks at once, maintaining priority ordering while balancing load across workers. This improves overall
   * scheduler throughput by keeping workers busy.
   *
-  * ==State Management==
+  * #### State Management
   *
-  * The worker transitions between three states:
+  * The worker transitions between four states:
   *   - Idle: No tasks to execute
+  *   - Dispatched: A thread was requested from the executor but has not claimed the worker yet
   *   - Running: Actively executing tasks
   *   - Stalled: Detected as blocked or exceeding time slice
+  *
+  * The scheduler has no recovery of its own for a dispatch the executor accepts and then drops: it relies on the executor honoring
+  * every accepted runnable. A worker reported as not running, with load above zero and no mount thread, is that failure's
+  * fingerprint in a status dump.
   *
   * Thread state monitoring detects when workers become blocked on I/O or synchronization, allowing the scheduler to compensate by not
   * scheduling new tasks to blocked workers.
   *
-  * ==Thread Management==
+  * #### Thread Management
   *
   * Workers use an ephemeral thread model where they acquire threads from the executor only when actively processing tasks:
   *   - Thread is mounted when the worker begins processing tasks
@@ -70,7 +76,7 @@ import scala.util.control.NonFatal
   *   Maximum time slice for task execution before preemption
   *
   * @see
-  *   Queue for details on the underlying task queue implementation
+  *   WorkerQueue for details on the underlying task queue implementation
   * @see
   *   Task for the task execution model
   * @see
@@ -89,16 +95,47 @@ abstract private class Worker(
 
     protected def shouldStop(): Boolean
 
+    /** Returns the current interrupt epoch from the scheduler. Each call to Scheduler.notifyInterrupt
+      * bumps this value; rebalance compares it against lastRebuiltEpoch to gate queue rebuilds.
+      */
+    protected def currentInterruptEpoch(): Long
+
     val a1, a2, a3, a4, a5, a6, a7 = 0L // padding
 
     private val state = new AtomicReference[State](State.Idle)
 
-    @volatile private var mount: Thread = null
+    @volatile private[scheduler] var mount: Thread = null
+    // -1 = not mounted (idle or never started). Set to the thread's CPU-time ID
+    // at the start of run(), reset to -1 on exit. Published by currentTask volatile.
+    private[scheduler] var mountId: Long = -1L
+    // Not volatile: written by BlockingMonitor timer thread (~2ms), read by cycleWorkers timer
+    // thread (~100μs). Stale reads are acceptable: this is a scheduling heuristic, not a
+    // correctness constraint. Worst case: a blocked worker accepts one extra task before
+    // detection, which is then drained on the next cycle.
+    private[scheduler] var blocked: Boolean = false
+
+    // Coordinates between BlockingMonitor's interrupt dispatch and task cleanup.
+    // Prevents the TOCTOU race where Thread.interrupt() dispatched for task A arrives
+    // after task B starts on the same worker. Both monitor and worker acquire this lock:
+    // monitor before dispatch, worker before clearing currentTask + Thread.interrupted().
+    private[scheduler] val interruptLock = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Held while checkAvailability's drain re-schedules this worker's tasks. Re-scheduling a drained task scans the other
+    // workers, whose drains scan this one again while it is still Stalled and refilled by the fallback placement; draining it
+    // again there nests without bound (StackOverflowError on the scheduling thread, and the tasks it had drained are lost). A
+    // flag rather than a State: the drain runs on another thread, and the owner's plain `state.set` in the run loop would
+    // erase a state.
+    private val draining = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+    @scala.annotation.tailrec
+    private def acquireInterruptLock(): Unit =
+        if (!interruptLock.compareAndSet(false, true))
+            acquireInterruptLock()
 
     val b1, b2, b3, b4, b5, b6, b7 = 0L // padding
 
-    @volatile private var taskStartMs       = 0L
-    @volatile private var currentTask: Task = null
+    @volatile private var taskStartMs                  = 0L
+    @volatile private[scheduler] var currentTask: Task = null
 
     val c1, c2, c3, c4, c5, c6, c7 = 0L // padding
 
@@ -108,9 +145,14 @@ abstract private class Worker(
     private var mounts      = 0L
     private var stolenTasks = 0L
 
+    // Epoch and timestamp of this worker's last queue rebuild. Single-thread-owned by the
+    // worker's own run loop (read and written only inside rebalance), so plain vars suffice.
+    private var lastRebuiltEpoch = 0L
+    private var lastRebuildMs    = 0L
+
     private val lostTasks = new LongAdder
 
-    private val queue = new Queue[Task]()
+    private val queue = new WorkerQueue()
 
     private val schedule = scheduleTask(_, this)
 
@@ -121,11 +163,12 @@ abstract private class Worker(
         wakeup()
     }
 
-    /** Transitions the worker from Idle to Running state and requests a new thread from the executor if successful. Used when new work
-      * arrives for an idle worker.
+    /** Transitions the worker from Idle to Dispatched and requests a thread from the executor. run() claims the
+      * worker by taking the Dispatched -> Running edge, so a dispatch that never mounts leaves the worker
+      * Dispatched, which is what recoverStrand detects.
       */
     def wakeup() = {
-        if ((state.get() eq State.Idle) && state.compareAndSet(State.Idle, State.Running))
+        if ((state.get() eq State.Idle) && state.compareAndSet(State.Idle, State.Dispatched))
             exec.execute(this)
     }
 
@@ -155,18 +198,79 @@ abstract private class Worker(
     def drain(): Unit =
         queue.drain(schedule)
 
+    /** The drain of an unavailable worker found by `checkAvailability`. A no-op while one is already in progress on any thread: what
+      * arrives meanwhile stays queued for the next check.
+      *
+      * The run loop's exit and `Scheduler.flush` call `drain` itself, unconditionally. A task enqueued after a concurrent drain took its
+      * snapshot and before the loop set this worker idle gets no wakeup, since the enqueue saw it running, and would sit until the next
+      * check drained it: the exit's own drain is what hands it on.
+      */
+    private def drainUnavailable(): Unit =
+        if (draining.compareAndSet(false, true))
+            try drain()
+            finally draining.set(false)
+
+    /** Re-heapifies this worker's own queue when an interrupt has reset a queued task's runtime in place.
+      *
+      * Gated on two conditions so the common case stays off the hot path: the epoch from currentInterruptEpoch
+      * (bumped by Scheduler.notifyInterrupt on every real interrupt) must have advanced past lastRebuiltEpoch,
+      * and at least minInterval milliseconds must have elapsed since the last rebuild. When both hold,
+      * queue.rebuild() re-establishes priority order in O(n), sifting the reset task (now lowest runtime) to
+      * the head so the next poll returns it within a bounded, load-independent delay. Operates only on this
+      * worker's own queue.
+      */
+    private def rebalance(): Unit = {
+        val epoch = currentInterruptEpoch()
+        if (epoch != lastRebuiltEpoch) {
+            val now = clock.currentMillis()
+            if (now - lastRebuildMs >= minInterval()) {
+                queue.rebuild()
+                lastRebuiltEpoch = epoch
+                lastRebuildMs = now
+            }
+        }
+    }
+
     /** Checks if this worker can accept new tasks by verifying:
       *   - Not stalled on a long-running task
       *   - Not in Stalled state
       *   - Thread not blocked on I/O or synchronization
       *
-      * If checks fail while Running, transitions to Stalled and drains queue. Used by scheduler to skip workers that can't make progress.
+      * If checks fail while Running, transitions to Stalled and drains queue. A worker already Stalled drains again whenever it holds
+      * queued work it cannot serve: while blocked, or while its task stays over its slice. Used by scheduler to skip workers that can't
+      * make progress.
       */
     def checkAvailability(nowMs: Long): Boolean = {
-        val st        = this.state.get()
-        val available = !checkStalling(nowMs) && (st ne State.Stalled) && !isBlocked()
-        if (!available && (st eq State.Running) && state.compareAndSet(State.Running, State.Stalled))
-            drain()
+        val st = this.state.get()
+        // Evaluate checkStalling for any non-blocked worker, not just a Running one: a worker already in Stalled
+        // state but pinned on a long-running, preemptible CPU-bound task must still receive doPreempt once work
+        // queues up behind it. Otherwise a worker that stalled while its queue was momentarily empty (no doPreempt
+        // issued) stays Stalled forever, never re-checked, spinning the task while its queue grows unbounded, which
+        // deadlocks the scheduler under CPU-bound load. Blocked workers are excluded: their task is parked on I/O,
+        // not burning a time slice, so it is the BlockingMonitor's Thread.interrupt (not a time-slice doPreempt)
+        // that frees them. Issuing doPreempt against a blocked task is pointless and, on Native, unsafe.
+        val stalling  = !blocked && checkStalling(nowMs)
+        val available = (st ne State.Stalled) && !blocked && !stalling
+        if (!available) {
+            if ((st eq State.Running) && state.compareAndSet(State.Running, State.Stalled))
+                drainUnavailable()
+            else if ((blocked || stalling) && !queue.isEmpty())
+                // Drain again for a worker that is ALREADY Stalled and still cannot serve its queue. The transition drain
+                // above fires once, on the Running -> Stalled edge, but tasks keep arriving after it: Scheduler.schedule
+                // places on an unavailable worker once no worker is available, and a worker can block, or overrun its
+                // slice, at any point after a task was handed to it. Such a task is stranded, because nothing else frees
+                // the queue: stealing is opportunistic (a thief must sample this worker while its own queue is empty, and
+                // an idle worker is woken only by an enqueue onto itself), and run() polls the queue only once the current
+                // task yields. A blocked task is parked in a syscall and gets no doPreempt (pointless, and on Native
+                // unsafe), so it yields when the syscall returns. A task still over its slice was issued doPreempt by
+                // checkStalling and has not honored it, which is what a nested evaluation (a finalizer, an unsafe run) or a
+                // step with no suspension point does, so it yields when it is done. Either way the queue waits on the task,
+                // and the wait deadlocks outright when the task is itself waiting, directly or through another fiber, on the
+                // stranded work: an I/O driver parked in a poll whose event the stranded task would produce, or a finalizer
+                // spinning on a flag the stranded task sets. A task that honors the preemption yields within its next
+                // suspension point and run() then polls its own queue, so the drain moves at most the arrivals of one cycle.
+                drainUnavailable()
+        }
         available
     }
 
@@ -174,78 +278,136 @@ abstract private class Worker(
         val task    = currentTask
         val start   = taskStartMs
         val stalled = (task ne null) && start > 0 && start < nowMs - timeSliceMs
-        if (stalled && !queue.isEmpty()) {
+        if (stalled) {
+            // Preempt a long-running task even when this worker's own queue is empty. The task may be
+            // pinned on work that cannot progress until a task stranded on another worker's queue runs:
+            // e.g. a fiber blocked in runAndBlock parks its carrier, and the completer that would
+            // unblock it can be enqueued onto that now-parked worker (the producer cannot avoid this:
+            // a worker can block after a task is submitted to it). The pinned worker is then the only
+            // one that can make progress, but it never would, because with an empty local queue it has
+            // no reason to yield and run() never reaches the steal path. Preempting unconditionally lets
+            // run() attempt a steal and pick that stranded work up. With local work queued the behavior
+            // is unchanged: the preempted task interleaves with the queued tasks.
             task.doPreempt()
         }
         stalled
     }
 
-    private def isBlocked(): Boolean = {
-        val mount = this.mount
-        (mount ne null) && {
-            val state = mount.getState().ordinal()
-            state == Thread.State.BLOCKED.ordinal() ||
-            state == Thread.State.WAITING.ordinal() ||
-            state == Thread.State.TIMED_WAITING.ordinal()
-        }
-    }
-
     def run(): Unit = {
+        // Clear any stale interrupt from pool reuse before the ownership claim, so a loser that bows out below
+        // does not carry a leftover interrupt back into the pooled thread.
+        Thread.interrupted()
+        // Claim the worker by taking the Dispatched -> Running edge. A strand-recovery re-dispatch can race the
+        // original dispatch when that original was merely slow rather than lost; the loser of this CAS returns
+        // immediately, before writing any single-owner field, so the worker is never mounted by two threads.
+        if (!state.compareAndSet(State.Dispatched, State.Running)) return
         // Set up worker state
         mounts += 1
         mount = Thread.currentThread()
+        mountId = ThreadUserTime.currentThreadId()
         setCurrent(this)
         var task: Task = null
+        // Set once the idle path below releases ownership of the worker. After that a successor run()
+        // may own it, so the finally must not write any shared field (state, mount, mountId, queue).
+        var released = false
 
-        while (true) {
-            // Mark worker as actively running
-            state.set(State.Running)
+        try
+            while (!shouldStop()) {
+                // Re-sift the queue if an interrupt reset a queued task, before polling so the
+                // reset victim reaches the head and the next poll returns it (epoch-and-time-gated).
+                rebalance()
 
-            if (task eq null)
-                // Try to get a task from our own queue first
-                task = queue.poll()
+                // Mark worker as actively running
+                state.set(State.Running)
 
-            if (task eq null) {
-                // If our queue is empty, try to steal work from another worker
-                task = stealTask(this)
-                if (task ne null)
-                    // Track number of stolen tasks including batch size
-                    stolenTasks += queue.size() + 1
-            }
+                if (task eq null)
+                    // Try to get a task from our own queue first
+                    task = queue.poll()
 
-            if (task ne null) {
-                // We have a task to execute
-                executions += 1
-                if (runTask(task) == Task.Preempted) {
-                    // Task was preempted - add it back to queue and get next task
-                    preemptions += 1
-                    task = queue.addAndPoll(task)
-                } else {
-                    // Task completed normally
-                    completions += 1
+                if (task eq null) {
+                    // If our queue is empty, try to steal work from another worker
+                    task = stealTask(this)
+                    if (task ne null)
+                        // Track number of stolen tasks including batch size
+                        stolenTasks += queue.size() + 1
+                }
+
+                if (task ne null) {
+                    // We have a task to execute
+                    val current = task
                     task = null
-                }
-            } else {
-                // No tasks available - prepare to go idle
-                state.set(State.Idle)
-                if (queue.isEmpty() || !state.compareAndSet(State.Idle, State.Running)) {
-                    // Either queue is empty or another thread changed our state
-                    // Clean up and exit
+                    executions += 1
+                    if (runTask(current) == Task.Preempted) {
+                        preemptions += 1
+                        if (current.needsInterrupt())
+                            // Interrupted during its slice: never requeue (a racy runtime key could starve
+                            // it). Run it again immediately; eval observes the interrupt and finalizes.
+                            task = current
+                        else {
+                            // Add the preempted task back and pick the next local task. addAndPoll returns
+                            // `current` itself only when the local queue was empty; in that case attempt a
+                            // steal before resuming `current`. This is what lets a worker pinned on a task
+                            // that cannot progress (until work stranded on a blocked worker's queue runs)
+                            // yield its core to that stranded work instead of spinning on `current`. With
+                            // local work queued, addAndPoll returns it and we run it as before.
+                            val next = queue.addAndPoll(current)
+                            if (next ne current)
+                                task = next
+                            else {
+                                val stolen = stealTask(this)
+                                if (stolen ne null) {
+                                    stolenTasks += queue.size() + 1
+                                    // Re-enqueue `current` (it keeps its accumulated runtime, so it sorts
+                                    // behind the stolen work) and run the stolen task now.
+                                    queue.add(current)
+                                    task = stolen
+                                } else
+                                    task = current
+                            }
+                        }
+                    } else {
+                        // Task completed normally
+                        completions += 1
+                    }
+                } else {
+                    // No tasks available: go idle. Clear the active-run fields BEFORE publishing Idle:
+                    // while state is Running or Stalled no successor can be dispatched, so these writes
+                    // cannot race one. Once Idle is published the Idle edge has two contenders, this
+                    // invocation's re-claim (Idle -> Running) and a wakeup (Idle -> Dispatched, whose
+                    // successor claims at entry); the CAS arbitration leaves exactly one owner.
+                    blocked = false
+                    mountId = -1L
                     mount = null
-                    clearCurrent()
-                    return
+                    state.set(State.Idle)
+                    if (queue.isEmpty() || !state.compareAndSet(State.Idle, State.Running)) {
+                        // Queue empty or a wakeup took the Idle edge first (its successor now owns the
+                        // worker): either way this invocation is done. Leave the shared fields untouched
+                        // so a successor's setup is not clobbered.
+                        released = true
+                        return
+                    }
+                    mount = Thread.currentThread()
+                    mountId = ThreadUserTime.currentThreadId()
                 }
             }
-
-            // Check if we should stop processing tasks
-            if (shouldStop()) {
+        finally {
+            if (!released) {
+                // Owner exit: shouldStop or a fatal Throwable escaping runTask. We still own the worker
+                // (at loop exit state is Running/Stalled, never Idle, so no successor can have spawned).
+                // Clear the single-owner fields BEFORE publishing Idle; those (not drain) are what would
+                // clobber a successor that mounts once Idle is visible. Publish Idle, then drain LAST: a
+                // task enqueued while we were not yet Idle had its producer's wakeup skip dispatch, so the
+                // post-Idle drain hands it off. Safe after Idle because WorkerQueue is spin-locked and
+                // drain writes no single-owner field; strand-free because the @volatile count the idle
+                // double-check relies on makes the pre-Idle add visible to drain here.
+                blocked = false
+                mountId = -1L
+                mount = null
+                if (task ne null) queue.add(task)
                 state.set(State.Idle)
-                // Reschedule current task if we have one
-                if (task ne null) schedule(task)
-                // Drain remaining tasks from queue
                 drain()
-                return
             }
+            clearCurrent()
         }
     }
 
@@ -261,8 +423,11 @@ abstract private class Worker(
                 thread.getUncaughtExceptionHandler().uncaughtException(thread, ex)
                 Task.Done
         } finally {
+            acquireInterruptLock()
             currentTask = null
             taskStartMs = 0
+            Thread.interrupted() // clear stale interrupt flag before next task
+            interruptLock.set(false)
             task.addRuntime((clock.currentMillis() - start).asInstanceOf[Int])
         }
     }
@@ -276,7 +441,8 @@ abstract private class Worker(
             statsScope.counterGauge("completions")(completions),
             statsScope.counterGauge("mounts")(mounts),
             statsScope.counterGauge("stolen_tasks")(stolenTasks),
-            statsScope.counterGauge("lost_tasks")(lostTasks.sum())
+            statsScope.counterGauge("lost_tasks")(lostTasks.sum()),
+            statsScope.counterGauge("drain_put_backs")(queue.drainPutBacks.sum())
         )
 
     def status(): WorkerStatus = {
@@ -285,14 +451,15 @@ abstract private class Worker(
                 case null =>
                     ("", "")
                 case mount: Thread =>
-                    (mount.getName(), mount.getStackTrace().head.toString())
+                    val trace = mount.getStackTrace()
+                    (mount.getName(), if (trace.nonEmpty) trace.head.toString() else "")
             }
         WorkerStatus(
             id,
             state.get() eq State.Running,
             thread,
             frame,
-            isBlocked(),
+            blocked,
             checkStalling(clock.currentMillis()),
             executions,
             preemptions,
@@ -307,15 +474,19 @@ abstract private class Worker(
 
 private object Worker {
 
-    final class WorkerThread(init: Runnable) extends Thread(init) {
+    // Created without inheriting the creator's thread-locals (the final `false` is `inheritThreadLocals`): a worker spawned by a busy parent would
+    // otherwise share the parent's Scala Native `StackTrace` unwind-cursor `Context`, and two threads driving one cursor corrupt it into a native SIGSEGV.
+    final class WorkerThread(init: Runnable)
+        extends Thread(null, init, "kyo-scheduler-worker", 0L, false) {
         var currentWorker: Worker = null
     }
 
     sealed trait State
     object State {
-        case object Idle    extends State
-        case object Running extends State
-        case object Stalled extends State
+        case object Idle       extends State
+        case object Dispatched extends State
+        case object Running    extends State
+        case object Stalled    extends State
     }
 
     private[Worker] object internal {

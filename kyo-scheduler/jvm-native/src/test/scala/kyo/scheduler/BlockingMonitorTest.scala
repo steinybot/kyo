@@ -1,0 +1,1290 @@
+package kyo.scheduler
+
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.locks.ReentrantLock
+import kyo.scheduler.util.ThreadUserTime
+import org.scalatest.NonImplicitAssertions
+import org.scalatest.concurrent.Eventually
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.time.Millis
+import org.scalatest.time.Seconds
+import org.scalatest.time.Span
+
+class BlockingMonitorTest extends AnyFreeSpec with NonImplicitAssertions with Eventually {
+
+    /** The budget for the leaves that state no timeout of their own; see SchedulerTest for why the default one is unusable here. */
+    implicit override val patienceConfig: PatienceConfig =
+        PatienceConfig(timeout = Span(15, Seconds), interval = Span(50, Millis))
+
+    // ── shared scheduler (single instance for all scheduler-level tests) ─
+
+    private val scheduler = new Scheduler(
+        TestExecutors.cached,
+        TestExecutors.scheduled,
+        TestExecutors.scheduled
+    )
+
+    // ── shared helpers ──────────────────────────────────────────────────
+
+    /** Finds the worker status for a task by checking which worker is blocked */
+    private def blockedWorkerStatus(): Option[kyo.scheduler.top.WorkerStatus] =
+        scheduler.status().workers.find(w => (w ne null) && w.isBlocked)
+
+    private def blockedWorkerCount(): Int =
+        scheduler.status().workers.count(w => (w ne null) && w.isBlocked)
+
+    /** Runs `check` with the id of a daemon thread parked on a latch for the duration, whose user CPU time is flat by construction. */
+    private def withParkedThread(check: Array[Long] => Unit): Unit = {
+        val started  = new CountDownLatch(1)
+        val release  = new CountDownLatch(1)
+        val threadId = new AtomicLong(0L)
+        val thread   = new Thread((() => {
+            threadId.set(ThreadUserTime.currentThreadId())
+            started.countDown()
+            try { val _ = release.await(30, TimeUnit.SECONDS) }
+            catch { case _: InterruptedException => () }
+        }): Runnable)
+        thread.setDaemon(true)
+        thread.start()
+        assert(started.await(5, TimeUnit.SECONDS))
+        try check(Array(threadId.get()))
+        finally {
+            release.countDown()
+            thread.join(5000)
+        }
+    }
+
+    /** Runs a blocking operation on a thread and verifies the detector identifies it as blocked. Uses latches for synchronization — no
+      * Thread.sleep needed since blocked threads have flat CPU time immediately.
+      */
+    private def assertDetectsBlocking(setup: () => AutoCloseable = () => NoOpCloseable)(op: CountDownLatch => Unit): Unit = {
+        val resource = setup()
+        try {
+            val detector = new BlockingMonitor(1)
+            val started  = new CountDownLatch(1)
+            val done     = new CountDownLatch(1)
+            val threadId = new AtomicLong(0L)
+            val thread   = new Thread((() => {
+                threadId.set(ThreadUserTime.currentThreadId())
+                started.countDown()
+                op(done)
+            }): Runnable)
+            thread.setDaemon(true)
+            thread.start()
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            val ids = Array(threadId.get())
+            eventually(timeout(scaled(org.scalatest.time.Span(5, org.scalatest.time.Seconds)))) {
+                detector.sample(ids, 1)
+                assert(detector.isBlocked(0), "thread should be detected as blocked")
+            }
+
+            done.countDown()
+            thread.interrupt()
+            thread.join(5000)
+        } finally
+            resource.close()
+    }
+
+    /** Runs an active operation and verifies the detector does NOT identify it as blocked. Waits for the thread to accumulate CPU time (via
+      * warmUp latch), then samples the detector.
+      */
+    private def assertNotBlocked(op: (CountDownLatch, AtomicBoolean) => Unit): Unit = {
+        val detector = new BlockingMonitor(1)
+        val started  = new CountDownLatch(1)
+        val warmedUp = new CountDownLatch(1)
+        val stop     = new AtomicBoolean(false)
+        val threadId = new AtomicLong(0L)
+        val thread   = new Thread((() => {
+            threadId.set(ThreadUserTime.currentThreadId())
+            started.countDown()
+            op(warmedUp, stop)
+        }): Runnable)
+        thread.setDaemon(true)
+        thread.start()
+        assert(started.await(5, TimeUnit.SECONDS))
+        assert(warmedUp.await(5, TimeUnit.SECONDS))
+
+        val ids = Array(threadId.get())
+        assertNotBlockedActive(detector, ids)
+
+        stop.set(true)
+        thread.join(5000)
+    }
+
+    /** Asserts the detector never flags position 0 as blocked while its thread is actively running, bracketing the detector's own window with an
+      * independent read of the thread's user CPU time. The detector calls a thread "blocked" when its user time did not advance between two samples,
+      * which is exactly what a spinning thread looks like when CI oversubscription starves it of a scheduling slice. Reading the user time right
+      * after sample n-1 (cPrev) and right before sample n (cCur) and asserting only when cCur > cPrev means the assertion fires solely on a window
+      * that (by monotonicity) also advanced for the detector, so a starved spinner just retries. Deterministic under arbitrary starvation, no product change.
+      */
+    private def assertNotBlockedActive(detector: BlockingMonitor, ids: Array[Long]): Unit = {
+        val cpuBuf          = new Array[Long](1)
+        def userCpu(): Long = { ThreadUserTime.userTimes(ids, 1, cpuBuf); cpuBuf(0) }
+        detector.sample(ids, 1)
+        var cPrev = userCpu()
+        val _     = eventually(timeout(scaled(org.scalatest.time.Span(30, org.scalatest.time.Seconds)))) {
+            val cCur = userCpu()
+            detector.sample(ids, 1)
+            val advanced = cCur > cPrev
+            cPrev = cCur
+            assert(advanced, "the active thread accumulated no CPU time in this detector window (host-starved); retrying")
+            assert(!detector.isBlocked(0), "active thread should not be detected as blocked")
+        }
+    }
+
+    private object NoOpCloseable extends AutoCloseable { def close(): Unit = () }
+
+    /** Holds `check` across `cycles` completed scans of the blocking monitor.
+      *
+      * Counting the monitor's own scans, not wall time, fixes the observation window regardless of host
+      * speed (a timed wait could catch no scans at all). The deadline only bails out a stalled monitor.
+      */
+    private def acrossMonitorCycles(cycles: Long)(check: => Any): Unit = {
+        val target   = scheduler.blockingMonitor.cycles + cycles
+        val deadline = System.nanoTime() + 60L * 1000 * 1000 * 1000
+        while (scheduler.blockingMonitor.cycles < target) {
+            val _ = check
+            assert(System.nanoTime() < deadline, s"the blocking monitor did not complete $cycles scans")
+            Thread.`yield`()
+        }
+        val _ = check
+    }
+
+    /** Waits until the blocking monitor has completed `cycles` scans. */
+    private def awaitMonitorCycles(cycles: Long): Unit =
+        acrossMonitorCycles(cycles)(())
+
+    // Helper to spawn daemon threads that busy-spin to saturate CPU
+    private def spawnBusyThreads(count: Int): (Array[Thread], AtomicBoolean) = {
+        val stop    = new AtomicBoolean(false)
+        val started = new CountDownLatch(count)
+        val threads = (0 until count).map { i =>
+            val t = new Thread((() => {
+                started.countDown()
+                while (!stop.get()) ()
+            }): Runnable)
+            t.setDaemon(true)
+            t.setName(s"busy-spinner-$i")
+            t.start()
+            t
+        }.toArray
+        assert(started.await(10, TimeUnit.SECONDS), "busy threads should start")
+        (threads, stop)
+    }
+
+    private def cleanupBusyThreads(threads: Array[Thread], stop: AtomicBoolean): Unit = {
+        stop.set(true)
+        threads.foreach(_.join(5000))
+    }
+
+    // ── blocking detection (raw thread tests — no scheduler) ───────────────
+
+    "blocking detection" - {
+
+        "detects blocking" - {
+
+            "Thread.sleep — TIMED_WAITING" in {
+                assertDetectsBlocking() { done =>
+                    try { val _ = done.await(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                }
+            }
+
+            "LockSupport.park — WAITING" in {
+                assertDetectsBlocking() { done =>
+                    while (done.getCount > 0)
+                        LockSupport.parkNanos(1000000000L)
+                }
+            }
+
+            "Object.wait — WAITING" in {
+                val lock = new Object
+                assertDetectsBlocking() { done =>
+                    lock.synchronized {
+                        while (done.getCount > 0)
+                            try lock.wait(1000)
+                            catch { case _: InterruptedException => () }
+                    }
+                }
+            }
+
+            "ReentrantLock contention — WAITING" in {
+                val lock = new ReentrantLock()
+                lock.lock()
+                assertDetectsBlocking(() => { new AutoCloseable { def close(): Unit = lock.unlock() } }) { _ =>
+                    lock.lock()
+                    lock.unlock()
+                }
+            }
+
+            "ServerSocket.accept — RUNNABLE but blocked" in {
+                val server = new ServerSocket(0)
+                assertDetectsBlocking(() => server) { _ =>
+                    try { val _ = server.accept() }
+                    catch { case _: Exception => () }
+                }
+            }
+
+            "Socket.read — RUNNABLE but blocked" in {
+                val server = new ServerSocket(0)
+                val client = new Socket()
+                client.connect(new InetSocketAddress("127.0.0.1", server.getLocalPort))
+                val accepted = server.accept()
+                assertDetectsBlocking(() =>
+                    new AutoCloseable {
+                        def close(): Unit = { client.close(); accepted.close(); server.close() }
+                    }
+                ) { _ =>
+                    try { val _ = accepted.getInputStream.read() }
+                    catch { case _: Exception => () }
+                }
+            }
+
+            "Process.waitFor — WAITING" in {
+                assertDetectsBlocking() { done =>
+                    val proc = Runtime.getRuntime.exec(Array("sleep", "30"))
+                    try { val _ = proc.waitFor(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                    finally { val _ = proc.destroyForcibly() }
+                }
+            }
+        }
+
+        "does not detect blocking" - {
+
+            "CPU-bound computation" in {
+                assertNotBlocked { (warmedUp, stop) =>
+                    val end = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) ()
+                    warmedUp.countDown()
+                    while (!stop.get()) ()
+                }
+            }
+
+            "Thread.yield loop" in {
+                assertNotBlocked { (warmedUp, stop) =>
+                    val end = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) Thread.`yield`()
+                    warmedUp.countDown()
+                    while (!stop.get()) Thread.`yield`()
+                }
+            }
+
+            "busy-spin with AtomicInteger" in {
+                assertNotBlocked { (warmedUp, stop) =>
+                    val counter = new java.util.concurrent.atomic.AtomicInteger(0)
+                    val end     = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) { val _ = counter.incrementAndGet() }
+                    warmedUp.countDown()
+                    while (!stop.get()) { val _ = counter.incrementAndGet() }
+                }
+            }
+        }
+
+        "state transitions" - {
+
+            "blocking clears when thread resumes" in {
+                val detector  = new BlockingMonitor(1)
+                val started   = new CountDownLatch(1)
+                val unblock   = new CountDownLatch(1)
+                val computing = new CountDownLatch(1)
+                val stop      = new AtomicBoolean(false)
+                val threadId  = new AtomicLong(0L)
+                val thread    = new Thread((() => {
+                    threadId.set(ThreadUserTime.currentThreadId())
+                    started.countDown()
+                    try { val _ = unblock.await(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                    val end = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) ()
+                    computing.countDown()
+                    while (!stop.get()) ()
+                }): Runnable)
+                thread.setDaemon(true)
+                thread.start()
+                assert(started.await(5, TimeUnit.SECONDS))
+
+                val ids = Array(threadId.get())
+
+                eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                    detector.sample(ids, 1)
+                    assert(detector.isBlocked(0), "should detect blocking while blocked")
+                }
+
+                unblock.countDown()
+                assert(computing.await(5, TimeUnit.SECONDS))
+
+                // The resumed thread spins, so not-blocked must be asserted on a window that actually advanced its CPU (see assertNotBlockedActive),
+                // or CI starvation of the spinner would read as a failure to clear the blocked flag.
+                assertNotBlockedActive(detector, ids)
+
+                stop.set(true)
+                thread.join(5000)
+            }
+
+            "blocking detection resets on resume" in {
+                val detector = new BlockingMonitor(1)
+                val started  = new CountDownLatch(1)
+                val unblock  = new CountDownLatch(1)
+                val warmedUp = new CountDownLatch(1)
+                val stop     = new AtomicBoolean(false)
+                val threadId = new AtomicLong(0L)
+                val thread   = new Thread((() => {
+                    threadId.set(ThreadUserTime.currentThreadId())
+                    started.countDown()
+                    try { val _ = unblock.await(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                    val end = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) ()
+                    warmedUp.countDown()
+                    while (!stop.get()) ()
+                }): Runnable)
+                thread.setDaemon(true)
+                thread.start()
+                assert(started.await(5, TimeUnit.SECONDS))
+
+                val ids = Array(threadId.get())
+
+                eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                    detector.sample(ids, 1)
+                    assert(detector.isBlocked(0))
+                }
+
+                unblock.countDown()
+                assert(warmedUp.await(5, TimeUnit.SECONDS))
+
+                // Same bracketing as above: the resumed thread spins, so only a CPU-advancing window may assert not-blocked.
+                assertNotBlockedActive(detector, ids)
+
+                stop.set(true)
+                thread.join(5000)
+            }
+
+            "multiple positions tracked independently" in {
+                val detector = new BlockingMonitor(2)
+                val started  = new CountDownLatch(2)
+                val stop     = new AtomicBoolean(false)
+                val blocker  = new CountDownLatch(1)
+                val warmedUp = new CountDownLatch(1)
+                val tid0     = new AtomicLong(0L)
+                val tid1     = new AtomicLong(0L)
+
+                val t0 = new Thread((() => {
+                    tid0.set(ThreadUserTime.currentThreadId())
+                    started.countDown()
+                    try { val _ = blocker.await(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                }): Runnable)
+                val t1 = new Thread((() => {
+                    tid1.set(ThreadUserTime.currentThreadId())
+                    started.countDown()
+                    val end = System.nanoTime() + 20000000L
+                    while (System.nanoTime() < end) ()
+                    warmedUp.countDown()
+                    while (!stop.get()) ()
+                }): Runnable)
+                t0.setDaemon(true)
+                t1.setDaemon(true)
+                t0.start()
+                t1.start()
+                assert(started.await(5, TimeUnit.SECONDS))
+                assert(warmedUp.await(5, TimeUnit.SECONDS))
+
+                val ids = Array(tid0.get(), tid1.get())
+                eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                    detector.sample(ids, 2)
+                    assert(detector.isBlocked(0), "blocking thread should be blocked")
+                    assert(!detector.isBlocked(1), "computing thread should not be blocked")
+                }
+
+                blocker.countDown()
+                stop.set(true)
+                t0.join(5000)
+                t1.join(5000)
+            }
+
+            "a scan without the slot resets the idle streak" in {
+                withParkedThread { ids =>
+                    val detector = new BlockingMonitor(1)
+                    detector.sample(ids, 1)
+                    detector.sample(ids, 1)
+                    assert(detector.isBlocked(0), "the mounted thread with flat CPU time is blocked")
+                    detector.sample(ids, 0)
+                    assert(!detector.isBlocked(0), "an absent slot is not blocked")
+                    detector.sample(ids, 1)
+                    assert(!detector.isBlocked(0), "a remount after an absent scan is a new baseline")
+                    detector.sample(ids, 1)
+                    val _ = assert(detector.isBlocked(0), "the remounted thread with flat CPU time is blocked in turn")
+                }
+            }
+
+            "a worker that unmounted since the last scan starts a new baseline" in {
+                withParkedThread { ids =>
+                    val clock  = InternalClock(TestExecutors.cached)
+                    val worker = new Worker(0, TestExecutors.cached, (_, _) => (), _ => null, clock, 10) {
+                        def currentInterruptEpoch(): Long = 0L
+                        def shouldStop()                  = false
+                    }
+                    val monitor = new BlockingMonitor(Array[Worker](worker), () => 1, 1, null)
+                    try {
+                        worker.mountId = ids(0)
+                        monitor.cycle()
+                        monitor.cycle()
+                        monitor.cycle()
+                        assert(worker.blocked, "a mounted worker with flat CPU time is blocked")
+                        // What the worker does when it goes idle.
+                        worker.mountId = -1L
+                        worker.blocked = false
+                        monitor.cycle()
+                        worker.mountId = ids(0)
+                        monitor.cycle()
+                        monitor.cycle()
+                        assert(!worker.blocked, "the scan after a remount is a baseline, not a continuation of the streak it left")
+                        monitor.cycle()
+                        val _ = assert(worker.blocked, "the remounted worker with flat CPU time is blocked in turn")
+                    } finally clock.stop()
+                }
+            }
+        }
+
+        "edge cases" - {
+
+            "first sample is always baseline — no detection" in {
+                val detector = new BlockingMonitor(1)
+                val started  = new CountDownLatch(1)
+                val done     = new CountDownLatch(1)
+                val threadId = new AtomicLong(0L)
+                val thread   = new Thread((() => {
+                    threadId.set(ThreadUserTime.currentThreadId())
+                    started.countDown()
+                    try { val _ = done.await(30, TimeUnit.SECONDS) }
+                    catch { case _: InterruptedException => () }
+                }): Runnable)
+                thread.setDaemon(true)
+                thread.start()
+                assert(started.await(5, TimeUnit.SECONDS))
+
+                val ids = Array(threadId.get())
+                detector.sample(ids, 1)
+                assert(!detector.isBlocked(0), "first sample must be baseline only")
+
+                done.countDown()
+                thread.join(5000)
+            }
+        }
+
+        "updateSlot" - {
+
+            "flat samples of the same thread read as idle after the baseline" in {
+                val m = new BlockingMonitor(4)
+                assert(!m.updateSlot(0, 7L, 100L), "first sample must be baseline only")
+                assert(m.updateSlot(0, 7L, 100L))
+                assert(m.updateSlot(0, 7L, 100L))
+            }
+
+            "an advancing sample resets the idle accumulation" in {
+                val m = new BlockingMonitor(4)
+                assert(!m.updateSlot(0, 7L, 100L))
+                assert(m.updateSlot(0, 7L, 100L))
+                assert(!m.updateSlot(0, 7L, 150L), "advancing time must clear the idle state")
+                assert(m.updateSlot(0, 7L, 150L))
+            }
+
+            "a thread change at the slot resets the baseline even when sampled values collide" in {
+                val m = new BlockingMonitor(4)
+                assert(!m.updateSlot(0, 7L, 100L))
+                assert(m.updateSlot(0, 7L, 100L))
+                assert(!m.updateSlot(0, 8L, 100L), "a new thread must not inherit the previous occupant's state")
+                assert(m.updateSlot(0, 8L, 100L), "the new thread accumulates from its own baseline")
+            }
+
+            "slots accumulate independently" in {
+                val m = new BlockingMonitor(4)
+                assert(!m.updateSlot(0, 7L, 100L))
+                assert(!m.updateSlot(1, 8L, 200L))
+                assert(m.updateSlot(0, 7L, 100L))
+                assert(!m.updateSlot(1, 8L, 250L))
+            }
+
+            "unavailable samples never read as idle" in {
+                val m = new BlockingMonitor(4)
+                assert(!m.updateSlot(0, 7L, -1L))
+                assert(!m.updateSlot(0, 7L, -1L), "-1 samples must not match each other as idle")
+                assert(!m.updateSlot(0, 7L, 100L), "recovery sample is a fresh baseline")
+                assert(m.updateSlot(0, 7L, 100L))
+            }
+        }
+    }
+
+    // ── blocking compensation (scheduler-level tests) ───────────────────
+
+    "blocking compensation" - {
+
+        "Thread.sleep — TIMED_WAITING detected as blocked" in {
+            val started = new CountDownLatch(1)
+            val done    = new CountDownLatch(1)
+            val task    = TestTask(_run = () => {
+                started.countDown()
+                done.await()
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            // BlockingMonitor needs baseline + at least 1 flat sample (~4ms min)
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                val blocked = blockedWorkerStatus()
+                assert(blocked.isDefined, "blocked worker should be detected via cpu time")
+            }
+
+            done.countDown()
+            eventually(assert(task.executions == 1))
+        }
+
+        "LockSupport.park — WAITING detected as blocked" in {
+            val started    = new CountDownLatch(1)
+            val done       = new CountDownLatch(1)
+            val taskThread = new AtomicReference[Thread](null)
+            val task       = TestTask(_run = () => {
+                taskThread.set(Thread.currentThread())
+                started.countDown()
+                LockSupport.park()
+                done.await() // secondary block to keep task alive until we release
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined, "parked thread should be detected as blocked")
+            }
+
+            LockSupport.unpark(taskThread.get())
+            done.countDown()
+            eventually(assert(task.executions == 1))
+        }
+
+        "Object.wait — WAITING detected as blocked" in {
+            val lock    = new Object
+            val started = new CountDownLatch(1)
+            val done    = new AtomicBoolean(false)
+            val task    = TestTask(_run = () => {
+                started.countDown()
+                lock.synchronized {
+                    while (!done.get()) lock.wait(1000)
+                }
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined, "waiting thread should be detected as blocked")
+            }
+
+            done.set(true)
+            lock.synchronized { lock.notifyAll() }
+            eventually(assert(task.executions == 1))
+        }
+
+        "active computation is NOT detected as blocked" in {
+            val baseline   = blockedWorkerCount()
+            val iterations = new AtomicInteger(0)
+            val stop       = new AtomicBoolean(false)
+            val task       = TestTask(_run = () => {
+                while (!stop.get()) {
+                    val _ = iterations.incrementAndGet()
+                }
+                Task.Done
+            })
+            scheduler.schedule(task)
+            eventually(assert(iterations.get() > 1000))
+
+            // Let monitor run several cycles — worker should NOT be marked blocked
+            eventually(timeout(scaled(org.scalatest.time.Span(30, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerCount() <= baseline, "active worker should not be detected as blocked")
+            }
+
+            // Verify the task kept executing (not drained): iterations must eventually exceed a
+            // snapshot; a drained task stalls and fails at eventually's timeout.
+            val before = iterations.get()
+            eventually(assert(iterations.get() > before, "task should still be executing"))
+
+            stop.set(true)
+            eventually(assert(task.executions == 1))
+        }
+
+        "blocked flag resets when thread resumes" in {
+            // Track the one worker running this task (via Worker.current) instead of a global
+            // blocked count. That worker's flag is monotonic within each phase (set while
+            // parked, cleared once it resumes CPU work), so each transition is observed
+            // reliably; the global count is a noisy aggregate that unrelated workers' transient
+            // false positives under load can push past any fixed snapshot.
+            val started   = new CountDownLatch(1)
+            val release   = new CountDownLatch(1)
+            val resumed   = new CountDownLatch(1)
+            val stop      = new AtomicBoolean(false)
+            val theWorker = new AtomicReference[Worker](null)
+            val task      = TestTask(_run = () => {
+                theWorker.set(Worker.current())
+                started.countDown()
+                release.await() // block: flat CPU time -> worker flagged blocked
+                resumed.countDown()
+                while (!stop.get()) {} // sustained CPU work -> worker flag clears
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+            val worker = theWorker.get()
+
+            eventually(timeout(scaled(org.scalatest.time.Span(5, org.scalatest.time.Seconds)))) {
+                assert(worker.status().isBlocked, "parked worker should be detected as blocked")
+            }
+
+            release.countDown()
+            assert(resumed.await(5, TimeUnit.SECONDS))
+
+            eventually(timeout(scaled(org.scalatest.time.Span(5, org.scalatest.time.Seconds)))) {
+                assert(!worker.status().isBlocked, "worker's blocked flag should clear after resume")
+            }
+
+            stop.set(true)
+            eventually(assert(task.executions == 1))
+        }
+    }
+
+    // ── interrupt dispatch ──────────────────────────────────────────────
+
+    "interrupt dispatch" - {
+
+        "dispatches Thread.interrupt to blocked thread with needsInterrupt" in {
+            val interrupted = new AtomicBoolean(false)
+            val started     = new CountDownLatch(1)
+            val task        = TestTask(_run = () => {
+                started.countDown()
+                try
+                    Thread.sleep(30000)
+                catch {
+                    case _: InterruptedException =>
+                        interrupted.set(true)
+                }
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            // Wait until the thread is detected blocked before marking it for interrupt, not a
+            // fixed 10ms guess.
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined, "sleeping thread should be detected as blocked")
+            }
+
+            task.interrupted = true
+            assert(task.needsInterrupt(), "needsInterrupt should reflect the interrupt flag")
+
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(interrupted.get(), "blocked thread should receive Thread.interrupt()")
+            }
+            eventually(assert(task.executions == 1))
+        }
+
+        "does not interrupt blocked thread without needsInterrupt" in {
+            val interrupted = new AtomicBoolean(false)
+            val started     = new CountDownLatch(1)
+            val done        = new CountDownLatch(1)
+            val task        = TestTask(_run = () => {
+                started.countDown()
+                try
+                    done.await()
+                catch {
+                    case _: InterruptedException =>
+                        interrupted.set(true)
+                }
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            // Verify worker IS detected as blocked
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined)
+            }
+
+            // Without needsInterrupt, no interrupt dispatches: the monitor must see the blocked
+            // worker and decline it on every scan (counted in scans, not wall time).
+            assert(!task.needsInterrupt())
+            acrossMonitorCycles(25) {
+                assert(!interrupted.get(), "blocked thread without needsInterrupt must not be interrupted")
+            }
+
+            done.countDown()
+            eventually(assert(task.executions == 1))
+        }
+
+        "re-interrupts thread that catches and re-blocks" in {
+            val interruptCount = new AtomicInteger(0)
+            val started        = new CountDownLatch(1)
+            val task           = TestTask(_run = () => {
+                started.countDown()
+                while (interruptCount.get() < 3) {
+                    try
+                        Thread.sleep(30000)
+                    catch {
+                        case _: InterruptedException =>
+                            val _ = interruptCount.incrementAndGet()
+                    }
+                }
+                Task.Done
+            })
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+            // Wait until the thread is detected blocked before marking it for interrupt, not a
+            // fixed 10ms guess.
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined, "sleeping thread should be detected as blocked")
+            }
+
+            task.interrupted = true
+
+            eventually(timeout(scaled(org.scalatest.time.Span(5, org.scalatest.time.Seconds)))) {
+                assert(interruptCount.get() >= 3, s"expected at least 3 interrupts, got ${interruptCount.get()}")
+            }
+        }
+
+        "interrupt flag cleared between tasks on same worker" in {
+            val flagLeaked = new AtomicBoolean(false)
+            val done       = new CountDownLatch(1)
+
+            val task1 = TestTask(_run = () => {
+                Thread.currentThread().interrupt()
+                Task.Done
+            })
+            val task2 = TestTask(_run = () => {
+                if (Thread.interrupted())
+                    flagLeaked.set(true)
+                done.countDown()
+                Task.Done
+            })
+
+            scheduler.schedule(task1)
+            scheduler.schedule(task2)
+
+            assert(done.await(5, TimeUnit.SECONDS))
+            assert(!flagLeaked.get(), "Thread.interrupted() in runTask finally should clear the flag")
+        }
+
+        "interrupts multiple blocked tasks on different workers" in {
+            val count       = 3
+            val started     = new CountDownLatch(count)
+            val interrupted = Array.fill(count)(new AtomicBoolean(false))
+            val tasks       = (0 until count).map { i =>
+                TestTask(_run = () => {
+                    started.countDown()
+                    try
+                        Thread.sleep(30000)
+                    catch {
+                        case _: InterruptedException =>
+                            interrupted(i).set(true)
+                    }
+                    Task.Done
+                })
+            }
+
+            tasks.foreach(scheduler.schedule)
+            assert(started.await(10, TimeUnit.SECONDS))
+            // Let the monitor take its baseline CPU-time samples, counted in scans not wall time.
+            awaitMonitorCycles(3)
+
+            tasks.foreach(t => t.interrupted = true)
+
+            eventually(timeout(scaled(Span(5, Seconds)))) {
+                (0 until count).foreach { i =>
+                    assert(interrupted(i).get(), s"task $i should have been interrupted")
+                }
+            }
+        }
+
+        "interrupts a blocked worker above the shrunken currentWorkers bound" in {
+            // The regulator can shrink the admitted worker count while workers above the bound
+            // still hold mounted tasks; the monitor must keep scanning those slots, or a blocked
+            // worker there is never flagged, never compensated for, and never interrupted.
+            val started     = new CountDownLatch(1)
+            val interrupted = new AtomicBoolean(false)
+            // The monitor samples CPU time by the id a worker publishes at mount, which on Scala Native is the pthread
+            // handle, not Thread.getId; the sleeper must publish it from inside itself or the slot never reads blocked.
+            val sleeperId = new AtomicLong(0L)
+            val sleeper   = new Thread((() => {
+                sleeperId.set(ThreadUserTime.currentThreadId())
+                started.countDown()
+                try Thread.sleep(60000)
+                catch { case _: InterruptedException => interrupted.set(true) }
+            }): Runnable)
+            sleeper.setDaemon(true)
+            sleeper.start()
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            val clock  = InternalClock(TestExecutors.cached)
+            val worker = new Worker(2, TestExecutors.cached, (_, _) => (), _ => null, clock, 10) {
+                def currentInterruptEpoch(): Long = 0L
+                def shouldStop()                  = false
+            }
+            val task = TestTask()
+            task.interrupted = true
+            worker.mount = sleeper
+            worker.mountId = sleeperId.get()
+            worker.currentTask = task
+
+            val workers = new Array[Worker](4)
+            workers(2) = worker
+
+            val monitor = new BlockingMonitor(workers, () => 2, 4, TestExecutors.cached)
+            try
+                eventually(timeout(scaled(Span(10, Seconds)))) {
+                    assert(interrupted.get(), "a mounted worker above currentWorkers must still be scanned and interrupted")
+                }
+            finally {
+                monitor.stop()
+                clock.stop()
+            }
+        }
+    }
+
+    // ── interrupt storms ────────────────────────────────────────────────
+
+    "interrupt storms" - {
+
+        "all blocked tasks eventually interrupted" in {
+            val n           = 5
+            val allStarted  = new CountDownLatch(n)
+            val interrupted = new Array[AtomicBoolean](n)
+
+            val tasks = (0 until n).map { i =>
+                interrupted(i) = new AtomicBoolean(false)
+                val interruptedFlag = interrupted(i)
+                val task            = TestTask(_run = () => {
+                    allStarted.countDown()
+                    try
+                        Thread.sleep(30000)
+                    catch {
+                        case _: InterruptedException =>
+                            interruptedFlag.set(true)
+                    }
+                    Task.Done
+                })
+                scheduler.schedule(task)
+                task
+            }
+
+            assert(allStarted.await(30, TimeUnit.SECONDS), "all tasks should start")
+            // Let the monitor take its baseline CPU-time samples, counted in scans not wall time.
+            awaitMonitorCycles(3)
+
+            // Request interrupt on all tasks simultaneously
+            tasks.foreach(t => t.interrupted = true)
+            scheduler.notifyInterrupt()
+
+            // All tasks should eventually get interrupted. With blockThreshold=2 and
+            // minInterval~2ms, each task needs ~3 monitor cycles before interrupt dispatch.
+            eventually(timeout(scaled(Span(30, Seconds)))) {
+                val count = interrupted.count(_.get())
+                assert(count == n, s"expected all $n tasks interrupted, got $count")
+            }
+
+            // All tasks complete without crash
+            eventually(timeout(scaled(Span(5, Seconds)))) {
+                tasks.foreach(t => assert(t.executions == 1))
+            }
+        }
+
+        "re-interrupt — task catches and re-blocks" in {
+            val interruptCount = new AtomicInteger(0)
+            val started        = new CountDownLatch(1)
+
+            val task = TestTask(_run = () => {
+                started.countDown()
+                while (interruptCount.get() < 5) {
+                    try
+                        Thread.sleep(30000)
+                    catch {
+                        case _: InterruptedException =>
+                            val _ = interruptCount.incrementAndGet()
+                    }
+                }
+                Task.Done
+            })
+
+            scheduler.schedule(task)
+            assert(started.await(5, TimeUnit.SECONDS))
+            // Wait until the thread is detected blocked before marking it for interrupt, not a
+            // fixed 10ms guess.
+            eventually(timeout(scaled(org.scalatest.time.Span(2, org.scalatest.time.Seconds)))) {
+                assert(blockedWorkerStatus().isDefined, "sleeping thread should be detected as blocked")
+            }
+
+            task.interrupted = true
+
+            // Monitor should re-interrupt on each cycle when thread re-blocks
+            eventually(timeout(scaled(Span(10, Seconds)))) {
+                assert(interruptCount.get() >= 5, s"expected at least 5 interrupts, got ${interruptCount.get()}")
+            }
+
+            eventually(assert(task.executions == 1))
+        }
+
+        "blocked vs active — correct discrimination" in {
+            val blockingStarted     = new CountDownLatch(2)
+            val activeStarted       = new CountDownLatch(2)
+            val blockingInterrupted = Array.fill(2)(new AtomicBoolean(false))
+            val activeInterrupted   = Array.fill(2)(new AtomicBoolean(false))
+            val activeStop          = new AtomicBoolean(false)
+
+            // 2 blocking tasks — should receive Thread.interrupt()
+            val blockingTasks = (0 until 2).map { i =>
+                val flag = blockingInterrupted(i)
+                val task = TestTask(_run = () => {
+                    blockingStarted.countDown()
+                    try
+                        Thread.sleep(30000)
+                    catch {
+                        case _: InterruptedException =>
+                            flag.set(true)
+                    }
+                    Task.Done
+                })
+                scheduler.schedule(task)
+                task
+            }
+
+            assert(blockingStarted.await(60, TimeUnit.SECONDS), "blocking tasks should start")
+
+            // 2 active tasks — should NOT receive Thread.interrupt()
+            val activeTasks = (0 until 2).map { i =>
+                val flag = activeInterrupted(i)
+                val task = TestTask(_run = () => {
+                    activeStarted.countDown()
+                    while (!activeStop.get()) {
+                        var sum = 0L
+                        val end = System.nanoTime() + 1000000L // 1ms of compute
+                        while (System.nanoTime() < end) sum += 1
+                        if (Thread.interrupted()) flag.set(true)
+                    }
+                    Task.Done
+                })
+                scheduler.schedule(task)
+                task
+            }
+
+            assert(activeStarted.await(60, TimeUnit.SECONDS), "active tasks should start")
+
+            // Let monitor establish baseline CPU time samples, counted in its own scans
+            awaitMonitorCycles(3)
+
+            // Request interrupt on ALL 4 tasks
+            blockingTasks.foreach(t => t.interrupted = true)
+            activeTasks.foreach(t => t.interrupted = true)
+            scheduler.notifyInterrupt()
+
+            // Only blocking tasks are asserted interrupted: dispatch is gated on blocked-detection, and an active
+            // task's flat user time makes its interrupt unlikely (not impossible). Flags reported for diagnosis.
+            eventually(timeout(scaled(Span(30, Seconds)))) {
+                val count = blockingInterrupted.count(_.get())
+                assert(
+                    count == 2,
+                    s"expected all 2 blocking tasks interrupted, got $count " +
+                        s"(active tasks interrupted: ${activeInterrupted.count(_.get())})"
+                )
+            }
+
+            activeStop.set(true)
+            eventually(timeout(scaled(Span(10, Seconds)))) {
+                blockingTasks.foreach(t => assert(t.executions == 1))
+                activeTasks.foreach(t => assert(t.executions == 1))
+            }
+        }
+
+        "race safety — no spurious interrupt to successor task" in {
+            // Verifies that if a task completes between the monitor's collect() and
+            // process() phases, the NEXT task on the same worker does NOT get interrupted.
+            val spuriousInterrupt = new AtomicBoolean(false)
+            val firstStarted      = new CountDownLatch(1)
+            val secondStarted     = new CountDownLatch(1)
+            val secondStop        = new AtomicBoolean(false)
+
+            // First task: blocks briefly then completes
+            val firstTask = TestTask(_run = () => {
+                firstStarted.countDown()
+                try
+                    Thread.sleep(10000)
+                catch {
+                    case _: InterruptedException => ()
+                }
+                Task.Done
+            })
+
+            // Second task: checks for spurious interrupts
+            val secondTask = TestTask(_run = () => {
+                secondStarted.countDown()
+                while (!secondStop.get()) {
+                    if (Thread.interrupted()) {
+                        spuriousInterrupt.set(true)
+                    }
+                    Thread.`yield`()
+                }
+                Task.Done
+            })
+
+            scheduler.schedule(firstTask)
+            assert(firstStarted.await(60, TimeUnit.SECONDS))
+
+            // Request interrupt while first task is blocking
+            firstTask.interrupted = true
+            scheduler.notifyInterrupt()
+
+            // Wait for first task to complete
+            eventually(timeout(scaled(Span(5, Seconds)))) {
+                assert(firstTask.executions == 1, "first task should complete")
+            }
+
+            // Schedule second task — it may land on the same worker
+            scheduler.schedule(secondTask)
+            assert(secondStarted.await(60, TimeUnit.SECONDS))
+
+            // The second task must receive no spurious interrupts, a per-scan guarantee: counting
+            // cycles exercises the race window where a fixed wait buys only the host's spare scans.
+            acrossMonitorCycles(100) {
+                assert(
+                    !spuriousInterrupt.get(),
+                    "successor task on same worker must not receive spurious Thread.interrupt()"
+                )
+            }
+
+            secondStop.set(true)
+            eventually(assert(secondTask.executions == 1))
+        }
+    }
+
+    // ── stress ──────────────────────────────────────────────────────────
+
+    "stress" - {
+
+        "CPU saturation — blocking task still detected" in {
+            // Use 3 busy threads — enough to create significant CPU pressure without
+            // exhausting Native thread resources
+            val (busyThreads, busyStop) = spawnBusyThreads(3)
+            try {
+                val started = new CountDownLatch(1)
+                val done    = new CountDownLatch(1)
+
+                val task = TestTask(_run = () => {
+                    started.countDown()
+                    done.await()
+                    Task.Done
+                })
+
+                scheduler.schedule(task)
+                assert(started.await(60, TimeUnit.SECONDS))
+
+                eventually(timeout(scaled(Span(10, Seconds)))) {
+                    assert(
+                        blockedWorkerCount() >= 1,
+                        "blocking task should still be detected under CPU saturation"
+                    )
+                }
+
+                done.countDown()
+                eventually(timeout(scaled(Span(5, Seconds)))) {
+                    assert(task.executions == 1)
+                }
+            } finally
+                cleanupBusyThreads(busyThreads, busyStop)
+        }
+
+        "mixed workload — discrimination and compensation" in {
+            // Start active task first so it grabs a worker
+            val activeStarted = new CountDownLatch(1)
+            val activeStop    = new AtomicBoolean(false)
+            val activeTask    = TestTask(_run = () => {
+                activeStarted.countDown()
+                var i = 0L
+                while (!activeStop.get()) i += 1
+                Task.Done
+            })
+            scheduler.schedule(activeTask)
+            assert(activeStarted.await(60, TimeUnit.SECONDS))
+
+            // Then start blocking task
+            val blockingStarted = new CountDownLatch(1)
+            val blockingDone    = new CountDownLatch(1)
+            val blockingTask    = TestTask(_run = () => {
+                blockingStarted.countDown()
+                blockingDone.await()
+                Task.Done
+            })
+            scheduler.schedule(blockingTask)
+            assert(blockingStarted.await(10, TimeUnit.SECONDS))
+
+            // Verify blocking task is detected as blocked
+            eventually(timeout(scaled(Span(5, Seconds)))) {
+                assert(
+                    blockedWorkerCount() >= 1,
+                    s"expected at least 1 blocked worker, got ${blockedWorkerCount()}"
+                )
+            }
+
+            blockingDone.countDown()
+            activeStop.set(true)
+            eventually(timeout(scaled(Span(5, Seconds)))) {
+                assert(blockingTask.executions == 1)
+                assert(activeTask.executions == 1)
+            }
+        }
+
+        "wake backpressure" in {
+            // A burst of wake() calls collapses into a few monitor scans via LockSupport's
+            // permit model, rather than one scan per call. Counting scans (not wall-clock
+            // time) makes this immune to CI scheduling jitter.
+            val wakeStarted = new CountDownLatch(1)
+            val wakeDone    = new CountDownLatch(1)
+            val wakeTask    = TestTask(_run = () => {
+                wakeStarted.countDown()
+                wakeDone.await()
+                Task.Done
+            })
+            scheduler.schedule(wakeTask)
+            assert(wakeStarted.await(5, TimeUnit.SECONDS))
+
+            // Baseline right after a completed scan, so the count starts on a cycle boundary.
+            awaitMonitorCycles(2)
+            // A large call count keeps the coalescing margin wide: a false fail needs the burst to
+            // stall past wakeCalls * 2ms scan floor (20s here), while the calls run in well under 1ms.
+            val wakeCalls    = 10000
+            val cyclesBefore = scheduler.blockingMonitor.cycles
+            var i            = 0
+            while (i < wakeCalls) {
+                scheduler.notifyInterrupt()
+                i += 1
+            }
+            val cyclesAdded = scheduler.blockingMonitor.cycles - cyclesBefore
+
+            // Two counts, no clock: a scan per call lands at wakeCalls scans; coalescing lands below.
+            assert(
+                cyclesAdded < wakeCalls,
+                s"$wakeCalls wake() calls triggered $cyclesAdded monitor scans: " +
+                    "they should coalesce, not scan per call"
+            )
+
+            wakeDone.countDown()
+            eventually(assert(wakeTask.executions == 1))
+        }
+    }
+
+    // ── resilience ──────────────────────────────────────────────────────
+
+    "resilience" - {
+
+        "a fatal error in one scan does not stop the scans after it" in {
+            // The monitor runs as one long-lived loop on the timer pool. An error that escapes a scan ends that loop, and nothing
+            // restarts it: blocked workers are never flagged again and interrupts are never dispatched again, for the life of the
+            // scheduler. Its own scheduler and timer pool, so a monitor killed here cannot leak into the shared one.
+            val timer   = java.util.concurrent.Executors.newScheduledThreadPool(8, kyo.scheduler.util.Threads("test-timer"))
+            val sched   = new Scheduler(TestExecutors.cached, TestExecutors.scheduled, timer)
+            val started = new CountDownLatch(1)
+            val release = new CountDownLatch(1)
+            val thrown  = new AtomicBoolean(false)
+            val task    = new TestTask(_run = () => {
+                started.countDown()
+                release.await()
+                Task.Done
+            }) {
+                // The monitor asks every mounted task whether it needs an interrupt on each scan. Other threads ask too (a
+                // preemption and a runtime update both check it), so only a call on the monitor's own thread fails, the way the
+                // scheduler's drain recursion did on CI.
+                override def needsInterrupt(): Boolean =
+                    if ((Thread.currentThread() eq sched.blockingMonitor.monitorThread) && thrown.compareAndSet(false, true))
+                        throw new StackOverflowError("injected")
+                    else false
+            }
+            try {
+                sched.schedule(task)
+                assert(started.await(5, TimeUnit.SECONDS))
+                eventually(assert(thrown.get()))
+                val after = sched.blockingMonitor.cycles
+                // Counts the monitor's own scans; the deadline only bails out a monitor that stopped.
+                val deadline = System.nanoTime() + 60L * 1000 * 1000 * 1000
+                while (sched.blockingMonitor.cycles < after + 20 && System.nanoTime() < deadline) Thread.`yield`()
+                assert(
+                    sched.blockingMonitor.cycles >= after + 20,
+                    s"the monitor stopped scanning after the error (cycles ${sched.blockingMonitor.cycles}, was $after)"
+                )
+            } finally {
+                release.countDown()
+                sched.shutdown()
+                timer.shutdownNow(): Unit
+            }
+        }
+    }
+
+    // ── task bit-packing (no scheduler needed) ──────────────────────────
+
+    "task bit-packing" - {
+
+        "runtime preserved across preemption" in {
+            val task = new TaskTestHelper(10)
+            assert(task.checkRuntime() == 11) // initial 1 + added 10
+
+            task.doPreempt()
+            assert(task.checkShouldPreempt())
+            assert(task.checkRuntime() == 11, "doPreempt should not change runtime")
+        }
+
+        "addRuntime accumulates runtime and clears preemption" in {
+            val task = new TaskTestHelper(0)
+            task.doPreempt()
+            assert(task.checkShouldPreempt())
+
+            task.addRuntime(5)
+            assert(task.checkRuntime() == 6, "runtime should be initial 1 + added 5")
+            assert(!task.checkShouldPreempt(), "addRuntime should clear preemption (flip to positive)")
+        }
+
+        "addRuntime accumulates runtime across preemption" in {
+            val task = new TaskTestHelper(10)
+            task.doPreempt()
+            task.addRuntime(5)
+            assert(task.checkRuntime() == 16, "runtime accumulates regardless of the preemption flag")
+        }
+
+        "ordering preserved with preemption set" in {
+            val t1 = Task((), 1)
+            val t2 = Task((), 2)
+            val t3 = Task((), 3)
+            t2.doPreempt()
+            val q = new WorkerQueue()
+            q.add(t2)
+            q.add(t3)
+            q.add(t1)
+            assert((q.poll(): Task) eq t1, "lowest runtime first")
+            assert((q.poll(): Task) eq t2, "middle runtime second (preemption shouldn't affect order)")
+            assert((q.poll(): Task) eq t3, "highest runtime last")
+        }
+    }
+
+    // ── inner helper class ──────────────────────────────────────────────
+
+    class TaskTestHelper(runtimeValue: Int = 0) extends Task {
+        addRuntime(runtimeValue)
+        def run(startMillis: Long, clock: InternalClock, deadline: Long) = Task.Done
+        def checkShouldPreempt(): Boolean                                = shouldPreempt()
+        def checkRuntime(): Int                                          = runtime()
+    }
+}

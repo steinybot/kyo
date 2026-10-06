@@ -1,0 +1,386 @@
+package kyo.internal
+
+import kyo.*
+import kyo.internal.codec.OpenApiGenerator
+
+class OpenApiGeneratorTest extends kyo.BaseHttpTest:
+
+    "OpenApiGenerator" - {
+
+        "empty handlers" in {
+            val spec = OpenApiGenerator.generate(Seq.empty)
+            assert(spec.paths.isEmpty)
+            assert(spec.openapi == "3.0.0")
+        }
+
+        "config fields" in {
+            val spec = OpenApiGenerator.generate(
+                Seq.empty,
+                OpenApiGenerator.Config(title = "My API", version = "2.0", description = Some("desc"))
+            )
+            assert(spec.info.title == "My API")
+            assert(spec.info.version == "2.0")
+            assert(spec.info.description == Some("desc"))
+        }
+
+        "simple GET route" in {
+            val h    = HttpHandler.const(HttpMethod.GET, "pets", HttpStatus.OK)
+            val spec = OpenApiGenerator.generate(Seq(h))
+            assert(spec.paths.contains("/pets"))
+            val pathItem = spec.paths("/pets")
+            assert(pathItem.get.isDefined)
+            assert(pathItem.post.isEmpty)
+        }
+
+        "multiple methods on same path" in {
+            val spec = OpenApiGenerator.generate(Seq(
+                HttpHandler.const(HttpMethod.GET, "pets", HttpStatus.OK),
+                HttpHandler.const(HttpMethod.POST, "pets", HttpStatus.Created)
+            ))
+            assert(spec.paths.size == 1)
+            val pathItem = spec.paths("/pets")
+            assert(pathItem.get.isDefined)
+            assert(pathItem.post.isDefined)
+        }
+
+        "path capture" in {
+            val route = HttpRoute.getRaw("pets" / HttpPath.Capture[Int]("petId"))
+            val h     = route.handler(_ => HttpResponse.ok)
+            val spec  = OpenApiGenerator.generate(Seq(h))
+            assert(spec.paths.contains("/pets/{petId}"))
+            val params = spec.paths("/pets/{petId}").get.get.parameters.get
+            assert(params.size == 1)
+            assert(params.head.name == "petId")
+            assert(params.head.in == "path")
+            assert(params.head.required == Some(true))
+            assert(params.head.json.`type` == Some("integer"))
+        }
+
+        "query parameter" in {
+            val route      = HttpRoute.getRaw("pets").request(_.query[Int]("limit"))
+            val h          = route.handler(_ => HttpResponse.ok)
+            val spec       = OpenApiGenerator.generate(Seq(h))
+            val params     = spec.paths("/pets").get.get.parameters.get
+            val limitParam = params.find(_.name == "limit").get
+            assert(limitParam.in == "query")
+            assert(limitParam.required == Some(true))
+            assert(limitParam.json.`type` == Some("integer"))
+        }
+
+        "optional query parameter" in {
+            val route      = HttpRoute.getRaw("pets").request(_.queryOpt[Int]("limit"))
+            val h          = route.handler(_ => HttpResponse.ok)
+            val spec       = OpenApiGenerator.generate(Seq(h))
+            val params     = spec.paths("/pets").get.get.parameters.get
+            val limitParam = params.find(_.name == "limit").get
+            assert(limitParam.required.isEmpty || limitParam.required == Some(false))
+        }
+
+        "header parameter" in {
+            val route  = HttpRoute.getRaw("pets").request(_.header[String]("X-Request-Id"))
+            val h      = route.handler(_ => HttpResponse.ok)
+            val spec   = OpenApiGenerator.generate(Seq(h))
+            val params = spec.paths("/pets").get.get.parameters.get
+            assert(params.exists(p => p.name == "X-Request-Id" && p.in == "header"))
+        }
+
+        "json response body" in {
+            val route = HttpRoute.getRaw("greeting").response(_.bodyJson[String])
+            val h     = route.handler(_ => HttpResponse.ok("hello"))
+            val spec  = OpenApiGenerator.generate(Seq(h))
+            val resp  = spec.paths("/greeting").get.get.responses("200")
+            assert(resp.content.isDefined)
+            assert(resp.content.get.contains("application/json"))
+        }
+
+        "json request body" in {
+            val route = HttpRoute.postRaw("pets").request(_.bodyJson[String])
+            val h     = route.handler(_ => HttpResponse.ok)
+            val spec  = OpenApiGenerator.generate(Seq(h))
+            val op    = spec.paths("/pets").post.get
+            assert(op.requestBody.isDefined)
+            assert(op.requestBody.get.content.contains("application/json"))
+            assert(op.requestBody.get.required == Some(true))
+        }
+
+        "request body with Option fields excludes them from required" in {
+            case class UpdateItem(name: String, description: Option[String]) derives Schema
+            val route = HttpRoute.putRaw("items" / HttpPath.Capture[Int]("id"))
+                .request(_.bodyJson[UpdateItem])
+                .response(_.bodyJson[String])
+            val h    = route.handler(_ => HttpResponse.ok("ok"))
+            val spec = OpenApiGenerator.generate(Seq(h))
+            val json = HttpOpenApi.toJson(spec)
+            // The UpdateItem schema should have "name" in required but NOT "description"
+            assert(json.contains("properties"), s"OpenAPI should contain schema properties, got: $json")
+            // Find the schema — it may be inline or in components
+            val schema = spec.paths("/items/{id}").put.get.requestBody.get
+                .content("application/json").json
+            val resolvedSchema: HttpOpenApi.SchemaObject = schema.`$ref` match
+                case Some(ref) =>
+                    val schemaName = ref.stripPrefix("#/components/schemas/")
+                    spec.components.get.schemas.get.apply(schemaName)
+                case None => schema
+            val required = resolvedSchema.required.getOrElse(Nil)
+            assert(required.contains("name"), s"'name' (non-optional) should be in required, got: $required")
+            assert(
+                !required.contains("description"),
+                s"'description' (Option[String]) should NOT be in required, got: $required"
+            )
+        }
+
+        "text response body" in {
+            val route = HttpRoute.getRaw("hello").response(_.bodyText)
+            val h     = route.handler(_ => HttpResponse.ok("hi"))
+            val spec  = OpenApiGenerator.generate(Seq(h))
+            val resp  = spec.paths("/hello").get.get.responses("200")
+            assert(resp.content.get.contains("text/plain"))
+        }
+
+        "metadata" in {
+            val route = HttpRoute.getRaw("pets")
+                .metadata(_.summary("List pets").description("Returns all pets").operationId("listPets").tag("pets"))
+            val h    = route.handler(_ => HttpResponse.ok)
+            val spec = OpenApiGenerator.generate(Seq(h))
+            val op   = spec.paths("/pets").get.get
+            assert(op.operationId == Some("listPets"))
+            assert(op.summary == Some("List pets"))
+            assert(op.description == Some("Returns all pets"))
+            assert(op.tags == Some(List("pets")))
+        }
+
+        "deprecated route" in {
+            val route = HttpRoute.getRaw("old").metadata(_.markDeprecated)
+            val h     = route.handler(_ => HttpResponse.ok)
+            val spec  = OpenApiGenerator.generate(Seq(h))
+            assert(spec.paths("/old").get.get.deprecated == Some(true))
+        }
+
+        "codec type inference" - {
+            "string codec" in {
+                val route = HttpRoute.getRaw("test").request(_.query[String]("q"))
+                val h     = route.handler(_ => HttpResponse.ok)
+                val spec  = OpenApiGenerator.generate(Seq(h))
+                val param = spec.paths("/test").get.get.parameters.get.head
+                assert(param.json.`type` == Some("string"))
+            }
+
+            "boolean codec" in {
+                val route = HttpRoute.getRaw("test").request(_.query[Boolean]("flag"))
+                val h     = route.handler(_ => HttpResponse.ok)
+                val spec  = OpenApiGenerator.generate(Seq(h))
+                val param = spec.paths("/test").get.get.parameters.get.head
+                assert(param.json.`type` == Some("boolean"))
+            }
+
+            "long codec" in {
+                val route = HttpRoute.getRaw("test" / HttpPath.Capture[Long]("id"))
+                val h     = route.handler(_ => HttpResponse.ok)
+                val spec  = OpenApiGenerator.generate(Seq(h))
+                val param = spec.paths("/test/{id}").get.get.parameters.get.head
+                assert(param.json.format == Some("int64"))
+            }
+        }
+
+        "roundtrip to JSON" in {
+            val route = HttpRoute.getRaw("pets" / HttpPath.Capture[Int]("petId"))
+                .request(_.query[Boolean]("verbose"))
+                .response(_.bodyJson[String])
+                .metadata(_.operationId("getPet").summary("Get a pet"))
+            val h    = route.handler(_ => HttpResponse.ok("cat"))
+            val spec = OpenApiGenerator.generate(
+                Seq(h),
+                OpenApiGenerator.Config(title = "Pet API", version = "1.0.0")
+            )
+            val json = HttpOpenApi.toJson(spec)
+            assert(json.contains("getPet"))
+            assert(json.contains("Pet API"))
+            assert(json.contains("petId"))
+        }
+
+        "codec-declared schema" - {
+
+            // A dedicated type rather than a bare String: a second
+            // `given HttpCodec[String]` would be ambiguous with the built-in one,
+            // and this is how a constrained parameter is declared in practice.
+            case class Hash(value: String) derives CanEqual
+
+            val hashPattern = "^0x[0-9a-fA-F]{64}$"
+            val aHash       = "0x" + "ab" * 32
+
+            given HttpCodec[Hash] =
+                HttpCodec.pattern(hashPattern)(_.value, Hash(_), "32-byte hash")
+
+            def specFor(): HttpOpenApi =
+                val route = HttpRoute.getRaw("tx" / HttpPath.Capture[Hash]("hash"))
+                OpenApiGenerator.generate(Seq(route.handler(_ => HttpResponse.ok)), OpenApiGenerator.Config())
+
+            def hashParam(): HttpOpenApi.Parameter =
+                specFor().paths("/tx/{hash}").get.get.parameters.get.head
+
+            "publishes the codec's pattern on a path capture" in {
+                // Without this the generator can only probe the codec with sample
+                // values, which for a string recovers `type: string` and nothing
+                // else — the constraint would live in prose or not at all.
+                val param = hashParam()
+                assert(param.name == "hash")
+                assert(param.in == "path")
+                assert(param.json.pattern == Some(hashPattern))
+                assert(param.json.`type` == Some("string"))
+            }
+
+            "carries the codec's description onto the path parameter" in {
+                // A path capture has no route-level description the way a query
+                // param does, so this field was previously hardcoded to None.
+                assert(hashParam().description == Some("32-byte hash"))
+            }
+
+            "the same pattern also rejects a non-matching value" in {
+                // The point of declaring it on the codec: one expression both
+                // rejects and documents, so the document cannot describe a rule
+                // the server does not enforce.
+                val codec = summon[HttpCodec[Hash]]
+                assert(codec.decode(aHash).contains(Hash(aHash)))
+                assert(codec.decode("0xabcd").isFailure)
+                assert(codec.decode("nonsense").isFailure)
+            }
+
+            "reaches the serialized document" in {
+                assert(HttpOpenApi.toJson(specFor()).contains(hashPattern))
+            }
+
+            "a codec without a schema still falls back to probing" in {
+                // The inference path must keep working for every built-in codec.
+                val route = HttpRoute.getRaw("pets" / HttpPath.Capture[Int]("petId"))
+                val spec  = OpenApiGenerator.generate(Seq(route.handler(_ => HttpResponse.ok)), OpenApiGenerator.Config())
+                val param = spec.paths("/pets/{petId}").get.get.parameters.get.head
+                assert(param.json.`type` == Some("integer"))
+                assert(param.json.pattern.isEmpty)
+            }
+
+            "withSchema attaches a document without changing decoding" in {
+                val described = summon[HttpCodec[Int]].withSchema(
+                    HttpOpenApi.SchemaObject.integer.copy(description = Some("a page number"))
+                )
+                assert(described.decode("42").contains(42))
+                assert(described.schema.map(_.description).contains(Some("a page number")))
+            }
+        }
+
+        "constraint forwarding" - {
+
+            "Str: minLength, maxLength, and pattern" in {
+                val js  = Json.JsonSchema.Str(minLength = Present(2), maxLength = Present(50), pattern = Present("[a-z]+"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("string"))
+                assert(obj.minLength == Some(2))
+                assert(obj.maxLength == Some(50))
+                assert(obj.pattern == Some("[a-z]+"))
+                assert(obj.format == None)
+            }
+
+            "Str: format is still forwarded" in {
+                val js  = Json.JsonSchema.Str(format = Present("uuid"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.format == Some("uuid"))
+            }
+
+            "Str: description is forwarded" in {
+                val js  = Json.JsonSchema.Str(description = Present("a name"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.description == Some("a name"))
+            }
+
+            "Num: minimum and maximum" in {
+                val js  = Json.JsonSchema.Num(minimum = Present(0.0), maximum = Present(99.9))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("number"))
+                assert(obj.minimum == Some(0.0))
+                assert(obj.maximum == Some(99.9))
+                assert(obj.exclusiveMinimum == None)
+                assert(obj.exclusiveMaximum == None)
+            }
+
+            "Num: exclusiveMinimum and exclusiveMaximum" in {
+                val js  = Json.JsonSchema.Num(exclusiveMinimum = Present(0.0), exclusiveMaximum = Present(1.0))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.exclusiveMinimum == Some(0.0))
+                assert(obj.exclusiveMaximum == Some(1.0))
+            }
+
+            "Integer: minimum and maximum forwarded as Double" in {
+                val js  = Json.JsonSchema.Integer(minimum = Present(0L), maximum = Present(100L))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("integer"))
+                assert(obj.minimum == Some(0.0))
+                assert(obj.maximum == Some(100.0))
+            }
+
+            "Arr: minItems, maxItems, and uniqueItems" in {
+                val js =
+                    Json.JsonSchema.Arr(Json.JsonSchema.Str(), minItems = Present(1), maxItems = Present(10), uniqueItems = Present(true))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("array"))
+                assert(obj.minItems == Some(1))
+                assert(obj.maxItems == Some(10))
+                assert(obj.uniqueItems == Some(true))
+            }
+
+            "Obj: description is forwarded" in {
+                val js  = Json.JsonSchema.Obj(List("x" -> Json.JsonSchema.Str()), List("x"), description = Present("my object"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("object"))
+                assert(obj.description == Some("my object"))
+            }
+
+            "Bool: description is forwarded" in {
+                val js  = Json.JsonSchema.Bool(description = Present("a flag"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("boolean"))
+                assert(obj.description == Some("a flag"))
+            }
+
+            "Null: description is forwarded" in {
+                val js  = Json.JsonSchema.Null(description = Present("always null"))
+                val obj = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                assert(obj.`type` == Some("null"))
+                assert(obj.description == Some("always null"))
+            }
+
+            "constraint fields are absent from JSON when empty" in {
+                val js   = Json.JsonSchema.Str()
+                val obj  = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                val spec = HttpOpenApi(
+                    openapi = "3.0.0",
+                    info = HttpOpenApi.Info("T", "1", None),
+                    paths = Map.empty,
+                    components = Some(HttpOpenApi.Components(
+                        schemas = Some(Map("x" -> obj)),
+                        securitySchemes = None
+                    ))
+                )
+                val json = HttpOpenApi.toJson(spec)
+                assert(!json.contains("minLength"))
+                assert(!json.contains("maximum"))
+                assert(!json.contains("pattern"))
+            }
+
+            "constraint fields appear in serialized JSON when set" in {
+                val js   = Json.JsonSchema.Str(minLength = Present(1), pattern = Present("[a-z]+"))
+                val obj  = OpenApiGenerator.jsonSchemaToHttpOpenApi(js)
+                val spec = HttpOpenApi(
+                    openapi = "3.0.0",
+                    info = HttpOpenApi.Info("T", "1", None),
+                    paths = Map.empty,
+                    components = Some(HttpOpenApi.Components(
+                        schemas = Some(Map("x" -> obj)),
+                        securitySchemes = None
+                    ))
+                )
+                val json = HttpOpenApi.toJson(spec)
+                assert(json.contains("minLength"))
+                assert(json.contains("[a-z]+"))
+            }
+        }
+    }
+end OpenApiGeneratorTest

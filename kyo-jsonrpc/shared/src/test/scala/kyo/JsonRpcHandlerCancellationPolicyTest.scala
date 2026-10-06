@@ -1,0 +1,971 @@
+package kyo
+
+import kyo.Maybe.Absent
+import kyo.Maybe.Present
+import kyo.internal.engine.JsonRpcEndpointImpl
+
+class JsonRpcHandlerCancellationPolicyTest extends JsonRpcTest:
+
+    case class EchoReq(text: String) derives Schema, CanEqual
+    case class EchoResp(text: String) derives Schema, CanEqual
+
+    // Inline reconstruction of the cancellation policies (expectReplyForCancelledRequest=true variant).
+    private case class CancelByIdParams(id: JsonRpcId) derives Schema, CanEqual
+    private case class CancelWithReasonParams(requestId: JsonRpcId, reason: Maybe[String]) derives Schema, CanEqual
+
+    private val cancelByIdEncoder: JsonRpcCancellationPolicy.ParamsEncoder =
+        (id, _) =>
+            f ?=>
+                Sync.defer(Structure.encode(CancelByIdParams(id)))(using f)
+
+    private val cancelByIdDecoder: JsonRpcCancellationPolicy.ParamsDecoder =
+        sv =>
+            f ?=>
+                Sync.defer {
+                    Structure.decode[CancelByIdParams](sv)(using summon[Schema[CancelByIdParams]], f) match
+                        case Result.Success(p) => Present(p.id)
+                        case _                 => Absent
+                }(using f)
+
+    private val cancelWithReasonEncoder: JsonRpcCancellationPolicy.ParamsEncoder =
+        (id, reason) =>
+            f ?=>
+                Sync.defer(Structure.encode(CancelWithReasonParams(id, reason)))(using f)
+
+    private val cancelWithReasonDecoder: JsonRpcCancellationPolicy.ParamsDecoder =
+        sv =>
+            f ?=>
+                Sync.defer {
+                    Structure.decode[CancelWithReasonParams](sv)(using summon[Schema[CancelWithReasonParams]], f) match
+                        case Result.Success(p) => Present(p.requestId)
+                        case _                 => Absent
+                }(using f)
+
+    // cancelMethod="$/cancelRequest", expectReply=true (server still replies after cancel)
+    private val cancellationWithReply = JsonRpcCancellationPolicy(
+        cancelMethod = "$/cancelRequest",
+        encodeParams = cancelByIdEncoder,
+        decodeParams = cancelByIdDecoder,
+        expectReplyForCancelledRequest = true,
+        cancelledError = Present(JsonRpcCustomError(-32800, "Request cancelled")(using Frame.internal)),
+        protectedMethods = Set.empty
+    )
+
+    // cancelMethod="notifications/cancelled", expectReply=false (handler interrupted, no reply)
+    private val cancellationWithoutReply = JsonRpcCancellationPolicy(
+        cancelMethod = "notifications/cancelled",
+        encodeParams = cancelWithReasonEncoder,
+        decodeParams = cancelWithReasonDecoder,
+        expectReplyForCancelledRequest = false,
+        cancelledError = Absent,
+        protectedMethods = Set("initialize")
+    )
+
+    private val expectReplyConfig = JsonRpcHandler.Config(cancellation = Present(cancellationWithReply))
+    private val noReplyConfig     = JsonRpcHandler.Config(cancellation = Present(cancellationWithoutReply))
+    private val noPolicy          = JsonRpcHandler.Config(cancellation = Absent)
+
+    private class CapturingTransport(inner: JsonRpcTransport) extends JsonRpcTransport:
+        // Unsafe: AtomicRef.Unsafe.init for thread-safe envelope accumulation outside effect context
+        val sent = AtomicRef.Unsafe.init(List.empty[JsonRpcEnvelope])(using AllowUnsafe.embrace.danger)
+
+        def send(env: JsonRpcEnvelope)(using Frame): Unit < (Async & Abort[Closed | JsonRpcError]) =
+            Sync.defer(discard(sent.getAndUpdate(env :: _)(using AllowUnsafe.embrace.danger))).andThen(inner.send(env))
+
+        def incoming(using Frame): Stream[JsonRpcEnvelope, Async & Abort[Closed]] =
+            inner.incoming
+
+        def close(using Frame): Unit < Async =
+            inner.close
+
+        def sentList: List[JsonRpcEnvelope] = sent.get()(using AllowUnsafe.embrace.danger).reverse
+    end CapturingTransport
+
+    // GatedTransport holds responses until gateP is completed, then forwards them.
+    // gateP acts as a latch (replaces a one-shot countdown latch): complete it to open the gate.
+    private class GatedTransport(
+        inner: JsonRpcTransport,
+        gateP: Fiber.Promise[Unit, Abort[Closed]]
+    ) extends JsonRpcTransport:
+        // Unsafe: AtomicRef.Unsafe.init for thread-safe envelope accumulation outside effect context
+        val sent = AtomicRef.Unsafe.init(List.empty[JsonRpcEnvelope])(using AllowUnsafe.embrace.danger)
+
+        def send(env: JsonRpcEnvelope)(using Frame): Unit < (Async & Abort[Closed | JsonRpcError]) =
+            env match
+                case _: JsonRpcResponse =>
+                    Sync.defer(discard(sent.getAndUpdate(env :: _)(using AllowUnsafe.embrace.danger))).andThen {
+                        gateP.get.andThen(inner.send(env))
+                    }
+                case _ =>
+                    Sync.defer(discard(sent.getAndUpdate(env :: _)(using AllowUnsafe.embrace.danger))).andThen(inner.send(env))
+
+        def incoming(using Frame): Stream[JsonRpcEnvelope, Async & Abort[Closed]] =
+            inner.incoming
+
+        def close(using Frame): Unit < Async =
+            inner.close
+
+        def sentList: List[JsonRpcEnvelope] = sent.get()(using AllowUnsafe.embrace.danger).reverse
+    end GatedTransport
+
+    /** Holds the writer in its first send, signalling `held` there, until `gate` opens; the writer channel then fills behind it. */
+    private class HeldTransport(
+        inner: JsonRpcTransport,
+        held: Fiber.Promise[Unit, Any],
+        gate: Fiber.Promise[Unit, Any]
+    ) extends JsonRpcTransport:
+        def send(env: JsonRpcEnvelope)(using Frame): Unit < (Async & Abort[Closed | JsonRpcError]) =
+            held.completeUnitDiscard.andThen(gate.get).andThen(inner.send(env))
+
+        def incoming(using Frame): Stream[JsonRpcEnvelope, Async & Abort[Closed]] =
+            inner.incoming
+
+        def close(using Frame): Unit < Async =
+            inner.close
+    end HeldTransport
+
+    /** Returns once the peer has read every message `a` sent before it: a call to a method the peer does not know is answered
+      * directly by the peer's reader, so its reply proves the reader got past everything sent earlier. Any other outcome means
+      * the barrier did not hold, so it fails the test. The method name is not checked: the reply crosses the engine's JSON codec,
+      * which rebuilds a -32601 error without it. The reply reaches this call only through the call's own id.
+      */
+    private def flush(a: JsonRpcHandler)(using Frame, kyo.test.AssertScope): Unit < Async =
+        Abort.run[JsonRpcError | Closed](a.call[EchoReq, EchoResp]("no-such-method", EchoReq("flush"))).map {
+            case Result.Failure(e: JsonRpcMethodNotFoundError) if e.code == -32601 => ()
+            case other => fail(s"flush expected the peer's -32601 reply for 'no-such-method', got $other")
+        }
+
+    /** The no-reply policy sets no cancelledError, so its cancel settles the call locally with the default -32800. */
+    private def assertCancelledLocally(result: Result[JsonRpcError | Closed, EchoResp])(using Frame, kyo.test.AssertScope): Unit =
+        result match
+            case Result.Failure(e: JsonRpcError) if e.code == -32800 => ()
+            case other                                               => fail(s"expected the call to fail with -32800, got $other")
+
+    private def repliedTo(transport: CapturingTransport, id: JsonRpcId): Boolean =
+        transport.sentList.exists {
+            case JsonRpcResponse(rid, _, _, _) => rid == id
+            case _                             => false
+        }
+
+    "cancellation with expectReply: handler observes cancelled and caller gets -32800" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (req, ctx) =>
+                ctx.cancelled.get.andThen(EchoResp(req.text))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("hello"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        callFib.get.map {
+                                            case Result.Failure(e: JsonRpcError) =>
+                                                assert(e.code == -32800, s"expected -32800, got ${e.code}")
+                                            case other => fail(s"expected -32800, got $other")
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation with expectReply: a reply IS still sent on the transport" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (req, ctx) =>
+                ctx.cancelled.get.andThen(EchoResp(req.text))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capB = new CapturingTransport(tb)
+            JsonRpcHandler.init(ta, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(capB, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("hello"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        callFib.get.andThen {
+                                            assertEventually(Sync.defer {
+                                                capB.sentList.exists {
+                                                    case JsonRpcResponse(rid, _, _, _) => rid == id
+                                                    case _                             => false
+                                                }
+                                            }).andThen(succeed)
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // JVM and Native: the extras encoder holds its thread on a latch to keep the call inside the moment it learns its id, which a
+    // single-threaded runtime cannot do.
+    "a cancel issued as soon as the extras encoder has the id reaches the peer".notJs.notWasm in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val release    = new java.util.concurrent.CountDownLatch(1)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (req, ctx) =>
+                ctx.cancelled.get.andThen(EchoResp(req.text))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val implA     = endpointA.unsafe.asInstanceOf[JsonRpcEndpointImpl]
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer {
+                            capturedId.set(Present(id))(using AllowUnsafe.embrace.danger)
+                            release.await()
+                            Absent
+                        }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("hello"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    Fiber.initUnscoped(endpointA.cancel(id, Absent)).map { cancelFib =>
+                                        // The cancel has looked the id up once it either gave up on it or recorded its error.
+                                        assertEventually(cancelFib.done.map { done =>
+                                            done || Maybe(implA.callerRegistry.get(id)).exists(
+                                                _.pendingCancelError.get()(using AllowUnsafe.embrace.danger).isDefined
+                                            )
+                                        }).andThen {
+                                            Sync.defer(release.countDown())
+                                                .andThen(cancelFib.get)
+                                                .andThen(flush(endpointA))
+                                                .andThen {
+                                                    val cancelSent = capA.sentList.exists {
+                                                        case JsonRpcNotification(method, _, _) => method == "$/cancelRequest"
+                                                        case _                                 => false
+                                                    }
+                                                    if !cancelSent then fail("the cancel for a call whose id the caller held was dropped")
+                                                    else
+                                                        callFib.get.map {
+                                                            case Result.Failure(e: JsonRpcError) =>
+                                                                assert(e.code == -32800, s"expected -32800, got ${e.code}")
+                                                            case other => fail(s"expected -32800, got $other")
+                                                        }
+                                                    end if
+                                                }
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation without expectReply: no reply is sent on the transport" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) => ctx.cancelled.get.andThen(EchoResp("done"))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capB = new CapturingTransport(tb)
+            JsonRpcHandler.init(ta, Seq.empty, noReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(capB, Seq(echoOnB), noReplyConfig).map { endpointB =>
+                    val implB     = endpointB.unsafe.asInstanceOf[JsonRpcEndpointImpl]
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent)
+                                        .andThen(callFib.get.map(result => assertCancelledLocally(result)))
+                                        .andThen(flush(endpointA))
+                                        .andThen {
+                                            // The cancel can interrupt the handler before its body runs, so no signal from the
+                                            // route body can mark the handler settled. The entry leaving pendingInbound can: the
+                                            // engine removes it once the handler fiber completes, however it completed. The flush
+                                            // proves B read the request first, so an absent entry is never one not yet registered.
+                                            assertEventually(Sync.defer(!implB.pendingInbound.containsKey(id))).andThen {
+                                                Sync.defer {
+                                                    assert(
+                                                        !repliedTo(capB, id),
+                                                        "policy without expectReply should not send a reply for cancelled request"
+                                                    )
+                                                    assert(implB.pendingInbound.isEmpty, "a cancelled request left an inbound entry")
+                                                }
+                                            }
+                                        }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation without expectReply landing before the handler starts sends no reply and leaves no entry" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        // Unsafe: AtomicBoolean.Unsafe.init to observe from the test whether the echo route body ran
+        val bodyRan = AtomicBoolean.Unsafe.init(false)(using AllowUnsafe.embrace.danger)
+        Fiber.Promise.init[Unit, Any].map { holdReleased =>
+            // B starts a request only after every notification read before it has been handled, so the echo
+            // handler stays parked behind this one until the test completes holdReleased.
+            val holdOnB = JsonRpcRoute.notification[EchoReq]("hold") {
+                (_, _) => holdReleased.get
+            }
+            val echoOnB = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+                (req, _) =>
+                    Sync.defer(bodyRan.set(true)(using AllowUnsafe.embrace.danger)).andThen(EchoResp(req.text))
+            }
+            JsonRpcTransport.inMemory.map { (ta, tb) =>
+                val capB = new CapturingTransport(tb)
+                JsonRpcHandler.init(ta, Seq.empty, noReplyConfig).map { endpointA =>
+                    JsonRpcHandler.init(capB, Seq(holdOnB, echoOnB), noReplyConfig).map { endpointB =>
+                        val implB     = endpointB.unsafe.asInstanceOf[JsonRpcEndpointImpl]
+                        val idEncoder = JsonRpcExtrasEncoder(id =>
+                            Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                        )
+                        endpointA.notify[EchoReq]("hold", EchoReq("hold")).andThen {
+                            Fiber.initUnscoped(
+                                Abort.run[JsonRpcError | Closed](
+                                    endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                                )
+                            ).map { callFib =>
+                                assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                                    Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                        case Present(id) =>
+                                            endpointA.cancel(id, Absent)
+                                                .andThen(callFib.get.map(result => assertCancelledLocally(result)))
+                                                .andThen(flush(endpointA))
+                                                .andThen(holdReleased.completeUnit.map(released =>
+                                                    assert(released, "the hold promise was completed before the test released it")
+                                                ))
+                                                .andThen {
+                                                    assertEventually(Sync.defer(!implB.pendingInbound.containsKey(id))).andThen {
+                                                        Sync.defer {
+                                                            assert(
+                                                                !bodyRan.get()(using AllowUnsafe.embrace.danger),
+                                                                "the echo route body ran although its request was cancelled before it started"
+                                                            )
+                                                            assert(
+                                                                !repliedTo(capB, id),
+                                                                "policy without expectReply should not send a reply for cancelled request"
+                                                            )
+                                                            assert(
+                                                                implB.pendingInbound.isEmpty,
+                                                                "a cancelled request left an inbound entry"
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                        case Absent => fail("id not captured")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation without expectReply race: cancel while reply queued in writer channel suppresses the reply" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        // Unsafe: Fiber.Promise used as a gate (replaces CountDownLatch(1));
+        // complete it with completeUnitDiscard to open the gate
+        Fiber.Promise.init[Unit, Abort[Closed]].map { sendGate =>
+            JsonRpcTransport.inMemory.map { (ta, tb) =>
+                val gatedTb = new GatedTransport(tb, sendGate)
+                val echoOnB = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+                    (req, _) => EchoResp(req.text)
+                }
+                JsonRpcHandler.init(ta, Seq.empty, noReplyConfig).map { endpointA =>
+                    JsonRpcHandler.init(gatedTb, Seq(echoOnB), noReplyConfig).map { _ =>
+                        val idEncoder = JsonRpcExtrasEncoder(id =>
+                            Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                        )
+                        Fiber.initUnscoped(
+                            Abort.run[JsonRpcError | Closed](
+                                endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                            )
+                        ).map { callFib =>
+                            assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                                Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                    case Present(id) =>
+                                        // Wait for response to reach GatedTransport.send (before the gate blocks it)
+                                        assertEventually(Sync.defer {
+                                            gatedTb.sentList.exists {
+                                                case JsonRpcResponse(rid, _, _, _) => rid == id
+                                                case _                             => false
+                                            }
+                                        }).andThen {
+                                            // Fire cancel while reply is stuck behind the gate
+                                            endpointA.cancel(id, Absent).andThen {
+                                                // Open gate: writer now checks suppress flag; should drop the reply
+                                                sendGate.completeUnitDiscard.andThen {
+                                                    // The cancel fires the call's abortSignal, so awaiting the call
+                                                    // fiber resolves deterministically; it must resolve to a failure.
+                                                    callFib.get.map { result =>
+                                                        assert(result.isFailure, "call should fail after cancel")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    case Absent => fail("id not captured")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation with expectReply: sends $/cancelRequest notification and call fails with -32800" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) => ctx.cancelled.get.andThen(EchoResp("cancelled"))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("hello"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        callFib.get.map {
+                                            case Result.Failure(e: JsonRpcError) =>
+                                                assert(e.code == -32800)
+                                                assertEventually(Sync.defer {
+                                                    capA.sentList.exists {
+                                                        case JsonRpcNotification(m, _, _) => m == "$/cancelRequest"
+                                                        case _                            => false
+                                                    }
+                                                })
+                                            case other => fail(s"expected -32800, got $other")
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancellation without expectReply: sends notifications/cancelled with requestId and reason, call fails" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) => ctx.cancelled.get.andThen(EchoResp("cancelled"))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, noReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), noReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Present("user requested")).andThen {
+                                        callFib.get.map {
+                                            case Result.Failure(e: JsonRpcError) =>
+                                                assertEventually(Sync.defer {
+                                                    capA.sentList.exists {
+                                                        case JsonRpcNotification(m, _, _) => m == "notifications/cancelled"
+                                                        case _                            => false
+                                                    }
+                                                })
+                                            case other => fail(s"expected failure, got $other")
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancel for protected method sends no notification and does not abort call" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val initOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("initialize") {
+            (req, ctx) => ctx.cancelled.get.andThen(EchoResp("initialized"))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, noReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(initOnB), noReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("initialize", EchoReq("init"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    // cancel refuses a protected method synchronously (a logged no-op that enqueues
+                                    // nothing), so once endpointA.cancel returns the decision is final: assert no
+                                    // cancel notification was sent and the handler (blocked on its never-firing
+                                    // cancelled latch) leaves the call pending. No sleep is needed.
+                                    endpointA.cancel(id, Absent).andThen {
+                                        Sync.defer {
+                                            val noCancelSent = capA.sentList.forall {
+                                                case JsonRpcNotification(m, _, _) => m != "notifications/cancelled"
+                                                case _                            => true
+                                            }
+                                            assert(noCancelSent, "cancel notification should not be sent for protected method")
+                                        }.andThen {
+                                            callFib.done.map { isDone =>
+                                                assert(!isDone, "call should still be pending after refused cancel")
+                                            }
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancel for already-completed call returns unit without sending a cancel notification" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (req, _) => EchoResp(req.text)
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    endpointA.call[EchoReq, EchoResp]("echo", EchoReq("hello"), idEncoder).andThen {
+                        endpointA.awaitDrain.andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    val countBefore = Sync.defer {
+                                        capA.sentList.count {
+                                            case _: JsonRpcNotification => true
+                                            case _                      => false
+                                        }
+                                    }
+                                    countBefore.map { before =>
+                                        endpointA.cancel(id, Absent).andThen {
+                                            Sync.defer {
+                                                val after = capA.sentList.count {
+                                                    case _: JsonRpcNotification => true
+                                                    case _                      => false
+                                                }
+                                                assert(after == before, "cancel for completed call should not send notification")
+                                            }
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "inbound cancel for absent handler id is silently dropped without error" in {
+        val echoOnB = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (req, _) => EchoResp(req.text)
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            JsonRpcHandler.init(ta, Seq.empty, noReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), noReplyConfig).map { _ =>
+                    // Inject a cancel notification for a non-existent id directly into B's incoming stream
+                    val fakeId      = JsonRpcId.Num(99999L)
+                    val cancelNotif = JsonRpcNotification(
+                        "notifications/cancelled",
+                        Present(Structure.Value.Record(Chunk(
+                            "requestId" -> Structure.encode(fakeId),
+                            "reason"    -> Structure.Value.Null
+                        ))),
+                        Absent
+                    )
+                    Abort.run[Closed](ta.send(cancelNotif)).andThen {
+                        // The echo call is the sentinel: B's single reader processes the injected cancel for the
+                        // absent id before this later request (FIFO). A correct echo response proves the cancel was
+                        // silently dropped and B stayed healthy, with no sleep needed.
+                        endpointA.call[EchoReq, EchoResp]("echo", EchoReq("still alive")).map { resp =>
+                            assert(resp == EchoResp("still alive"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "timeout with expectReply policy sends $/cancelRequest and caller fails with -32800" in {
+        // A timeout that fires before the request is encoded has no request to cancel and sends nothing, so the clock advances
+        // past requestTimeout only once the peer holds the request.
+        Fiber.Promise.init[Unit, Any].map { received =>
+            val neverReturns = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+                (_, ctx) => received.completeUnitDiscard.andThen(ctx.cancelled.get).andThen(EchoResp("cancelled"))
+            }
+            Clock.withTimeControl { control =>
+                JsonRpcTransport.inMemory.map { (ta, tb) =>
+                    val capA                     = new CapturingTransport(ta)
+                    val timeoutExpectReplyConfig = JsonRpcHandler.Config(
+                        cancellation = Present(cancellationWithReply),
+                        requestTimeout = 150.millis
+                    )
+                    JsonRpcHandler.init(capA, Seq.empty, timeoutExpectReplyConfig).map { endpointA =>
+                        JsonRpcHandler.init(tb, Seq(neverReturns), expectReplyConfig).map { _ =>
+                            Fiber.initUnscoped(
+                                Abort.run[JsonRpcError | Closed](
+                                    endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"))
+                                )
+                            ).map { callFib =>
+                                received.get.andThen(control.awaitPendingSleepers(1)).andThen(control.advance(300.millis)).andThen {
+                                    callFib.get.map {
+                                        case Result.Failure(e: JsonRpcError) =>
+                                            assert(e.code == -32800)
+                                            assertEventually(Sync.defer {
+                                                capA.sentList.exists {
+                                                    case JsonRpcNotification(m, _, _) => m == "$/cancelRequest"
+                                                    case _                            => false
+                                                }
+                                            }).andThen(succeed)
+                                        case other => fail(s"expected -32800, got $other")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "a call whose timeout fires while its request waits for room on the writer fails with -32800, and the request never runs" in {
+        // The writer is held in its first send, so 64 more notifications fill its channel and the call's put waits for room. The
+        // call's extras encoder runs inside the encode callback, after the call is registered, so `registered` places the timeout
+        // between the call's registration and its request reaching the channel.
+        Fiber.Promise.init[Unit, Any].map { held =>
+            Fiber.Promise.init[Unit, Any].map { gate =>
+                Fiber.Promise.init[Unit, Any].map { registered =>
+                    AtomicBoolean.init.map { ran =>
+                        val echo = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+                            (req, _) => ran.set(true).andThen(EchoResp(req.text))
+                        }
+                        Clock.withTimeControl { control =>
+                            JsonRpcTransport.inMemory.map { (ta, tb) =>
+                                val config =
+                                    JsonRpcHandler.Config(cancellation = Present(cancellationWithReply), requestTimeout = 150.millis)
+                                JsonRpcHandler.init(new HeldTransport(ta, held, gate), Seq.empty, config).map { a =>
+                                    JsonRpcHandler.init(tb, Seq(echo), expectReplyConfig).map { _ =>
+                                        a.notify("fill", EchoReq("held")).andThen(held.get).andThen {
+                                            Kyo.foreach(Chunk.range(0, 64))(i => a.notify("fill", EchoReq(i.toString)))
+                                        }.andThen {
+                                            val marking = JsonRpcExtrasEncoder(_ => registered.completeUnitDiscard.andThen(Absent))
+                                            Fiber.initUnscoped(
+                                                Abort.run[JsonRpcError | Closed](a.call[EchoReq, EchoResp]("echo", EchoReq("x"), marking))
+                                            ).map { callFib =>
+                                                registered.get
+                                                    .andThen(control.awaitPendingSleeper(150.millis))
+                                                    .andThen(control.advance(300.millis))
+                                                    .andThen(gate.completeUnitDiscard)
+                                                    .andThen(callFib.get)
+                                                    .map {
+                                                        case Result.Failure(e: JsonRpcError) =>
+                                                            assert(e.code == -32800)
+                                                            flush(a).andThen(ran.get).map(r =>
+                                                                assert(!r, "the peer ran a request whose put the timeout interrupted")
+                                                            )
+                                                        case other => fail(s"expected -32800, got $other")
+                                                    }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "timeout with cancellation=Absent sends no cancel notification; call fails locally" in {
+        // The handler blocks on a never-completed gate so the requestTimeout is the only exit. Clock.withTimeControl
+        // drives it deterministically: Async.timeout routes through Clock.sleep, so advancing the fake clock past
+        // requestTimeout fires the timeout arm. Once the call fiber resolves the timeout path has fully run.
+        // The timeout arm registers its sleeper before the request is sent, and a timeout that fires first has no
+        // request to cancel, so the clock advances only once the peer holds the request.
+        Fiber.Promise.init[Unit, Any].map { received =>
+            val neverReturns = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+                (_, _) =>
+                    received.completeUnitDiscard.andThen(Fiber.Promise.init[Unit, Any].map { gate => gate.get.andThen(EchoResp("never")) })
+            }
+            Clock.withTimeControl { control =>
+                JsonRpcTransport.inMemory.map { (ta, tb) =>
+                    val capA            = new CapturingTransport(ta)
+                    val timeoutNoPolicy = JsonRpcHandler.Config(
+                        cancellation = Absent,
+                        requestTimeout = 150.millis
+                    )
+                    JsonRpcHandler.init(capA, Seq.empty, timeoutNoPolicy).map { endpointA =>
+                        JsonRpcHandler.init(tb, Seq(neverReturns)).map { _ =>
+                            Fiber.initUnscoped(
+                                Abort.run[JsonRpcError | Closed](
+                                    endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"))
+                                )
+                            ).map { callFib =>
+                                received.get.andThen(control.awaitPendingSleepers(1)).andThen(control.advance(300.millis)).andThen {
+                                    callFib.get.map {
+                                        case Result.Failure(_: JsonRpcError) =>
+                                            Sync.defer {
+                                                val noCancelSent = capA.sentList.forall {
+                                                    case JsonRpcNotification(_, _, _) => false
+                                                    case _                            => true
+                                                }
+                                                assert(noCancelSent, "no cancel notification should be sent when cancellation is Absent")
+                                            }
+                                        case other => fail(s"expected JsonRpcError failure, got $other")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "handler aborts with ContentModified on cancel: wire response carries -32801 verbatim" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) =>
+                ctx.cancelled.get.andThen {
+                    Abort.fail[JsonRpcError](JsonRpcCustomError(-32801, "Content modified"))
+                }
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            JsonRpcHandler.init(ta, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Absent }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        callFib.get.map {
+                                            case Result.Failure(e: JsonRpcError) =>
+                                                assert(e.code == -32801, s"expected ContentModified -32801, got ${e.code}")
+                                            case other => fail(s"expected ContentModified, got $other")
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancel notification carries extras from original call" in {
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        val echoOnB    = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) => ctx.cancelled.get.andThen(EchoResp("done"))
+        }
+        val sessionExtras = Structure.Value.Record(Chunk("session" -> Structure.Value.Str("s1")))
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer { capturedId.set(Present(id))(using AllowUnsafe.embrace.danger); Present(sessionExtras) }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        callFib.get.andThen {
+                                            assertEventually(Sync.defer {
+                                                capA.sentList.exists {
+                                                    case JsonRpcNotification(m, _, _) => m == "$/cancelRequest"
+                                                    case _                            => false
+                                                }
+                                            }).andThen {
+                                                Sync.defer {
+                                                    val cancelNotif = capA.sentList.collectFirst {
+                                                        case n @ JsonRpcNotification(m, _, _)
+                                                            if m == "$/cancelRequest" => n
+                                                    }
+                                                    assert(cancelNotif.isDefined, "cancel notification not found")
+                                                    assert(
+                                                        cancelNotif.get.extras == Present(sessionExtras),
+                                                        s"expected extras to match, got ${cancelNotif.get.extras}"
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "cancel-during-encode race: encoded request still sent but caller observes abort immediately" in {
+        // The idSignal fires inside the encode callback. endpoint.cancel can find callerRegistry[id]
+        // while encoding is still in progress (e.g. if we slow down the transport.send step).
+        // The caller should observe Abort.fail(cancelled) via the abortSignal race.
+        // Unsafe: AtomicRef.Unsafe.init for id capture across fibers
+        val capturedId = AtomicRef.Unsafe.init[Maybe[JsonRpcId]](Absent)(using AllowUnsafe.embrace.danger)
+        // Unsafe: AtomicBoolean.Unsafe.init for cancel-fired flag across fibers
+        val cancelFired = AtomicBoolean.Unsafe.init(false)(using AllowUnsafe.embrace.danger)
+        val echoOnB     = JsonRpcRoute.request[EchoReq, EchoResp]("echo") {
+            (_, ctx) => ctx.cancelled.get.andThen(EchoResp("cancelled"))
+        }
+        JsonRpcTransport.inMemory.map { (ta, tb) =>
+            val capA = new CapturingTransport(ta)
+            JsonRpcHandler.init(capA, Seq.empty, expectReplyConfig).map { endpointA =>
+                JsonRpcHandler.init(tb, Seq(echoOnB), expectReplyConfig).map { _ =>
+                    val idEncoder = JsonRpcExtrasEncoder(id =>
+                        Sync.defer {
+                            capturedId.set(Present(id))(using AllowUnsafe.embrace.danger)
+                            Absent
+                        }
+                    )
+                    Fiber.initUnscoped(
+                        Abort.run[JsonRpcError | Closed](
+                            endpointA.call[EchoReq, EchoResp]("echo", EchoReq("x"), idEncoder)
+                        )
+                    ).map { callFib =>
+                        assertEventually(Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger).isDefined)).andThen {
+                            Sync.defer(capturedId.get()(using AllowUnsafe.embrace.danger)).map {
+                                case Present(id) =>
+                                    endpointA.cancel(id, Absent).andThen {
+                                        Sync.defer(discard(cancelFired.set(true)(using AllowUnsafe.embrace.danger))).andThen {
+                                            callFib.get.map {
+                                                case Result.Failure(e: JsonRpcError) =>
+                                                    assert(e.code == -32800)
+                                                case other => fail(s"expected -32800, got $other")
+                                            }
+                                        }
+                                    }
+                                case Absent => fail("id not captured")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "custom policy decoder routes through decodeParams" in {
+        val decoder: Structure.Value => Frame ?=> Maybe[JsonRpcId] < Sync = sv =>
+            f ?=>
+                Sync.defer {
+                    sv match
+                        case Structure.Value.Record(fields) =>
+                            fields.iterator.collectFirst {
+                                case ("target", Structure.Value.Str(s)) => JsonRpcId.Str(s)
+                            } match
+                                case Some(id) => Present(id)
+                                case None     => Absent
+                        case _ => Absent
+                }(using f)
+        val policy = JsonRpcCancellationPolicy(
+            "x.cancel",
+            cancellationWithReply.encodeParams,
+            decoder,
+            false,
+            Absent,
+            Set.empty
+        )
+        val params = Present(Structure.Value.Record(Chunk("target" -> Structure.Value.Str("abc"))))
+        internal.engine.CancellationEngine.extractCancelIdForTest(policy, params).map { result =>
+            assert(result == Present(JsonRpcId.Str("abc")))
+        }
+    }
+
+end JsonRpcHandlerCancellationPolicyTest

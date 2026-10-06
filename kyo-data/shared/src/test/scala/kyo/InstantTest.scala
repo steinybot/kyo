@@ -1,6 +1,6 @@
 package kyo
 
-class InstantTest extends Test:
+class InstantTest extends kyo.test.Test[Any]:
 
     "parse" - {
         "valid ISO-8601 string" in {
@@ -58,39 +58,69 @@ class InstantTest extends Test:
             }
         }
 
-        "subtract instant" - {
-            "same instant" in {
-                val instant = Instant.Epoch
-                assert((instant - instant) == Duration.Zero)
-            }
-
-            "later instant" in {
-                val instant1 = Instant.Epoch
-                val instant2 = instant1 + 1000.seconds
-                assert((instant2 - instant1) == 1000.seconds)
-            }
-
-            "earlier instant" in {
-                val instant1 = Instant.Epoch
-                val instant2 = instant1 - 1000.seconds
-                assert((instant2 - instant1) == Duration.Zero)
-            }
-
-            "very distant instants" in {
-                assert((Instant.Max - Instant.Min) == Duration.Zero)
-            }
-
-            "large difference" in {
-                val instant1 = Instant.parse("2023-01-01T00:00:00Z").getOrThrow
-                val instant2 = Instant.parse("1970-01-01T00:00:00Z").getOrThrow
-                val duration = instant1 - instant2
-                assert(duration == 1672531200.seconds)
-            }
-        }
-
         "near Min" in {
             val nearMin = Instant.Min + 1.second
             assert((nearMin - 2.seconds) == Instant.Min)
+        }
+    }
+
+    "minus an instant" - {
+        "the same instant" in {
+            assert(Instant.Epoch.minus(Instant.Epoch) == Present(Duration.Zero))
+        }
+
+        "an earlier instant" in {
+            val earlier = Instant.Epoch
+            assert((earlier + 1000.seconds).minus(earlier) == Present(1000.seconds))
+        }
+
+        "a later instant is absent" in {
+            val later = Instant.Epoch
+            assert((later - 1000.seconds).minus(later) == Absent)
+            assert(Instant.Min.minus(Instant.Max) == Absent)
+        }
+
+        "across a second boundary" in {
+            val earlier = Instant.Epoch + 10.seconds + 700.millis
+            val later   = Instant.Epoch + 11.seconds + 200.millis
+            assert(later.minus(earlier) == Present(500.millis))
+            assert(earlier.minus(later) == Absent)
+        }
+
+        "a difference past Long nanoseconds is Infinity" in {
+            assert(Instant.Max.minus(Instant.Min) == Present(Duration.Infinity))
+            assert(Instant.Max.minus(Instant.Epoch) == Present(Duration.Infinity))
+            assert(Instant.Epoch.minus(Instant.Min) == Present(Duration.Infinity))
+        }
+
+        "large difference" in {
+            val instant1 = Instant.parse("2023-01-01T00:00:00Z").getOrThrow
+            val instant2 = Instant.parse("1970-01-01T00:00:00Z").getOrThrow
+            assert(instant1.minus(instant2) == Present(1672531200.seconds))
+        }
+    }
+
+    "minusOrZero an instant" - {
+        "the difference when the other instant is earlier" in {
+            val earlier = Instant.Epoch + 10.seconds + 700.millis
+            val later   = Instant.Epoch + 11.seconds + 200.millis
+            assert(later.minusOrZero(earlier) == 500.millis)
+        }
+
+        "Zero when the other instant is later" in {
+            val earlier = Instant.Epoch + 10.seconds + 700.millis
+            val later   = Instant.Epoch + 11.seconds + 200.millis
+            assert(earlier.minusOrZero(later) == Duration.Zero)
+            assert(Instant.Min.minusOrZero(Instant.Max) == Duration.Zero)
+        }
+
+        "agrees with minus whenever minus is present" in {
+            val instants = Chunk(Instant.Min, Instant.Epoch, Instant.Epoch + 999.millis, Instant.Epoch + 1.second, Instant.Max)
+            for
+                a <- instants
+                b <- instants
+            do assert(a.minusOrZero(b) == a.minus(b).getOrElse(Duration.Zero))
+            end for
         }
     }
 
@@ -470,6 +500,34 @@ class InstantTest extends Test:
 
         "Min instant" in {
             assert(Instant.Min.toDuration == Duration.Zero)
+        }
+    }
+
+    "Flag.Reader" - {
+        val reader = summon[Flag.Reader[Instant]]
+
+        "typeName" in {
+            assert(reader.typeName == "Instant")
+        }
+
+        "parses ISO-8601 format" in {
+            val result = reader("2024-01-15T10:30:00Z")
+            assert(result == Right(Instant.fromJava(java.time.Instant.parse("2024-01-15T10:30:00Z"))))
+        }
+
+        "parses epoch" in {
+            val result = reader("1970-01-01T00:00:00Z")
+            assert(result == Right(Instant.Epoch))
+        }
+
+        "invalid format" in {
+            assert(reader("not-an-instant").isLeft)
+        }
+
+        "parses ISO-8601 with timezone offset" in {
+            val result   = reader("2024-01-15T10:30:00+05:30")
+            val expected = Instant.fromJava(java.time.Instant.parse("2024-01-15T05:00:00Z"))
+            assert(result == Right(expected))
         }
     }
 

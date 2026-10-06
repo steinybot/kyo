@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+set -uo pipefail
+#
+# First-class local entry point for the shared runner.
+#
+# Usage:
+#   build.sh [--env direct|podman|podman-ci] [--arch native|x86|arm] [--role <role>] <action> <platform...>
+#
+# --env  direct     host sbt
+#        podman      a Linux container running ci-test.sh over a clean snapshot
+#        podman-ci   the podman container plus CI memory/CPU caps + CI=true +
+#                    SBT_TASK_LIMIT=1, reproducing CI
+# --arch native|x86|arm  container architecture (podman/podman-ci only); sets
+#        podman --platform. native = host arch, x86 = linux/amd64, arm =
+#        linux/arm64; qemu-emulated when it differs from the host arch.
+# --role <role>  the sbt-heap-lib.sh heap role of a raw `sbt` command (default:
+#        compile); the other actions take each process's role from ci-test.sh.
+# <action>    one of test, testDiff, compile, link (default: test), or
+#             `sbt <raw command>` to run one arbitrary sbt command in the env
+#             (e.g. build.sh --env direct sbt 'kyo-netJVM/test'); no platform arg
+# <platform>  one or more of JVM, JS, Native, Wasm, all (default: all)
+#
+# Every env delegates the WHAT to the same ci-test.sh, so a local run and a CI
+# run execute identical runner code.
+#
+# Env knobs the podman envs read:
+#   KYO_BUILD_IMAGE   container image (default ubuntu:noble). Point it at a musl JDK image
+#                     (e.g. eclipse-temurin:25-jdk-alpine) to reproduce the release's Alpine
+#                     legs; provisioning switches to apk and takes sbt from the release tarball,
+#                     because both staging scripts refuse a cross-OS build and the linux-musl-*
+#                     natives can only be produced on a genuine musl host.
+#   STAGE_BORINGSSL=1 build the vendored BoringSSL before the command (kyo-net TLS).
+#   STAGE_AERON=1     build the pinned Aeron C library before the command (kyo-aeron).
+#   STAGE_SQLITE=1    fetch the pinned SQLite C source before the command (kyo-sql-sqlite).
+#   STAGE_DOLTLITE=1  stage the pinned DoltLite library before the command (kyo-sql-doltlite).
+#                     Both derive their os-arch from the container's own host, musl included.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Every sbt this script starts takes its heap from the role table; sourcing it also clears an inherited
+# SBT_OPTS, whose options the launcher would otherwise place after the role's heap.
+. "$SCRIPT_DIR/sbt-heap-lib.sh"
+
+# CI-faithful resource caps for --env podman-ci. GitHub standard public-repo
+# runners are 4 vCPU / 16 GB on both linux-x64 and linux-arm64. One place.
+CI_MEMORY="${CI_MEMORY:-16g}"
+CI_CPUS="${CI_CPUS:-4}"
+CONTAINER_IMAGE="${KYO_BUILD_IMAGE:-ubuntu:noble}"
+apt_mirror="${KYO_APT_MIRROR:-}"
+
+ENV_KIND="direct"
+ARCH="native"
+RAW_ROLE="compile"
+ACTIONS="test testDiff compile link"
+PLATFORMS="JVM JS Native Wasm"
+
+usage() {
+    echo "Usage: build.sh [--env direct|podman|podman-ci] [--arch native|x86|arm] [--role <role>] <action> <platform...>" >&2
+}
+
+contains_word() {
+    local word="$1" list="$2" item
+    for item in $list; do [ "$item" = "$word" ] && return 0; done
+    return 1
+}
+
+die_usage() { echo "build.sh: $1" >&2; usage; exit 2; }
+
+# -- parse flags, then positional action + platforms --
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --env)  ENV_KIND="${2:-}"; shift 2 ;;
+        --arch) ARCH="${2:-}"; shift 2 ;;
+        --role) RAW_ROLE="${2:-}"; shift 2 ;;
+        --) shift; break ;;
+        -*) die_usage "unknown flag '$1'" ;;
+        *) break ;;
+    esac
+done
+
+case "$ENV_KIND" in direct|podman|podman-ci) ;; *) die_usage "unknown env '$ENV_KIND'" ;; esac
+case "$ARCH" in native|x86|arm) ;; *) die_usage "unknown arch '$ARCH'" ;; esac
+sbt_heap_role_mb "$RAW_ROLE" >/dev/null || die_usage "unknown role '$RAW_ROLE'"
+
+# The CI setup action stages BoringSSL and Aeron unconditionally (kyo-aeronJVM's ffiCompile links
+# -laeron_driver_static and the kyo-net TLS tests link real libssl/libcrypto), so the CI-faithful
+# env stages them by default too. An explicit STAGE_*=0 still opts out; plain podman keeps them
+# opt-in since they add several minutes of one-off toolchain and build work.
+if [ "$ENV_KIND" = podman-ci ]; then
+    STAGE_BORINGSSL="${STAGE_BORINGSSL:-1}"
+    STAGE_AERON="${STAGE_AERON:-1}"
+    # GitHub runners always carry a container runtime, which the container-backed suites
+    # (kyo-sql, kyo-pod) auto-detect and use to launch sibling DB containers. The CI-faithful
+    # env therefore defaults the socket passthrough on, pointing at the podman VM's own
+    # socket; KYO_POD_SOCKET= (explicitly empty) opts out, and plain podman keeps it opt-in.
+    KYO_POD_SOCKET="${KYO_POD_SOCKET-/run/podman/podman.sock}"
+    # An enforcing SELinux in the podman VM confines the sibling containers the suites launch
+    # (the build container itself runs label=disable) and denies their bind-mount writes into
+    # the shared /tmp, which GitHub runners never do: kyo-pod's host-marker tests then fail on
+    # EACCES inside the sibling. Verified directly: the identical stop-signal flow delivers with
+    # enforcement off and is denied with it on. Self-repair to permissive when a machine VM is
+    # present; a Linux host without a machine VM has no such layer to adjust.
+    if [ -n "${KYO_POD_SOCKET:-}" ] && podman machine ssh true >/dev/null 2>&1; then
+        if [ "$(podman machine ssh getenforce 2>/dev/null)" = "Enforcing" ]; then
+            echo "build.sh: podman VM SELinux is Enforcing; setting permissive so sibling containers can write shared bind mounts (as on CI)" >&2
+            podman machine ssh 'sudo setenforce 0 && sudo sed -i "s/^SELINUX=enforcing/SELINUX=permissive/" /etc/selinux/config' || true
+        fi
+    fi
+fi
+
+ACTION="${1:-test}"
+shift || true
+
+# The `sbt` action is a raw escape hatch: everything after it is one sbt command, run in the selected
+# env with no platform/diff machinery, for a module- or test-scoped local run (e.g.
+# `build.sh --env direct sbt 'kyo-netJVM/test'`). Every other action takes one or more platforms.
+RAW_MODE=no
+RAW_SBT=""
+PLAT_LIST=""
+if [ "$ACTION" = "sbt" ]; then
+    [ $# -gt 0 ] || die_usage "sbt mode needs a command, e.g. build.sh --env direct sbt 'kyo-netJVM/test'"
+    RAW_MODE=yes
+    RAW_SBT="$*"
+else
+    contains_word "$ACTION" "$ACTIONS" || die_usage "unknown action '$ACTION'"
+    if [ $# -eq 0 ]; then
+        set -- all
+    fi
+    for p in "$@"; do
+        if [ "$p" = "all" ]; then
+            PLAT_LIST="JVM JS Native Wasm"
+        elif contains_word "$p" "$PLATFORMS"; then
+            PLAT_LIST="$PLAT_LIST $p"
+        else
+            die_usage "unknown platform '$p'"
+        fi
+    done
+fi
+
+# -- arch resolution: a non-native arch is podman-only --
+host_arch() {
+    [ -n "${_HOST_ARCH_OVERRIDE:-}" ] && { echo "$_HOST_ARCH_OVERRIDE"; return 0; }
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86" ;;
+        arm64|aarch64) echo "arm" ;;
+        *) echo "native" ;;
+    esac
+}
+podman_platform() {
+    case "$ARCH" in
+        x86) echo "linux/amd64" ;;
+        arm) echo "linux/arm64" ;;
+        # A native run names the host's own platform rather than leaving the choice open. Without it podman resolves the image tag to
+        # whichever architecture happens to be cached, so a single cross-arch pull by anything on the machine silently turns every later
+        # native run into an emulated one. That failure is expensive to recognise: the run does not error, it slows down and then dies
+        # inside qemu on the JVM toolchain, far from the pull that caused it.
+        *)
+            case "$(host_arch)" in
+                x86) echo "linux/amd64" ;;
+                arm) echo "linux/arm64" ;;
+                *)   echo "" ;;
+            esac
+            ;;
+    esac
+}
+
+if [ "$ARCH" != "native" ] && [ "$ENV_KIND" = "direct" ]; then
+    die_usage "--arch $ARCH requires --env podman or podman-ci (direct has no container)"
+fi
+
+# -- pre-run echo (unconditional) --
+if [ "$RAW_MODE" = yes ]; then
+    echo "build.sh: env=$ENV_KIND arch=$ARCH sbt: $RAW_SBT"
+else
+    echo "build.sh: env=$ENV_KIND arch=$ARCH action=$ACTION platforms=$PLAT_LIST"
+fi
+
+# -- emulation notice + binfmt precheck for a cross-arch container --
+if [ "$ARCH" != "native" ]; then
+    hostarch=$(host_arch)
+    if [ "$ARCH" != "$hostarch" ]; then
+        echo "build.sh: emulated $ARCH run; expect substantial slowdown"
+        # Ask the container runtime to execute one binary of the target platform. The capability has to be
+        # checked where the containers run, which is not always where this script runs: with `podman machine`
+        # the binfmt_misc handlers live in the VM's kernel, and a macOS host has no /proc at all, so reading
+        # the host's own /proc/sys/fs/binfmt_misc answers "not registered" on every mac and refuses every
+        # cross-arch run on the machines most likely to need one. Running the thing is the only probe that
+        # cannot be wrong about which kernel it is asking. It costs an image pull the run is about to do
+        # anyway, since it uses the same image.
+        if [ -z "${BUILD_SKIP_BINFMT:-}" ] &&
+            ! podman run --rm --platform "$(podman_platform)" "$CONTAINER_IMAGE" true >/dev/null 2>&1; then
+            echo "build.sh: cannot execute $(podman_platform) binaries; register qemu-user-static binfmt handlers, then retry" >&2
+            exit 1
+        fi
+    fi
+fi
+
+run_one() {
+    local platform="$1"
+    case "$ENV_KIND" in
+        direct)
+            ( cd "$PROJECT_DIR" && ci_cmd "$platform" )
+            ;;
+        podman|podman-ci)
+            run_in_container "$platform"
+            ;;
+    esac
+}
+
+# The runner command, identical in every env.
+ci_cmd() { "$SCRIPT_DIR/ci-test.sh" "$1" "$ACTION"; }
+
+# Install the JDK + sbt via coursier inside a bare container image, making it
+# a usable build host (GitHub setup actions cannot run in a bare container).
+# Also installs Node 24 for JS/Wasm, the Linux native libraries for Native,
+# and patch (the snapshot applies uncommitted changes via patch). Emitted as
+# a shell prelude run inside the already-launched container, quiet and idempotent.
+container_provision() {
+    local platform="$1"
+    # Read host-side: the musl branch installs sbt before the source snapshot is extracted.
+    local sbt_version; sbt_version=$(sed -n 's/^sbt.version=//p' "$PROJECT_DIR/project/build.properties")
+    # liburing-dev + libssl-dev: the kyo-net JVM FFI shims link the io_uring (-luring) and OpenSSL TLS data planes; without them
+    # kyo-netJVM's ffiCompile fails (cannot find -luring). build-essential supplies the cc that ffiCompile runs to build the shims,
+    # preinstalled on GitHub runners but absent from a bare image, and its lack fails ffiCompile before any linking (cannot run "cc").
+    # Always installed so any kyo-net command builds in the container.
+    # openssl is the CLI, not the library libssl-dev provides, and the base image ships without it. The
+    # kyo-sql TLS suites generate their server cert and key by shelling out to it, so without it every
+    # such leaf fails as "SSL not ready" with a Postgres that started perfectly well and simply has no
+    # certificate, which reads like a TLS defect rather than a missing tool.
+    # file + binutils are not optional either: native_assert_arch reads a member of the staged archive
+    # to prove it is really for the target architecture, and fails when either tool is missing.
+    local apt_pkgs="curl ca-certificates patch build-essential liburing-dev libssl-dev openssl file binutils"
+    local node_pkgs="" native_pkgs="" bssl_pkgs="" aeron_pkgs="" sqlite_pkgs="" doltlite_pkgs=""
+    # Alpine equivalents, used when KYO_BUILD_IMAGE names a musl image. Alpine spells the OpenSSL and
+    # libuuid development packages differently (openssl-dev, util-linux-dev) and has no separate
+    # ca-certificates-for-curl split, so the lists are mapped rather than shared. build-base is the
+    # musl counterpart of build-essential, for the same cc that ffiCompile runs.
+    local apk_pkgs="bash curl ca-certificates patch build-base liburing-dev openssl-dev tar file binutils"
+    local apk_node_pkgs="" apk_native_pkgs="" apk_bssl_pkgs="" apk_aeron_pkgs="" apk_sqlite_pkgs="" apk_doltlite_pkgs=""
+    # kyo-pod's shell backend execs the podman CLI (the CI setup action installs it on the runner
+    # for exactly these suites); with the socket passthrough active the CLI talks to the same
+    # socket the HTTP backend uses, via the CONTAINER_HOST the passthrough exports. The client
+    # must match the server's major: apt's podman (4.9 on noble) fails unmarshalling a 5.x
+    # server's inspect payloads over the libpod remote API, so the pinned static remote client
+    # is installed instead of the distro package. The docker shell cells stay visible cancels:
+    # CI's docker comes preinstalled on the runner, not from kyo's own setup, and the podman
+    # socket serves both API backends already.
+    local pod_setup=""
+    if [ -n "${KYO_POD_SOCKET:-}" ]; then
+        pod_setup='
+case $(uname -m) in aarch64) podman_arch=linux_arm64 ;; *) podman_arch=linux_amd64 ;; esac
+curl -fsSL "https://github.com/containers/podman/releases/download/v'"${PODMAN_CLIENT_VERSION:-5.0.1}"'/podman-remote-static-${podman_arch}.tar.gz" \
+    | tar xz -C /usr/local/bin --strip-components=1
+mv "/usr/local/bin/podman-remote-static-${podman_arch}" /usr/local/bin/podman
+chmod +x /usr/local/bin/podman'
+    fi
+    # "all" provisions the union (raw sbt mode may run any platform's command in the container).
+    case "$platform" in
+        JS|Wasm|all) node_pkgs="nodejs npm"; apk_node_pkgs="nodejs npm" ;;
+    esac
+    case "$platform" in
+        # clang, cc (build-essential), and libssl-dev are preinstalled on GitHub runners,
+        # so the CI setup action never lists them; a bare container needs them explicitly
+        # (scala-native drives clang, kyo-ffi-it's bundled lib builds with cc, and the
+        # openssl-linked modules need -lssl -lcrypto).
+        Native|all) native_pkgs="clang build-essential libssl-dev libcurl4-openssl-dev libidn2-dev libh2o-evloop-dev=2.2.5+dfsg2-8.1ubuntu3 libgc-dev"
+                    # No libh2o on Alpine; the Native leg is not a musl target, and the musl legs the
+                    # release actually runs are JVM-only native staging.
+                    apk_native_pkgs="clang build-base openssl-dev curl-dev libidn2-dev gc-dev" ;;
+    esac
+    # Node 24, matching the workflow's setup-node pin. noble's apt `nodejs` is 18, and jsdom@30 declares
+    # engines >= 22, so a DOM-backed suite installs and then fails to load it, reporting "jsdom is not
+    # resolvable" no matter what the code under test does. Beyond jsdom, running JS/Wasm on a different V8
+    # major than CI makes any local result unfaithful. The apt packages stay as the source of npm and a
+    # fallback; /usr/local/bin precedes /usr/bin, so the tarball wins when present.
+    local node_setup=""
+    if [ -n "$node_pkgs" ]; then
+        node_setup='
+node_ok=0
+if command -v node >/dev/null 2>&1; then
+    node_major=$(node --version | tr -d "v" | cut -d. -f1)
+    if [ "${node_major:-0}" -ge 24 ] 2>/dev/null; then node_ok=1; fi
+fi
+if [ "$node_ok" != 1 ]; then
+    case $(uname -m) in aarch64) node_arch=linux-arm64 ;; *) node_arch=linux-x64 ;; esac
+    fetch_url "https://nodejs.org/dist/v24.16.0/node-v24.16.0-${node_arch}.tar.gz" "$TMPDIR/node.tar.gz"
+    tar xzf "$TMPDIR/node.tar.gz" -C /usr/local --strip-components=1 && rm -f "$TMPDIR/node.tar.gz"
+fi'
+    fi
+    # BoringSSL build toolchain (cmake + Go + a C toolchain), only when STAGE_BORINGSSL=1 builds the vendored BoringSSL so kyo-net's
+    # TLS tests run against real libssl/libcrypto instead of cancelling. Heavy, so off by default.
+    [ "${STAGE_BORINGSSL:-}" = 1 ] && bssl_pkgs="cmake golang-go build-essential git clang libunwind-dev"
+    [ "${STAGE_BORINGSSL:-}" = 1 ] && apk_bssl_pkgs="cmake go build-base git clang libunwind-dev linux-headers perl"
+    # SQLite staging fetches and unpacks one source zip, so it needs only curl + unzip, neither of which every base
+    # image carries. Far lighter than the two above, but opt-in for the same reason: only a command touching
+    # kyo-sql-sqlite needs it, and that module's ffiLibraries hard-errors without it rather than degrading.
+    [ "${STAGE_SQLITE:-}" = 1 ] && sqlite_pkgs="curl unzip"
+    [ "${STAGE_SQLITE:-}" = 1 ] && apk_sqlite_pkgs="curl unzip"
+    # DoltLite downloads a published library where upstream has one and builds the pinned tag from source
+    # where it does not, which is every musl target, so the Alpine list carries the autoconf toolchain too.
+    [ "${STAGE_DOLTLITE:-}" = 1 ] && doltlite_pkgs="curl unzip git build-essential tcl"
+    [ "${STAGE_DOLTLITE:-}" = 1 ] && apk_doltlite_pkgs="curl unzip git build-base tcl linux-headers"
+    # Aeron build toolchain (a C toolchain + git for the pinned clone), only when STAGE_AERON=1 stages the static Aeron C library so
+    # kyo-aeron's shim has an archive to link. uuid-dev supplies the libuuid.so link target the driver needs and that no base image
+    # preinstalls. The staged tree is gitignored, so any container command touching kyo-aeron needs this. Heavy, so off by default.
+    local aeron_setup=""
+    if [ "${STAGE_AERON:-}" = 1 ]; then
+        aeron_pkgs="build-essential git uuid-dev"
+        # util-linux-dev is Alpine's libuuid: the Aeron driver links -luuid on Linux, musl included.
+        apk_aeron_pkgs="build-base git util-linux-dev linux-headers cmake"
+        # Aeron 1.51.1's CMakeLists sets cmake_minimum_required(3.30) and noble's apt cmake is 3.28, so apt cannot satisfy it. GitHub
+        # runners only avoid this because they preinstall a newer cmake; the setup action's apt fallback would hit the same wall.
+        # Install the upstream binary unless the image already carries >= 3.30.
+        aeron_setup='
+cmake_ok=0
+if command -v cmake >/dev/null 2>&1; then
+    cmake_ver=$(cmake --version | head -1 | tr -cd "0-9.\n" )
+    cmake_major=${cmake_ver%%.*}
+    cmake_rest=${cmake_ver#*.}
+    cmake_minor=${cmake_rest%%.*}
+    if [ "${cmake_major:-0}" -gt 3 ] 2>/dev/null || { [ "${cmake_major:-0}" -eq 3 ] 2>/dev/null && [ "${cmake_minor:-0}" -ge 30 ] 2>/dev/null; }; then
+        cmake_ok=1
+    fi
+fi
+if [ "$cmake_ok" != 1 ]; then
+    if command -v apk >/dev/null 2>&1; then
+        # Kitware ships glibc binaries only, so there is no upstream tarball to fall back to on musl.
+        # Alpine'"'"'s own cmake is the only source; say so rather than installing something unrunnable.
+        echo "cmake >= 3.30 required for Aeron 1.51.1 and this musl image has $(cmake --version 2>/dev/null | head -1)." >&2
+        echo "Use an Alpine release whose apk cmake is >= 3.30." >&2
+        exit 1
+    fi
+    case $(uname -m) in aarch64) cmake_arch=linux-aarch64 ;; *) cmake_arch=linux-x86_64 ;; esac
+    fetch_url "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-${cmake_arch}.tar.gz" "$TMPDIR/cmake.tar.gz"
+    tar xzf "$TMPDIR/cmake.tar.gz" -C /usr/local --strip-components=1 && rm -f "$TMPDIR/cmake.tar.gz"
+fi'
+    fi
+    cat <<PROVISION
+export DEBIAN_FRONTEND=noninteractive
+# GitHub runners export a UTF-8 locale; a bare image has none, which leaves the JVM's
+# sun.jnu.encoding at ASCII and makes unicode file names unmappable (kyo-pod's unicode
+# copy roundtrip fails with InvalidPathException). file.encoding alone does not cover
+# path encoding, so the locale itself is set.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+if command -v apt-get >/dev/null 2>&1; then
+    # Every run provisions from a bare image, so one unreachable Ubuntu mirror stalls the whole loop
+    # (ports.ubuntu.com has timed out for a stretch while the rest of the network was fine). KYO_APT_MIRROR
+    # points apt at a reachable mirror instead; unset, nothing changes. Both source formats are rewritten
+    # because noble ships deb822 while older images still use the one-line list.
+    if [ -n "${apt_mirror}" ]; then
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            [ -f "\$f" ] || continue
+            sed -i -e "s#https\\?://[a-z0-9.-]*/\\(ubuntu-ports\\|ubuntu\\)\\b#${apt_mirror}#g" "\$f"
+        done
+    fi
+    apt-get update -qq >/dev/null
+    apt-get install -y -qq -o Acquire::Retries=3 $apt_pkgs $node_pkgs $native_pkgs $bssl_pkgs $aeron_pkgs $sqlite_pkgs $doltlite_pkgs >/dev/null
+elif command -v apk >/dev/null 2>&1; then
+    # musl path, reached via KYO_BUILD_IMAGE=<a musl jdk image>. Both staging scripts refuse a
+    # cross-OS build, so the release builds its linux-musl-* natives on a genuine musl host; this is
+    # how that leg is reproduced locally.
+    apk add --no-cache $apk_pkgs $apk_node_pkgs $apk_native_pkgs $apk_bssl_pkgs $apk_aeron_pkgs $apk_sqlite_pkgs $apk_doltlite_pkgs >/dev/null
+fi
+$pod_setup
+$node_setup
+export COURSIER_CACHE=/root/.cache/coursier
+if command -v apk >/dev/null 2>&1; then
+    # The coursier launchers below are glibc binaries, so a musl image brings its own JDK and takes
+    # sbt from the release tarball (a JAR the musl JDK runs), exactly as release.yml's Alpine legs do.
+    command -v java >/dev/null 2>&1 || { echo "musl image must carry a JDK (use a *-jdk-alpine image)" >&2; exit 1; }
+    if ! command -v sbt >/dev/null 2>&1; then
+        # The version comes from the host: provisioning runs before the source snapshot is
+        # extracted, so project/build.properties is not readable here yet.
+        fetch_url "https://github.com/sbt/sbt/releases/download/v$sbt_version/sbt-$sbt_version.tgz" "\$TMPDIR/sbt.tgz"
+        tar -xzf "\$TMPDIR/sbt.tgz" -C /opt && rm -f "\$TMPDIR/sbt.tgz"
+    fi
+    export PATH="/opt/sbt/bin:\$PATH"
+elif ! command -v cs >/dev/null 2>&1; then
+    # Linux aarch64 launchers are published by VirtusLab's coursier-m1 releases, not
+    # by coursier/coursier (whose latest release has no aarch64-pc-linux asset).
+    arch=\$(uname -m)
+    if [ "\$arch" = aarch64 ]; then
+        cs_url="https://github.com/VirtusLab/coursier-m1/releases/latest/download/cs-aarch64-pc-linux.gz"
+    else
+        cs_url="https://github.com/coursier/coursier/releases/latest/download/cs-x86_64-pc-linux.gz"
+    fi
+    fetch_url "\$cs_url" "\$TMPDIR/cs.gz"
+    gzip -dc "\$TMPDIR/cs.gz" > /usr/local/bin/cs && chmod +x /usr/local/bin/cs && rm -f "\$TMPDIR/cs.gz"
+fi
+if command -v cs >/dev/null 2>&1; then
+    eval "\$(cs java --jvm corretto:25 --env)"
+    command -v sbt >/dev/null 2>&1 || cs install sbt >/dev/null
+    export PATH="/root/.local/share/coursier/bin:\$PATH"
+fi
+$aeron_setup
+PROVISION
+}
+
+# Container run: a clean git-archived snapshot mounted read-only, the
+# runner executed inside it. podman-ci adds the CI caps + CI env.
+run_in_container() {
+    local platform="$1"
+    local platform_flag; platform_flag=$(podman_platform)
+    local snap; snap=$(mktemp -d)
+    git -C "$PROJECT_DIR" archive HEAD --format=tar > "$snap/src.tar"
+    git -C "$PROJECT_DIR" diff HEAD > "$snap/changes.patch" 2>/dev/null || true
+
+    # --privileged + memlock: podman's default seccomp/limits block the io_uring syscalls and ring buffer locking that kyo-net's io_uring
+    # backend needs; without these the io_uring tests fail to init the ring and cancel. (GitHub runners allow them without privilege; this is a
+    # podman-sandbox concern only, so it does not change observed behavior.)
+    local args=(run --rm --security-opt label=disable --privileged --ulimit memlock=-1:-1 -v "$snap:/build-input:ro")
+    [ -n "$platform_flag" ] && args+=(--platform "$platform_flag")
+    # Artifact extraction. The container is --rm, so its target/ (coverage reports, etc.) is discarded on exit. When KYO_BUILD_OUT names a host
+    # directory, mount it at /output; the inner script below copies the scoverage report/data dirs there after the run, so a coverage run's
+    # report survives the container. Unset by default, so a normal run is unaffected.
+    if [ -n "${KYO_BUILD_OUT:-}" ]; then
+        mkdir -p "$KYO_BUILD_OUT"
+        args+=(-v "$KYO_BUILD_OUT:/output")
+    fi
+    # A container starts with no dependency cache, so every run re-fetches the JDK and the whole dependency set before it can compile
+    # anything. That is slow on every run and fragile on all of them: one refused connection to the JDK host leaves the container with no
+    # `java` at all, and the run dies having produced no test output, which reads as an empty result rather than as a failed download.
+    # Persisting the cache on the host removes both problems, and it is safe to share across runs because coursier's layout is
+    # content-addressed. KYO_BUILD_NO_CACHE forces the cold path for anyone who wants to reproduce a from-scratch fetch.
+    if [ -z "${KYO_BUILD_NO_CACHE:-}" ]; then
+        local cache="${KYO_BUILD_CACHE:-$HOME/.cache/kyo-build-container}"
+        mkdir -p "$cache/coursier" "$cache/sbt" "$cache/ivy"
+        args+=(-v "$cache/coursier:/root/.cache/coursier" -v "$cache/sbt:/root/.sbt" -v "$cache/ivy:/root/.ivy2")
+    fi
+    local envs=()
+    # A UTF-8 locale, because the image defaults to POSIX and the JDK then derives an ASCII
+    # sun.jnu.encoding: a test that names a file with non-ASCII characters fails to encode the path at all
+    # (InvalidPathException: unmappable characters) rather than exercising anything.
+    envs+=(-e LANG=C.UTF-8 -e LC_ALL=C.UTF-8)
+    # Forward the leak-debug flag so the forked test JVM (which inherits the container env) runs leaves serially and attributes each leaked
+    # descriptor to the test that opened it (see kyo.test.runner.internal.LeakDebug). Unset by default, so a normal run is unaffected.
+    [ -n "${KYO_TEST_LEAK_DEBUG:-}" ] && envs+=(-e "KYO_TEST_LEAK_DEBUG=$KYO_TEST_LEAK_DEBUG")
+    # Docker-out-of-docker for the container-backed suites (kyo-sql / kyo-pod): when KYO_POD_SOCKET names the host podman socket, mount it and
+    # share the host network so kyo-pod inside the container can start sibling DB containers and reach their published ports on localhost. Opt-in,
+    # so a normal run is unaffected.
+    if [ -n "${KYO_POD_SOCKET:-}" ]; then
+        # /tmp is shared with the daemon's host alongside the socket: a sibling container's bind
+        # mounts resolve on the daemon host, and the suites mint host paths under /tmp (markers a
+        # container trap writes for the test to read). On CI the test process runs directly on the
+        # daemon host so the trees coincide; sharing /tmp restores that arrangement here.
+        args+=(--network host -v "${KYO_POD_SOCKET}:${KYO_POD_SOCKET}" -v /tmp:/tmp)
+        envs+=(-e "CONTAINER_HOST=unix://${KYO_POD_SOCKET}")
+        # /tmp at the SAME path on both sides, because a sibling container's bind mounts are resolved by the daemon, not by us. A suite that
+        # generates a file and hands its path to a sibling (kyo-sql's TLS suites write server certs to a temp dir and bind it into Postgres at
+        # /etc/ssl-pg) otherwise names a path that exists only inside this container: the sibling mounts an empty directory, Postgres starts
+        # without TLS, and every TLS leaf fails with the server answering 'N' to SSLRequest rather than anything resembling the real defect.
+        # Sharing the daemon's own /tmp makes the two views agree, so the generated path resolves identically on both.
+        args+=(-v /tmp:/tmp)
+    fi
+    # Forward the BoringSSL-staging flag; when set the container builds the vendored BoringSSL before the command so kyo-net's TLS tests run
+    # against real libssl/libcrypto instead of cancelling.
+    [ -n "${STAGE_BORINGSSL:-}" ] && envs+=(-e "STAGE_BORINGSSL=$STAGE_BORINGSSL")
+    # Forward the libaeron-staging flag; when set the container builds the pinned Aeron C library before the command so kyo-aeron's
+    # ffiCompile finds the staged archive instead of failing to link. Both staging scripts derive the os-arch from the container's
+    # own host (musl included), so neither is passed one here: a hand-computed "linux-$(uname -m)" is wrong on an Alpine image.
+    [ -n "${STAGE_AERON:-}" ] && envs+=(-e "STAGE_AERON=$STAGE_AERON")
+    # Forward the SQLite-staging flag; when set the container fetches the pinned SQLite source before the command, so
+    # kyo-sql-sqlite's ffiCompile finds the staged tree instead of failing on the source file it cannot open.
+    [ -n "${STAGE_SQLITE:-}" ] && envs+=(-e "STAGE_SQLITE=$STAGE_SQLITE")
+    # Forward the DoltLite-staging flag, for the same reason as SQLite: without it that module's ffiCompile fails
+    # on the header and archive it cannot find.
+    [ -n "${STAGE_DOLTLITE:-}" ] && envs+=(-e "STAGE_DOLTLITE=$STAGE_DOLTLITE")
+    # Forward the kyo-net per-backend test isolation flag (KYO_NET_ONLY=<backend>), the per-TLS-provider isolation flag
+    # (KYO_NET_TLS_ONLY=<provider>), and the success-leaves-only flag (KYO_NET_SUCCESS_ONLY=1) so a podman run can
+    # validate/sample a single (backend x provider) cell in isolation. Unset by default (all backends/providers), so a normal run is unaffected.
+    [ -n "${KYO_NET_ONLY:-}" ] && envs+=(-e "KYO_NET_ONLY=$KYO_NET_ONLY")
+    [ -n "${KYO_NET_TLS_ONLY:-}" ] && envs+=(-e "KYO_NET_TLS_ONLY=$KYO_NET_TLS_ONLY")
+    [ -n "${KYO_NET_SUCCESS_ONLY:-}" ] && envs+=(-e "KYO_NET_SUCCESS_ONLY=$KYO_NET_SUCCESS_ONLY")
+    if [ "$ENV_KIND" = "podman-ci" ]; then
+        args+=(--memory "$CI_MEMORY" --cpus "$CI_CPUS")
+        envs+=(-e CI=true -e SBT_TASK_LIMIT=1)
+        # Mirror build.yml's Native env so a podman-ci Native run reproduces the row's link staging:
+        # the link CPU cap and the pool batch sizes carry the workflow's values. NATIVE_SKIP (the
+        # app/integration tier dropped from the Native leg) is forwarded so a host value reproduces the
+        # CI cut; it is empty by default here, so a bare `build.sh podman-ci test Native` links the whole
+        # set (set NATIVE_SKIP=<the build.yml list> to match the CI Native row exactly). NATIVE_HEAVY is
+        # the one deliberate difference: the workflow leaves it empty because its NATIVE_SKIP list drops
+        # kyo-schema-tests from the Native leg entirely, while a local run that keeps the whole set still
+        # wants that module pre-linked in a driver of its own. A host value wins for each. Native target
+        # only, matching the workflow's `matrix.target == 'Native'` gate.
+        if [ "$platform" = Native ]; then
+            envs+=(-e "NATIVE_HEAVY=${NATIVE_HEAVY-kyo-schema-tests}"
+                   -e "NATIVE_LINK_CPUS=${NATIVE_LINK_CPUS-3}"
+                   -e "NATIVE_LINK_BATCH=${NATIVE_LINK_BATCH-8}"
+                   -e "NATIVE_TEST_BATCH=${NATIVE_TEST_BATCH-8}"
+                   -e "NATIVE_SKIP=${NATIVE_SKIP-}")
+        fi
+        # The JS and Wasm run-phase batch sizes, as build.yml sets them for those rows.
+        [ "$platform" = JS ] && envs+=(-e "JS_TEST_BATCH=${JS_TEST_BATCH-8}")
+        [ "$platform" = Wasm ] && envs+=(-e "WASM_TEST_BATCH=${WASM_TEST_BATCH-8}")
+    fi
+    # Forward a host override of the native-run stale-output watchdog into any container run.
+    [ -n "${STALE_TIMEOUT:-}" ] && envs+=(-e "STALE_TIMEOUT=$STALE_TIMEOUT")
+    # Raw mode runs the arbitrary sbt command (passed via the environment to avoid host-side quoting);
+    # otherwise the inner command is the standard per-platform ci-test.sh runner.
+    local inner
+    if [ "$RAW_MODE" = yes ]; then
+        envs+=(-e "RAW_SBT=$RAW_SBT" -e "RAW_ROLE=$RAW_ROLE")
+        inner='./scripts/sbt.sh "$RAW_ROLE" "$RAW_SBT"'
+    else
+        inner="./scripts/ci-test.sh '$platform' '$ACTION'"
+    fi
+    # jsdom, on the same JS/Wasm condition the workflow's setup action applies. The DOM-backed kyo-ui suites
+    # resolve it lazily from the repository root and abort in their constructor when it is missing, and the
+    # container starts from a git archive, which never carries node_modules. Without this a DOM suite cannot
+    # run in a container at all: it fails identically whether or not the code under test is broken, which
+    # reads like a real failure. Gated rather than unconditional so a JVM or Native run keeps no dependency
+    # on the npm registry being reachable. Raw mode has no platform, so the sbt command itself is what says
+    # whether a JS or Wasm project is involved.
+    local stage_jsdom=0
+    if [ "$RAW_MODE" = yes ]; then
+        case "$RAW_SBT" in *JS*|*Wasm*) stage_jsdom=1 ;; esac
+    elif [ "$platform" = JS ] || [ "$platform" = Wasm ]; then
+        stage_jsdom=1
+    fi
+    envs+=(-e "STAGE_JSDOM=$stage_jsdom")
+    # The fetch library leads the prelude: provisioning runs before the source snapshot is extracted,
+    # so the container cannot source it from the tree, and every download in the prelude goes
+    # through it. A `curl | tar` pipe cannot be retried: curl restarts its output on a retry and tar
+    # has already consumed the first bytes.
+    local provision; provision=$(cat "$PROJECT_DIR/scripts/fetch-lib.sh" && container_provision "$platform")
+    # Named after the snapshot directory, which mktemp made unique on this host. Concurrent runs share state through two paths that
+    # are the same in every container: /tmp, which the socket passthrough mounts from the podman VM, held the downloads and the
+    # BoringSSL and Aeron staging trees, so two runs truncated each other's files; and the project directory, by which sbt keys its
+    # boot server socket under the shared /root/.sbt, so the second run failed with ServerAlreadyBootingException. Each run gets
+    # its own TMPDIR under /tmp, keeping the same path on both sides of the passthrough, and its own project directory.
+    local run_id; run_id=$(basename "$snap")
+    # `sh`, not `bash`: a musl JDK image ships busybox sh and no bash, and provisioning is what
+    # installs bash there, so a bash entrypoint cannot get far enough to install it. This prelude is
+    # POSIX throughout; the two staging scripts genuinely need bash and are invoked as `bash <script>`
+    # below, by which point the package step has provided it.
+    podman "${args[@]}" "${envs[@]}" "$CONTAINER_IMAGE" \
+        sh -c "set -e
+export TMPDIR=/tmp/kyo-build-$run_id
+mkdir -p \"\$TMPDIR\"
+trap 'rm -rf \"\$TMPDIR\"' EXIT
+$provision
+mkdir -p /work/$run_id && cd /work/$run_id && tar xf /build-input/src.tar \
+    && if [ -s /build-input/changes.patch ]; then patch -p1 < /build-input/changes.patch; fi \
+    && if [ \"\${STAGE_BORINGSSL:-}\" = 1 ]; then bash kyo-net/build/boringssl/build-boringssl.sh; fi \
+    && if [ \"\${STAGE_AERON:-}\" = 1 ]; then bash kyo-aeron/scripts/build-aeron.sh; fi \
+    && if [ \"\${STAGE_SQLITE:-}\" = 1 ]; then bash kyo-sql-sqlite/scripts/build-sqlite.sh; fi \
+    && if [ \"\${STAGE_DOLTLITE:-}\" = 1 ]; then bash kyo-sql-doltlite/scripts/build-doltlite.sh; fi \
+    && if [ \"\${STAGE_JSDOM:-}\" = 1 ]; then npm install --no-save --no-fund --no-audit jsdom@^30; fi
+if $inner; then __rc=0; else __rc=\$?; fi
+if [ -d /output ]; then find . -type d \\( -name scoverage-report -o -name scoverage-data \\) -exec cp -r --parents {} /output/ \\; 2>/dev/null || true; fi
+exit \${__rc:-1}"
+    local rc=$?
+    rm -rf "$snap"
+    return $rc
+}
+
+# -- raw sbt escape hatch (no platform loop), or fail-fast across platforms --
+if [ "$RAW_MODE" = yes ]; then
+    case "$ENV_KIND" in
+        direct)            ( cd "$PROJECT_DIR" && "$SCRIPT_DIR/sbt.sh" "$RAW_ROLE" "$RAW_SBT" ); exit $? ;;
+        podman|podman-ci)  run_in_container all; exit $? ;;
+    esac
+fi
+for platform in $PLAT_LIST; do
+    run_one "$platform" || exit $?
+done

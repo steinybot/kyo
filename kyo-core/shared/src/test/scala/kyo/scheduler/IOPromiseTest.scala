@@ -1,10 +1,9 @@
 package kyo.scheduler
 
 import kyo.*
-import org.scalatest.compatible.Assertion
 import scala.annotation.tailrec
 
-class IOPromiseTest extends Test:
+class IOPromiseTest extends kyo.test.Test[Any]:
 
     def deadline(after: Duration = timeout) =
         import AllowUnsafe.embrace.danger
@@ -170,6 +169,51 @@ class IOPromiseTest extends Test:
             p.interruptDiscard(Result.Panic(new Exception("Interrupted")))
             assert(p.block(deadline()).isPanic)
         }
+
+        "the interrupt hook runs once, on the interrupt path only, and settles through settleInterrupt" in {
+            class HookedPromise extends IOPromise[Nothing, Int]:
+                var fired                                                                                               = 0
+                var doneAtHook                                                                                          = false
+                override protected def interrupt(p: IOPromise.Pending[Nothing, Int], v: Result.Error[Nothing]): Boolean =
+                    fired += 1
+                    val settled = settleInterrupt(p, v)
+                    doneAtHook = done()
+                    settled
+                end interrupt
+            end HookedPromise
+
+            val interrupted = new HookedPromise
+            assert(interrupted.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(interrupted.fired == 1)
+            assert(interrupted.doneAtHook, "the hook settles the promise before it returns")
+            assert(!interrupted.interrupt(Result.Panic(new Exception("again"))))
+            assert(interrupted.fired == 1)
+
+            val completed = new HookedPromise
+            assert(completed.complete(Result.succeed(1)))
+            assert(completed.fired == 0)
+        }
+
+        "a hook that takes the interrupt without completing refuses the next through preInterrupt" in {
+            class TakingPromise extends IOPromise[Nothing, Int]:
+                var taken = Maybe.empty[Result.Error[Nothing]]
+                override protected def interrupt(p: IOPromise.Pending[Nothing, Int], v: Result.Error[Nothing]): Boolean =
+                    taken.isEmpty && {
+                        taken = Maybe(v)
+                        true
+                    }
+                override def preInterrupt(): Boolean = taken.isEmpty
+                def settle(): Boolean                = taken.exists(v => settleInterrupt(v))
+            end TakingPromise
+
+            val p = new TakingPromise
+            assert(p.interrupt(Result.Panic(new Exception("first"))))
+            assert(!p.done())
+            assert(!p.interrupt(Result.Panic(new Exception("second"))))
+            assert(p.settle())
+            assert(p.done())
+            assert(p.block(deadline()).isPanic)
+        }
     }
 
     "onComplete" - {
@@ -220,8 +264,8 @@ class IOPromiseTest extends Test:
         }
 
         "long chain of onComplete callbacks" in {
-            val p     = new IOPromise[Nothing, Int]()
-            var count = 0
+            val p                                 = new IOPromise[Nothing, Int]()
+            var count                             = 0
             def addCallback(remaining: Int): Unit =
                 if remaining > 0 then
                     p.onComplete(_ => count += 1)
@@ -285,173 +329,173 @@ class IOPromiseTest extends Test:
         }
     }
 
-    "mask" - {
+    "uninterruptible" - {
         "doesn't propagate interrupts to parent" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var originalCompleted                         = false
-            var maskedResult: Maybe[Result[Nothing, Int]] = Absent
+            var originalCompleted                                  = false
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
 
             original.onComplete(_ => originalCompleted = true)
-            masked.onComplete(r => maskedResult = Maybe(r))
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
-            assert(!masked.interrupt(Result.Panic(new Exception("Interrupted"))))
-            assert(maskedResult.isEmpty)
+            assert(!uninterruptible.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(uninterruptibleResult.isEmpty)
             assert(!originalCompleted)
         }
 
         "completes when original completes" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var maskedResult: Maybe[Result[Nothing, Int]] = Absent
-            masked.onComplete(r => maskedResult = Maybe(r))
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
             original.complete(Result.succeed(42))
-            assert(maskedResult.contains(Result.succeed(42)))
+            assert(uninterruptibleResult.contains(Result.succeed(42)))
         }
 
         "propagates failure" in {
-            val original = new IOPromise[Exception, Int]()
-            val masked   = original.mask()
+            val original        = new IOPromise[Exception, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var maskedResult: Maybe[Result[Exception, Int]] = Absent
-            masked.onComplete(r => maskedResult = Maybe(r))
+            var uninterruptibleResult: Maybe[Result[Exception, Int]] = Absent
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
             val ex = new Exception("Test exception")
             original.complete(Result.fail(ex))
-            assert(maskedResult.contains(Result.fail(ex)))
+            assert(uninterruptibleResult.contains(Result.fail(ex)))
         }
 
-        "allows completion of masked promise" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
+        "allows completion of uninterruptible promise" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var originalResult: Maybe[Result[Nothing, Int]] = Absent
-            var maskedResult: Maybe[Result[Nothing, Int]]   = Absent
+            var originalResult: Maybe[Result[Nothing, Int]]        = Absent
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
 
             original.onComplete(r => originalResult = Maybe(r))
-            masked.onComplete(r => maskedResult = Maybe(r))
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
-            masked.complete(Result.succeed(99))
-            assert(maskedResult.contains(Result.succeed(99)))
+            uninterruptible.complete(Result.succeed(99))
+            assert(uninterruptibleResult.contains(Result.succeed(99)))
             assert(originalResult.isEmpty)
         }
 
-        "chained masks" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked1  = original.mask()
-            val masked2  = masked1.mask()
+        "chained uninterruptibles" in {
+            val original         = new IOPromise[Nothing, Int]()
+            val uninterruptible1 = original.uninterruptible()
+            val uninterruptible2 = uninterruptible1.uninterruptible()
 
-            var originalCompleted                          = false
-            var masked1Completed                           = false
-            var masked2Result: Maybe[Result[Nothing, Int]] = Absent
+            var originalCompleted                                   = false
+            var uninterruptible1Completed                           = false
+            var uninterruptible2Result: Maybe[Result[Nothing, Int]] = Absent
 
             original.onComplete(_ => originalCompleted = true)
-            masked1.onComplete(_ => masked1Completed = true)
-            masked2.onComplete(r => masked2Result = Maybe(r))
+            uninterruptible1.onComplete(_ => uninterruptible1Completed = true)
+            uninterruptible2.onComplete(r => uninterruptible2Result = Maybe(r))
 
-            assert(!masked2.interrupt(Result.Panic(new Exception("Interrupted"))))
-            assert(masked2Result.isEmpty)
-            assert(!masked1Completed)
+            assert(!uninterruptible2.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(uninterruptible2Result.isEmpty)
+            assert(!uninterruptible1Completed)
             assert(!originalCompleted)
 
             original.complete(Result.succeed(42))
-            assert(masked1Completed)
+            assert(uninterruptible1Completed)
         }
 
-        "mask after completion" in {
+        "uninterruptible after completion" in {
             val original = new IOPromise[Nothing, Int]()
             original.complete(Result.succeed(42))
 
-            val masked                                    = original.mask()
-            var maskedResult: Maybe[Result[Nothing, Int]] = Absent
-            masked.onComplete(r => maskedResult = Maybe(r))
+            val uninterruptible                                    = original.uninterruptible()
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
-            assert(maskedResult.contains(Result.succeed(42)))
+            assert(uninterruptibleResult.contains(Result.succeed(42)))
         }
 
-        "interrupt original completes masked" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
+        "interrupt original completes uninterruptible" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var originalResult: Maybe[Result[Nothing, Int]] = Absent
-            var maskedResult: Maybe[Result[Nothing, Int]]   = Absent
+            var originalResult: Maybe[Result[Nothing, Int]]        = Absent
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
 
             original.onComplete(r => originalResult = Maybe(r))
-            masked.onComplete(r => maskedResult = Maybe(r))
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
 
             val panic = Result.Panic(new Exception("Interrupted"))
             assert(original.interrupt(panic))
             assert(originalResult == Maybe(panic))
-            assert(maskedResult == Maybe(panic))
+            assert(uninterruptibleResult == Maybe(panic))
         }
 
-        "chained masks with interrupt" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked1  = original.mask()
-            val masked2  = masked1.mask()
+        "chained uninterruptibles with interrupt" in {
+            val original         = new IOPromise[Nothing, Int]()
+            val uninterruptible1 = original.uninterruptible()
+            val uninterruptible2 = uninterruptible1.uninterruptible()
 
-            var originalResult: Maybe[Result[Nothing, Int]] = Absent
-            var masked1Result: Maybe[Result[Nothing, Int]]  = Absent
-            var masked2Result: Maybe[Result[Nothing, Int]]  = Absent
+            var originalResult: Maybe[Result[Nothing, Int]]         = Absent
+            var uninterruptible1Result: Maybe[Result[Nothing, Int]] = Absent
+            var uninterruptible2Result: Maybe[Result[Nothing, Int]] = Absent
 
             original.onComplete(r => originalResult = Maybe(r))
-            masked1.onComplete(r => masked1Result = Maybe(r))
-            masked2.onComplete(r => masked2Result = Maybe(r))
+            uninterruptible1.onComplete(r => uninterruptible1Result = Maybe(r))
+            uninterruptible2.onComplete(r => uninterruptible2Result = Maybe(r))
 
-            assert(!masked2.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!uninterruptible2.interrupt(Result.Panic(new Exception("Interrupted"))))
 
-            assert(masked2Result.isEmpty)
-            assert(masked1Result.isEmpty)
+            assert(uninterruptible2Result.isEmpty)
+            assert(uninterruptible1Result.isEmpty)
             assert(originalResult.isEmpty)
 
             original.complete(Result.succeed(42))
 
             assert(originalResult.contains(Result.succeed(42)))
-            assert(masked1Result.contains(Result.succeed(42)))
-            assert(masked2Result.contains(Result.succeed(42)))
+            assert(uninterruptible1Result.contains(Result.succeed(42)))
+            assert(uninterruptible2Result.contains(Result.succeed(42)))
         }
 
-        "mask interaction with become" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
-            val other    = new IOPromise[Nothing, Int]()
+        "uninterruptible interaction with become" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
+            val other           = new IOPromise[Nothing, Int]()
 
-            var originalResult: Maybe[Result[Nothing, Int]] = Absent
-            var maskedResult: Maybe[Result[Nothing, Int]]   = Absent
-            var otherResult: Maybe[Result[Nothing, Int]]    = Absent
+            var originalResult: Maybe[Result[Nothing, Int]]        = Absent
+            var uninterruptibleResult: Maybe[Result[Nothing, Int]] = Absent
+            var otherResult: Maybe[Result[Nothing, Int]]           = Absent
 
             original.onComplete(r => originalResult = Maybe(r))
-            masked.onComplete(r => maskedResult = Maybe(r))
+            uninterruptible.onComplete(r => uninterruptibleResult = Maybe(r))
             other.onComplete(r => otherResult = Maybe(r))
 
-            assert(masked.become(other))
+            assert(uninterruptible.become(other))
 
             other.complete(Result.succeed(99))
 
             assert(originalResult.isEmpty)
-            assert(maskedResult.contains(Result.succeed(99)))
+            assert(uninterruptibleResult.contains(Result.succeed(99)))
             assert(otherResult.contains(Result.succeed(99)))
 
             original.complete(Result.succeed(42))
 
             assert(originalResult.contains(Result.succeed(42)))
-            assert(maskedResult.contains(Result.succeed(99)))
+            assert(uninterruptibleResult.contains(Result.succeed(99)))
             assert(otherResult.contains(Result.succeed(99)))
         }
 
-        "mask with interrupts" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
-            val other    = new IOPromise[Nothing, Int]()
+        "uninterruptible with interrupts" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
+            val other           = new IOPromise[Nothing, Int]()
 
-            masked.interrupts(other)
+            uninterruptible.interrupts(other)
 
-            assert(!masked.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!uninterruptible.interrupt(Result.Panic(new Exception("Interrupted"))))
 
-            assert(!masked.done())
+            assert(!uninterruptible.done())
             assert(!other.done())
             assert(!original.done())
         }
@@ -484,37 +528,37 @@ class IOPromiseTest extends Test:
             assert(!interrupted)
         }
 
-        "onInterrupt with mask" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
+        "onInterrupt with uninterruptible" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
 
-            var originalInterrupted = false
-            var maskedInterrupted   = false
+            var originalInterrupted        = false
+            var uninterruptibleInterrupted = false
 
             original.onInterrupt(_ => originalInterrupted = true)
-            masked.onInterrupt(_ => maskedInterrupted = true)
+            uninterruptible.onInterrupt(_ => uninterruptibleInterrupted = true)
 
-            assert(!masked.interrupt(Result.Panic(new Exception("Interrupted"))))
-            assert(!maskedInterrupted)
+            assert(!uninterruptible.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!uninterruptibleInterrupted)
             assert(!originalInterrupted)
         }
 
         "onInterrupt with chained masks" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked1  = original.mask()
-            val masked2  = masked1.mask()
+            val original         = new IOPromise[Nothing, Int]()
+            val uninterruptible1 = original.uninterruptible()
+            val uninterruptible2 = uninterruptible1.uninterruptible()
 
-            var originalInterrupted = false
-            var masked1Interrupted  = false
-            var masked2Interrupted  = false
+            var originalInterrupted         = false
+            var uninterruptible1Interrupted = false
+            var uninterruptible2Interrupted = false
 
             original.onInterrupt(_ => originalInterrupted = true)
-            masked1.onInterrupt(_ => masked1Interrupted = true)
-            masked2.onInterrupt(_ => masked2Interrupted = true)
+            uninterruptible1.onInterrupt(_ => uninterruptible1Interrupted = true)
+            uninterruptible2.onInterrupt(_ => uninterruptible2Interrupted = true)
 
-            assert(!masked2.interrupt(Result.Panic(new Exception("Interrupted"))))
-            assert(!masked2Interrupted)
-            assert(!masked1Interrupted)
+            assert(!uninterruptible2.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!uninterruptible2Interrupted)
+            assert(!uninterruptible1Interrupted)
             assert(!originalInterrupted)
         }
 
@@ -535,24 +579,24 @@ class IOPromiseTest extends Test:
             assert(p2Interrupted)
         }
 
-        "onInterrupt with mask and become" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
-            val other    = new IOPromise[Nothing, Int]()
+        "onInterrupt with uninterruptible and become" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
+            val other           = new IOPromise[Nothing, Int]()
 
-            var originalInterrupted = false
-            var maskedInterrupted   = false
-            var otherInterrupted    = false
+            var originalInterrupted        = false
+            var uninterruptibleInterrupted = false
+            var otherInterrupted           = false
 
             original.onInterrupt(_ => originalInterrupted = true)
-            masked.onInterrupt(_ => maskedInterrupted = true)
+            uninterruptible.onInterrupt(_ => uninterruptibleInterrupted = true)
             other.onInterrupt(_ => otherInterrupted = true)
 
-            assert(masked.become(other))
+            assert(uninterruptible.become(other))
             assert(other.interrupt(Result.Panic(new Exception("Interrupted"))))
 
             assert(!originalInterrupted)
-            assert(maskedInterrupted)
+            assert(uninterruptibleInterrupted)
             assert(otherInterrupted)
         }
 
@@ -574,25 +618,25 @@ class IOPromiseTest extends Test:
             assert(p2Interrupted)
         }
 
-        "onInterrupt with mask and interrupts" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
-            val other    = new IOPromise[Nothing, Int]()
+        "onInterrupt with uninterruptible and interrupts" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
+            val other           = new IOPromise[Nothing, Int]()
 
-            var originalInterrupted = false
-            var maskedInterrupted   = false
-            var otherInterrupted    = false
+            var originalInterrupted        = false
+            var uninterruptibleInterrupted = false
+            var otherInterrupted           = false
 
             original.onInterrupt(_ => originalInterrupted = true)
-            masked.onInterrupt(_ => maskedInterrupted = true)
+            uninterruptible.onInterrupt(_ => uninterruptibleInterrupted = true)
             other.onInterrupt(_ => otherInterrupted = true)
 
-            masked.interrupts(other)
+            uninterruptible.interrupts(other)
 
-            assert(!masked.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!uninterruptible.interrupt(Result.Panic(new Exception("Interrupted"))))
 
             assert(!originalInterrupted)
-            assert(!maskedInterrupted)
+            assert(!uninterruptibleInterrupted)
             assert(!otherInterrupted)
         }
     }
@@ -636,11 +680,11 @@ class IOPromiseTest extends Test:
             assert(p2.block(deadline()) == Result.succeed(42))
         }
 
-        "complex chaining with interrupts and masks" in {
+        "complex chaining with interrupts and uninterruptibles" in {
             val p1 = new IOPromise[Nothing, Int]()
-            val p2 = p1.mask()
+            val p2 = p1.uninterruptible()
             val p3 = new IOPromise[Nothing, Int]()
-            val p4 = p3.mask()
+            val p4 = p3.uninterruptible()
 
             p2.become(p4)
             p1.interrupts(p3)
@@ -748,40 +792,40 @@ class IOPromiseTest extends Test:
             assert(chainCompleted)
         }
 
-        "exceptions with masked promises" in {
-            val original               = new IOPromise[Nothing, Int]()
-            val masked                 = original.mask()
-            var maskedCallbackExecuted = false
+        "exceptions with uninterruptible promises" in {
+            val original                        = new IOPromise[Nothing, Int]()
+            val uninterruptible                 = original.uninterruptible()
+            var uninterruptibleCallbackExecuted = false
 
-            masked.onComplete(_ => throw ex)
-            masked.onComplete(_ => maskedCallbackExecuted = true)
+            uninterruptible.onComplete(_ => throw ex)
+            uninterruptible.onComplete(_ => uninterruptibleCallbackExecuted = true)
 
             original.complete(Result.succeed(42))
-            assert(maskedCallbackExecuted)
+            assert(uninterruptibleCallbackExecuted)
         }
     }
 
-    "removeInterrupt" - {
-        "basic removeInterrupt" in {
+    "remove" - {
+        "basic remove" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p2)
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             assert(p1.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(p1.block(deadline()).isPanic)
             assert(!p2.done())
         }
 
-        "removeInterrupt with multiple linked promises" in {
+        "remove with multiple linked promises" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
             val p3 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p2)
             p1.interrupts(p3)
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             assert(p1.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(p1.block(deadline()).isPanic)
@@ -789,14 +833,14 @@ class IOPromiseTest extends Test:
             assert(p3.block(deadline()).isPanic)
         }
 
-        "removeInterrupt with chain of promises" in {
+        "remove with chain of promises" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
             val p3 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p2)
             p2.interrupts(p3)
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             assert(p1.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(p1.block(deadline()).isPanic)
@@ -804,79 +848,282 @@ class IOPromiseTest extends Test:
             assert(!p3.done())
         }
 
-        "removeInterrupt with non-linked promise" in {
+        "remove with non-linked promise" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
             val p3 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p2)
-            p1.removeInterrupt(p3)
+            p1.remove(p3)
 
             assert(p1.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(p1.block(deadline()).isPanic)
             assert(p2.block(deadline()).isPanic)
         }
 
-        "removeInterrupt after completion" in {
+        "remove after completion" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p2)
             p1.complete(Result.succeed(42))
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             assert(p1.block(deadline()) == Result.succeed(42))
             assert(!p2.done())
         }
 
-        "removeInterrupt with become" in {
+        "a wide fan-out costs no stack to unlink from" in {
+            // The deepest link removed from under every other one. Sized past any platform's thread stack.
+            val width    = 100000
+            val p        = new IOPromise[Nothing, Int]()
+            val deepest  = new IOPromise[Nothing, Int]()
+            val children = Array.fill(width)(new IOPromise[Nothing, Int]())
+            p.interrupts(deepest)
+            children.foreach(p.interrupts(_))
+
+            assert(!p.remove(new IOPromise[Nothing, Int]()), "a promise never linked was reported removed")
+            assert(p.remove(deepest), "the deepest link was not found")
+            assert(p.waiters() == width, s"expected $width links after the removal, found ${p.waiters()}")
+
+            assert(p.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(!deepest.done(), "the removed link still interrupted its target")
+            assert(children.forall(_.done()), "a link above the removed one was lost")
+        }
+
+        "remove with become" in {
             val p1 = new IOPromise[Nothing, Int]()
             val p2 = new IOPromise[Nothing, Int]()
             val p3 = new IOPromise[Nothing, Int]()
 
             p1.interrupts(p3)
             p1.become(p2)
-            p1.removeInterrupt(p3)
+            assert(p1.remove(p3))
 
             assert(p2.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(p2.block(deadline()).isPanic)
-            assert(p3.done())
+            assert(!p3.done())
         }
 
-        "removeInterrupt with mask" in {
-            val original = new IOPromise[Nothing, Int]()
-            val masked   = original.mask()
-            val other    = new IOPromise[Nothing, Int]()
+        "remove keeps the other links" in {
+            val p1     = new IOPromise[Nothing, Int]()
+            val linked = new IOPromise[Nothing, Int]()
+            val kept   = new IOPromise[Nothing, Int]()
+            p1.interrupts(kept)
+            p1.interrupts(linked)
+            assert(p1.remove(linked))
+            assert(p1.interrupt(Result.Panic(new Exception("Interrupted p1"))))
+            assert(!linked.done())
+            assert(kept.block(deadline()).isPanic)
+        }
 
-            masked.interrupts(other)
-            masked.removeInterrupt(other)
+        "remove of a link on the chain merged by become" in {
+            val target = new IOPromise[Nothing, Int]()
+            val source = new IOPromise[Nothing, Int]()
+            val linked = new IOPromise[Nothing, Int]()
+            val kept   = new IOPromise[Nothing, Int]()
+            source.interrupts(kept)
+            source.interrupts(linked)
+            assert(source.become(target))
+            assert(target.remove(linked))
+            assert(target.interrupt(Result.Panic(new Exception("Interrupted target"))))
+            assert(!linked.done())
+            assert(kept.block(deadline()).isPanic)
+        }
 
-            assert(!masked.interrupt(Result.Panic(new Exception("Interrupted"))))
+        "remove of a link on the target's own chain after become" in {
+            val target = new IOPromise[Nothing, Int]()
+            val source = new IOPromise[Nothing, Int]()
+            val linked = new IOPromise[Nothing, Int]()
+            val kept   = new IOPromise[Nothing, Int]()
+            target.interrupts(linked)
+            source.interrupts(kept)
+            assert(source.become(target))
+            assert(target.remove(linked))
+            assert(target.interrupt(Result.Panic(new Exception("Interrupted target"))))
+            assert(!linked.done())
+            assert(kept.block(deadline()).isPanic)
+        }
+
+        "remove keeps the completion callbacks on both merged chains" in {
+            val target = new IOPromise[Nothing, Int]()
+            val source = new IOPromise[Nothing, Int]()
+            val linked = new IOPromise[Nothing, Int]()
+            var seen   = List.empty[Result[Nothing, Int]]
+            target.onComplete(r => seen = r :: seen)
+            source.onComplete(r => seen = r :: seen)
+            source.interrupts(linked)
+            assert(source.become(target))
+            assert(target.remove(linked))
+            assert(target.complete(Result.succeed(42)))
+            assert(seen == List(Result.succeed(42), Result.succeed(42)))
+            assert(!linked.done())
+        }
+
+        "remove with uninterruptible" in {
+            val original        = new IOPromise[Nothing, Int]()
+            val uninterruptible = original.uninterruptible()
+            val other           = new IOPromise[Nothing, Int]()
+
+            uninterruptible.interrupts(other)
+            uninterruptible.remove(other)
+
+            assert(!uninterruptible.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(!other.done())
         }
 
-        "removeInterrupt preserves other callbacks" in {
+        "an interrupt on an unmasked await fires the callback once, through completion" in {
+            val awaited = new IOPromise[Nothing, Int]()
+            val awaiter = new IOPromise[Nothing, Int]()
+
+            var fired                                = 0
+            val resume: Result[Nothing, Int] => Unit = _ => fired += 1
+            awaited.onComplete(resume)
+            awaiter.interrupts(awaited)
+
+            assert(awaiter.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(awaited.done(), "the link did not interrupt the awaited promise")
+            assert(fired == 1, s"the callback fired $fired times")
+        }
+
+        "remove reports whether the registration was there" in {
+            val p                               = new IOPromise[Nothing, Int]()
+            val f: Result[Nothing, Int] => Unit = _ => ()
+            val g: Result[Nothing, Int] => Unit = _ => ()
+            p.onComplete(f)
+            assert(p.remove(f))
+            assert(!p.remove(f), "already removed")
+            assert(!p.remove(g), "never registered")
+            p.complete(Result.succeed(1))
+            assert(!p.remove(f), "a completed promise holds nothing")
+        }
+
+        "remove reaches a registration merged in by become" in {
+            val p1                              = new IOPromise[Nothing, Int]()
+            val p2                              = new IOPromise[Nothing, Int]()
+            val f: Result[Nothing, Int] => Unit = _ => ()
+            p1.onComplete(f)
+            assert(p1.become(p2))
+            assert(p2.waiters() == 1)
+            assert(p1.remove(f))
+            assert(p2.waiters() == 0)
+        }
+
+        "remove by function identity drops only that onComplete callback" in {
+            val p                               = new IOPromise[Nothing, Int]()
+            var seen                            = List.empty[String]
+            val f: Result[Nothing, Int] => Unit = _ => seen = "f" :: seen
+            val g: Result[Nothing, Int] => Unit = _ => seen = "g" :: seen
+            p.onComplete(f)
+            p.onComplete(g)
+            assert(p.remove(f), "the onComplete callback was not found")
+            assert(p.waiters() == 1, s"expected 1 waiter after the removal, found ${p.waiters()}")
+            assert(p.complete(Result.succeed(1)))
+            assert(seen == List("g"), s"completion fired $seen")
+        }
+
+        "remove by function identity drops an onInterrupt callback" in {
+            val p                                = new IOPromise[Nothing, Int]()
+            var seen                             = List.empty[String]
+            val f: Result.Error[Nothing] => Unit = _ => seen = "f" :: seen
+            val g: Result.Error[Nothing] => Unit = _ => seen = "g" :: seen
+            p.onInterrupt(f)
+            p.onInterrupt(g)
+            assert(p.remove(f), "the onInterrupt callback was not found")
+            assert(p.waiters() == 1, s"expected 1 waiter after the removal, found ${p.waiters()}")
+            assert(p.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(seen == List("g"), s"the interrupt fired $seen")
+        }
+
+        "remove by function identity through a Linked promise" in {
+            val p1                              = new IOPromise[Nothing, Int]()
+            val p2                              = new IOPromise[Nothing, Int]()
+            var fired                           = 0
+            val f: Result[Nothing, Int] => Unit = _ => fired += 1
+            assert(p1.become(p2))
+            p1.onComplete(f)
+            assert(p2.waiters() == 1, s"the callback did not reach the target: ${p2.waiters()} waiters")
+            assert(p1.remove(f), "the callback was not found through the link")
+            assert(p2.waiters() == 0, s"expected no waiters on the target, found ${p2.waiters()}")
+            assert(p2.complete(Result.succeed(1)))
+            assert(fired == 0, s"the removed callback fired $fired times")
+        }
+
+        "remove by function identity on either side of a merged chain" in {
+            val target                                               = new IOPromise[Nothing, Int]()
+            val source                                               = new IOPromise[Nothing, Int]()
+            var seen                                                 = List.empty[String]
+            def callback(name: String): Result[Nothing, Int] => Unit = _ => seen = name :: seen
+            val ownRemoved                                           = callback("ownRemoved")
+            val ownKept                                              = callback("ownKept")
+            val mergedRemoved                                        = callback("mergedRemoved")
+            val mergedKept                                           = callback("mergedKept")
+            target.onComplete(ownKept)
+            target.onComplete(ownRemoved)
+            source.onComplete(mergedKept)
+            source.onComplete(mergedRemoved)
+            assert(source.become(target))
+            assert(target.waiters() == 4, s"expected 4 waiters on the merged chain, found ${target.waiters()}")
+            assert(target.remove(mergedRemoved), "the callback merged in by become was not found")
+            assert(target.remove(ownRemoved), "the target's own callback was not found")
+            assert(target.waiters() == 2, s"expected 2 waiters after both removals, found ${target.waiters()}")
+            assert(target.complete(Result.succeed(1)))
+            assert(seen.sorted == List("mergedKept", "ownKept"), s"completion fired $seen")
+        }
+
+        "a remove that matches nothing leaves the chain as it was" in {
+            val p                                    = new IOPromise[Nothing, Int]()
+            val linked                               = new IOPromise[Nothing, Int]()
+            var seen                                 = List.empty[String]
+            val f: Result[Nothing, Int] => Unit      = _ => seen = "f" :: seen
+            val i: Result.Error[Nothing] => Unit     = _ => seen = "i" :: seen
+            val absent: Result[Nothing, Int] => Unit = _ => seen = "absent" :: seen
+            p.onComplete(f)
+            p.interrupts(linked)
+            p.onInterrupt(i)
+            assert(p.waiters() == 3, s"expected 3 waiters, found ${p.waiters()}")
+            assert(!p.remove(absent), "a callback never registered was reported removed")
+            assert(!p.remove(new IOPromise[Nothing, Int]()), "a promise never linked was reported removed")
+            assert(p.waiters() == 3, s"a miss changed the chain: ${p.waiters()} waiters")
+            assert(p.interrupt(Result.Panic(new Exception("Interrupted"))))
+            assert(linked.done(), "the link did not survive the miss")
+            assert(seen.sorted == List("f", "i"), s"the interrupt fired $seen")
+        }
+
+        "a remove that matches nothing on a merged chain leaves it as it was" in {
+            val target                          = new IOPromise[Nothing, Int]()
+            val source                          = new IOPromise[Nothing, Int]()
+            val f: Result[Nothing, Int] => Unit = _ => ()
+            val g: Result[Nothing, Int] => Unit = _ => ()
+            target.onComplete(f)
+            source.onComplete(f)
+            assert(source.become(target))
+            assert(!target.remove(g), "a callback never registered was reported removed")
+            assert(target.waiters() == 2, s"a miss changed the merged chain: ${target.waiters()} waiters")
+        }
+
+        "remove preserves other callbacks" in {
             val p1               = new IOPromise[Nothing, Int]()
             val p2               = new IOPromise[Nothing, Int]()
             var callbackExecuted = false
 
             p1.interrupts(p2)
             p1.onComplete(_ => callbackExecuted = true)
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             p1.complete(Result.succeed(42))
             assert(callbackExecuted)
             assert(!p2.done())
         }
 
-        "removeInterrupt with onInterrupt callbacks" in {
+        "remove with onInterrupt callbacks" in {
             val p1                        = new IOPromise[Nothing, Int]()
             val p2                        = new IOPromise[Nothing, Int]()
             var interruptCallbackExecuted = false
 
             p1.interrupts(p2)
             p1.onInterrupt(_ => interruptCallbackExecuted = true)
-            p1.removeInterrupt(p2)
+            p1.remove(p2)
 
             assert(p1.interrupt(Result.Panic(new Exception("Interrupted"))))
             assert(interruptCallbackExecuted)
@@ -991,6 +1238,260 @@ class IOPromiseTest extends Test:
             p2.complete(Result.succeed(42))
 
             assert(p1.waiters() == 0)
+        }
+    }
+
+    // --- becomeAvailable / reuseTake tests ---
+
+    /** A testable subclass that exposes protected methods. */
+    class TestablePromise[E, A] extends IOPromise[E, A]:
+        def testBecomeAvailable(): Boolean     = becomeAvailable()
+        var onCompleteCount: Int               = 0
+        var lastOnCompleteResult: Result[E, A] = null.asInstanceOf[Result[E, A]]
+
+        override protected def onComplete(): Unit =
+            onCompleteCount += 1
+            poll() match
+                case Present(r) => lastOnCompleteResult = r
+                case Absent     => ()
+        end onComplete
+    end TestablePromise
+
+    /** A reusable promise that can be used as a Channel taker and reset between cycles. */
+    class ReusableChannelPromise[A] extends IOPromise[Any, A < Abort[Closed]]:
+        def reset(): Boolean                                 = becomeAvailable()
+        def toUnsafe: Fiber.Promise.Unsafe[A, Abort[Closed]] =
+            Fiber.Promise.Unsafe.fromIOPromise(this)
+    end ReusableChannelPromise
+
+    /** Helper to extract value from a channel block result. */
+    private def blockValue[A](fiber: Fiber.Unsafe[A, Abort[Closed]]): A =
+        import AllowUnsafe.embrace.danger
+        val result = fiber.block(deadline())
+        result.getOrThrow.eval
+    end blockValue
+
+    "becomeAvailable" - {
+        "reset completed success promise" in {
+            val p = new TestablePromise[Nothing, Int]
+            assert(p.complete(Result.succeed(1)))
+            assert(p.done())
+            assert(p.testBecomeAvailable())
+            assert(!p.done())
+        }
+
+        "reset completed failure promise" in {
+            val p  = new TestablePromise[Exception, Int]
+            val ex = new Exception("fail")
+            assert(p.complete(Result.fail(ex)))
+            assert(p.done())
+            assert(p.testBecomeAvailable())
+            assert(!p.done())
+        }
+
+        "reset pending promise returns false" in {
+            val p = new TestablePromise[Nothing, Int]
+            assert(!p.testBecomeAvailable())
+        }
+
+        "reset linked promise returns false" in {
+            val p     = new TestablePromise[Nothing, Int]
+            val other = new IOPromise[Nothing, Int]
+            assert(p.become(other))
+            assert(!p.testBecomeAvailable())
+        }
+
+        "reuse cycle: complete → reset → complete again" in {
+            val p = new TestablePromise[Nothing, Int]
+            assert(p.complete(Result.succeed(1)))
+            assert(p.block(deadline()) == Result.succeed(1))
+            assert(p.testBecomeAvailable())
+            assert(p.complete(Result.succeed(2)))
+            assert(p.block(deadline()) == Result.succeed(2))
+        }
+
+        "multiple reuse cycles" in {
+            val p = new TestablePromise[Nothing, Int]
+            for i <- 1 to 10 do
+                assert(p.complete(Result.succeed(i)))
+                assert(p.block(deadline()) == Result.succeed(i))
+                assert(p.testBecomeAvailable())
+            end for
+            assert(p.complete(Result.succeed(11)))
+            assert(p.block(deadline()) == Result.succeed(11))
+        }
+
+        "onComplete fires after reuse" in {
+            val p = new TestablePromise[Nothing, Int]
+            assert(p.complete(Result.succeed(1)))
+            assert(p.testBecomeAvailable())
+            var received: Result[Nothing, Int] = null.asInstanceOf[Result[Nothing, Int]]
+            p.onComplete(r => received = r)
+            assert(p.complete(Result.succeed(2)))
+            assert(received == Result.succeed(2))
+        }
+
+        "repeated becomeAvailable and complete cycles" in {
+            val p = new TestablePromise[Nothing, Int]
+            for i <- 1 to 100 do
+                assert(p.complete(Result.succeed(i)))
+                assert(p.testBecomeAvailable())
+            end for
+            assert(p.complete(Result.succeed(999)))
+            var received: Result[Nothing, Int] = null.asInstanceOf[Result[Nothing, Int]]
+            p.onComplete(r => received = r)
+            assert(received == Result.succeed(999))
+        }
+    }
+
+    "onComplete poll" - {
+        "reads success result" in {
+            val p = new TestablePromise[Nothing, Int]
+            assert(p.complete(Result.succeed(42)))
+            assert(p.onCompleteCount == 1)
+            assert(p.lastOnCompleteResult == Result.succeed(42))
+        }
+
+        "reads failure result" in {
+            val p  = new TestablePromise[Exception, Int]
+            val ex = new Exception("fail")
+            assert(p.complete(Result.fail(ex)))
+            assert(p.onCompleteCount == 1)
+            assert(p.lastOnCompleteResult == Result.fail(ex))
+        }
+
+        "reads panic result" in {
+            val p     = new TestablePromise[Nothing, Int]
+            val panic = Result.Panic(new RuntimeException("boom"))
+            assert(p.interrupt(panic))
+            assert(p.onCompleteCount == 1)
+            val result = p.lastOnCompleteResult
+            assert(result.isPanic)
+        }
+    }
+
+    "reuseTake" - {
+        "reuseTake receives next put" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](4)
+                val promise = Promise.Unsafe.init[Int, Abort[Closed]]()
+                ch.reuseTake(promise)
+                discard(ch.offer(1))
+                val value = blockValue(promise)
+                assert(value == 1)
+            }
+        }
+
+        "reuseTake multiple cycles" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](4)
+                val promise = new ReusableChannelPromise[Int]
+                val unsafe  = promise.toUnsafe
+                for i <- 1 to 5 do
+                    ch.reuseTake(unsafe)
+                    discard(ch.offer(i))
+                    val value = blockValue(unsafe)
+                    assert(value == i)
+                    assert(promise.reset())
+                end for
+                succeed
+            }
+        }
+
+        "reuseTake with offer" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](4)
+                val promise = Promise.Unsafe.init[Int, Abort[Closed]]()
+                discard(ch.offer(10))
+                ch.reuseTake(promise)
+                val value = blockValue(promise)
+                assert(value == 10)
+            }
+        }
+
+        "reuseTake on closed channel" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](4)
+                val promise = Promise.Unsafe.init[Int, Abort[Closed]]()
+                discard(ch.close())
+                ch.reuseTake(promise)
+                val result = promise.block(deadline())
+                assert(result.isFailure)
+            }
+        }
+
+        "reuseTake interleaved with regular takeFiber" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](4)
+                val promise = Promise.Unsafe.init[Int, Abort[Closed]]()
+
+                ch.reuseTake(promise)
+                discard(ch.offer(1))
+                val r1 = blockValue(promise)
+                assert(r1 == 1)
+
+                val fiber = ch.takeFiber()
+                discard(ch.offer(2))
+                val r2 = blockValue(fiber)
+                assert(r2 == 2)
+
+                val promise2 = Promise.Unsafe.init[Int, Abort[Closed]]()
+                ch.reuseTake(promise2)
+                discard(ch.offer(3))
+                val r3 = blockValue(promise2)
+                assert(r3 == 3)
+
+                succeed
+            }
+        }
+
+        "reuseTake concurrent puts" in {
+            import AllowUnsafe.embrace.danger
+            Sync.defer {
+                val ch      = Channel.Unsafe.init[Int](16)
+                val results = new java.util.concurrent.ConcurrentLinkedQueue[Int]()
+
+                for i <- 1 to 10 do
+                    discard(ch.offer(i))
+
+                for _ <- 1 to 10 do
+                    val promise = Promise.Unsafe.init[Int, Abort[Closed]]()
+                    ch.reuseTake(promise)
+                    val value = blockValue(promise)
+                    discard(results.add(value))
+                end for
+
+                assert(results.size() == 10)
+                val all = new java.util.ArrayList[Int]()
+                results.forEach(v => discard(all.add(v)))
+                val sorted = (0 until all.size()).map(all.get).sorted
+                assert(sorted == (1 to 10).toSeq)
+            }
+        }
+    }
+
+    "flush" - {
+        "a fatal error in one completion callback still runs the others" in {
+            // When a promise completes, its registered callbacks run in a single flush loop. A callback that throws
+            // must not abort that loop and leave the promise's other waiters unnotified. InterruptedException is a
+            // portable throwable that scala.util.control.NonFatal classifies as fatal; placing it between two
+            // counting callbacks means an aborted flush would skip one of them regardless of order.
+            var ran = 0
+            val p   = new IOPromise[Nothing, Int]()
+            p.onComplete(_ => ran += 1)
+            p.onComplete(_ => throw new InterruptedException("fatal error"))
+            p.onComplete(_ => ran += 1)
+            try p.completeDiscard(Result.succeed(1))
+            catch case _: Throwable => () // contain any throwable that escapes the flush so the assertion below runs
+            assert(
+                ran == 2,
+                s"a fatal callback aborted the flush and orphaned the other waiters; only $ran of 2 non-fatal callbacks ran"
+            )
         }
     }
 

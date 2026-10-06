@@ -1,7 +1,6 @@
 package kyo
 
 import Var.internal.*
-import kyo.Tag
 import kyo.kernel.*
 import scala.annotation.nowarn
 
@@ -12,6 +11,7 @@ import scala.annotation.nowarn
   * operations.
   *
   * The effect encapsulates three fundamental operations:
+  *
   *   - Reading the current state via `get` and `use` methods
   *   - Setting a new state via `set` and `setDiscard` methods
   *   - Updating the state based on its current value via `update` and `updateDiscard` methods
@@ -144,17 +144,17 @@ object Var:
     private[kyo] inline def runWith[V, A, S, B, S2](state: V)(v: A < (Var[V] & S))(
         inline f: (V, A) => B < S2
     )(using inline tag: Tag[Var[V]], inline frame: Frame): B < (S & S2) =
-        ArrowEffect.handleLoop(tag, state, v)(
+        ArrowEffect.handleLoopState(tag, state, v)(
             [C] =>
-                (input, state, cont) =>
+                (state, input) =>
                     input match
                         case input: Get.type =>
-                            Loop.continue(state, cont(state))
+                            Loop.continue(state, state)
                         case input: Update[V] @unchecked =>
                             val nst = input(state)
-                            Loop.continue(nst, cont(nst))
+                            Loop.continue(nst, nst)
                         case input: V @unchecked =>
-                            Loop.continue(input, cont(state)),
+                            Loop.continue(input, state),
             done = f
         )
 

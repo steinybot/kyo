@@ -1,0 +1,154 @@
+package kyo.internal
+
+import kyo.*
+import kyo.ffi.Ffi
+import kyo.ffi.FfiNullPointer
+
+/** Platform selector, backed by the C client through kyo-ffi over the `kyo_aeron.c` shim.
+  *
+  * One shared source serves every platform; codegen supplies the backend difference (Panama
+  * downcalls on the JVM, `@extern` on Native, koffi on JS and Wasm). The C client and its embedded
+  * driver are the same pinned Aeron across all four, so the transport behaves identically everywhere.
+  */
+private[kyo] object AeronPlatformTransport:
+
+    /** Starts an embedded media driver in `dir` and connects a client to it.
+      *
+      * `dir` must be unique per call (callers pass `Path.tempDir`), since Aeron otherwise routes
+      * every runtime through its single default directory. The `@Ffi.blocking` downcalls bridge
+      * through the platform's blocking mechanism (the JVM and Native park the carrier under the
+      * scheduler's blocking monitor; JS and Wasm dispatch to a libuv worker, leaving the event loop
+      * free) rather than stranding the caller during the ~10s connect. The driver is just-launched,
+      * so the connect returns within milliseconds; the NULL path is [[external]]'s concern.
+      *
+      * The client-liveness and publication-unblock timeouts default to [[AeronDriver.Settings.embedded]]
+      * (wider than Aeron's own, see there for why); `Topic.run(settings)` overrides them.
+      */
+    def embedded(
+        dir: String,
+        clientLivenessNs: Long = AeronDriver.Settings.embedded.clientLivenessTimeout.toNanos,
+        publicationUnblockNs: Long = AeronDriver.Settings.embedded.publicationUnblockTimeout.toNanos
+    )(using Frame): AeronRuntime < Async =
+        Sync.Unsafe.defer(Ffi.load[AeronBindings]).map { bindings =>
+            for
+                driver <- Sync.Unsafe.defer(
+                    bindings.driverStart(dir, clientLivenessNs, publicationUnblockNs)
+                ).flatMap(_.safe.get)
+                client  <- Sync.Unsafe.defer(bindings.clientConnect(dir)).flatMap(_.safe.get)
+                runtime <- Sync.Unsafe.defer {
+                    val ffiTransport = new FfiAeronTransport(bindings, client)
+                    // Winning this CAS grants the right to close the driver, the same way FfiAeronTransport's own flag
+                    // grants the right to close the client. `kyo_aeron_driver_close` frees its bundle outright, so a
+                    // second close reads a freed pointer and faults inside the conductor-agent teardown. Guarding only
+                    // the client left the halves asymmetric: a runtime released on both an error path and its scope
+                    // exit survived the repeat on one half and took the process down on the other.
+                    val driverClosed = AtomicBoolean.Unsafe.init(false)
+                    // A live media driver holds descriptors (its CnC mapping and sockets), and the descriptor leak check
+                    // attaches the diagnostics dump to every survivor precisely so it names its owner instead of reporting
+                    // an opaque inode. Without an entry here an abandoned driver is exactly that opaque inode. Registering
+                    // no probe is deliberate: the probe's meaning is a parked LOOP that stopped making progress, which a
+                    // runtime has no notion of, so it reports through the dump alone and can never raise a stranded-op
+                    // finding of its own.
+                    val diagRegistration = kyo.internal.Diagnostics.register(
+                        "AeronRuntime@" + java.lang.System.identityHashCode(ffiTransport)
+                    )(dump = () => s"dir=$dir driverClosed=${driverClosed.get()}")
+                    new AeronRuntime:
+                        val transport: AeronTransport        = ffiTransport
+                        def close()(using AllowUnsafe): Unit =
+                            // Close order is load-bearing: the client holds an open connection to the
+                            // conductor, so closing the driver first leaves it in an invalid state. These
+                            // are plain downcalls, so the conductor pthread-join runs inline; it is bounded
+                            // and one-shot (it parks the carrier on the JVM and Native, briefly freezes the
+                            // event loop on JS and Wasm), unlike the connect that @Ffi.blocking covers.
+                            ffiTransport.closeClient()
+                            if driverClosed.compareAndSet(false, true) then bindings.driverClose(driver)
+                            diagRegistration.close()
+                        end close
+                    end new
+                }
+            yield runtime
+        }
+    end embedded
+
+    /** Starts an embedded media driver in `dir` without connecting a client, for a caller that
+      * connects its own clients to the directory (see [[kyo.AeronDriver]]).
+      *
+      * Timeouts are nanoseconds and `0` keeps the driver's default; the caller validates their
+      * relationship before reaching here.
+      */
+    def driver(dir: String, clientLivenessNs: Long, publicationUnblockNs: Long)(using Frame): AeronDriverRuntime < Async =
+        Sync.Unsafe.defer(Ffi.load[AeronBindings]).map { bindings =>
+            Sync.Unsafe.defer(bindings.driverStart(dir, clientLivenessNs, publicationUnblockNs)).flatMap(_.safe.get).map {
+                started =>
+                    Sync.Unsafe.defer {
+                        // Same one-shot ownership as the embedded runtime above: the shim's driver close frees the
+                        // bundle, so only the caller that wins the flag may perform it.
+                        val driverClosed = AtomicBoolean.Unsafe.init(false)
+                        // Named in the diagnostics dump for the same reason as the embedded runtime: an abandoned driver
+                        // holds descriptors, and the leak check reports them by inode unless something claims them.
+                        val diagRegistration = kyo.internal.Diagnostics.register(
+                            "AeronDriverRuntime@" + java.lang.System.identityHashCode(started)
+                        )(dump = () => s"dir=$dir driverClosed=${driverClosed.get()}")
+                        new AeronDriverRuntime:
+                            def close()(using AllowUnsafe): Unit =
+                                if driverClosed.compareAndSet(false, true) then bindings.driverClose(started)
+                                diagRegistration.close()
+                        end new
+                    }
+            }
+        }
+    end driver
+
+    /** Connects a client to a caller-owned external driver at `aeronDir`.
+      *
+      * No driver is started, so the returned runtime closes only the client. `clientConnect`
+      * installs the C recording error handler.
+      */
+    def external(aeronDir: String)(using Frame): AeronRuntime < (Async & Abort[TopicTransportFailedException]) =
+        Sync.Unsafe.defer(Ffi.load[AeronBindings]).map(bindings => externalWith(aeronDir, bindings))
+
+    /** [[external]] with the FFI bindings injected, so a test can drive the connect/close lifecycle with a fake.
+      */
+    private[kyo] def externalWith(aeronDir: String, bindings: AeronBindings)(using
+        Frame
+    ): AeronRuntime < (Async & Abort[TopicTransportFailedException]) =
+        // A driver-absent connect returns NULL after the ~10s driver timeout, which the
+        // generated binding raises as FfiNullPointer. On JS that completes the fiber with a
+        // Panic; on the JVM and Native the blocking bridge runs the downcall on the calling
+        // thread, so it throws out of `clientConnect` itself. The call therefore has to stay
+        // inside the recover, whose panic arm covers both.
+        Abort.recover[Nothing](
+            onFail = (never: Nothing) => never,
+            onPanic = mapConnectPanic
+        ) {
+            Sync.Unsafe.defer {
+                val connecting = bindings.clientConnect(aeronDir)
+                var taken      = false
+                // A caller interrupted at the join is abandoned without resuming, so a client the connect produces, now
+                // or later, has no owner but this finalizer. `taken` marks the normal exit, where the runtime owns the
+                // client; the runtime is built in the step the client arrives so no checkpoint sits between the two.
+                Sync.Unsafe.ensure {
+                    if !taken then connecting.onComplete(_.foreach(client => bindings.clientClose(client.eval)))
+                } {
+                    connecting.safe.use { client =>
+                        taken = true
+                        val ffiTransport = new FfiAeronTransport(bindings, client)
+                        new AeronRuntime:
+                            val transport: AeronTransport        = ffiTransport
+                            def close()(using AllowUnsafe): Unit = ffiTransport.closeClient()
+                        end new
+                    }
+                }
+            }
+        }
+    end externalWith
+
+    /** Maps a connect panic, treating the absent-driver NULL as the only expected one and
+      * re-raising everything else so a genuine defect stays a defect.
+      */
+    private def mapConnectPanic(t: Throwable)(using Frame): Nothing < Abort[TopicTransportFailedException] =
+        t match
+            case n: FfiNullPointer =>
+                Abort.fail(TopicTransportFailedException(Maybe(n.getMessage).filter(_.nonEmpty).getOrElse(n.toString), n))
+            case other => Abort.panic(other)
+end AeronPlatformTransport

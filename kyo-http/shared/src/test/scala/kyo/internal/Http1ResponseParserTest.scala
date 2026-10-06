@@ -1,0 +1,655 @@
+package kyo.internal
+
+import java.nio.charset.StandardCharsets
+import kyo.*
+import kyo.internal.codec.*
+import kyo.internal.http1.*
+import kyo.internal.util.*
+
+class Http1ResponseParserTest extends kyo.BaseHttpTest:
+
+    given CanEqual[Any, Any] = CanEqual.derived
+
+    import AllowUnsafe.embrace.danger
+
+    /** Helper: create a channel, offer response bytes, create parser, capture ParsedResponse. */
+    private def parseResponse(
+        rawResponse: String,
+        maxHeaderSize: Int = 65536
+    ): (ParsedResponse, Span[Byte]) =
+        val channel = Channel.Unsafe.init[Span[Byte]](16)
+        val bytes   = rawResponse.getBytes(StandardCharsets.US_ASCII)
+        discard(channel.offer(Span.fromUnsafe(bytes)))
+
+        var result: ParsedResponse = null.asInstanceOf[ParsedResponse]
+        var body: Span[Byte]       = Span.empty[Byte]
+        val parser                 = new Http1ResponseParser(
+            channel,
+            maxHeaderSize,
+            onResponseParsed = (resp, b) =>
+                result = resp
+                body = b
+        )
+        parser.start()
+        (result, body)
+    end parseResponse
+
+    /** How the parser refuses `rawResponse`, or Absent when it does not. */
+    private def refusal(rawResponse: String): Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] =
+        val channel = Channel.Unsafe.init[Span[Byte]](16)
+        discard(channel.offer(Span.fromUnsafe(rawResponse.getBytes(StandardCharsets.US_ASCII))))
+        var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+        new Http1ResponseParser(channel, onFailure = f => failure = Present(f)).start()
+        failure
+    end refusal
+
+    private def refused(detail: String): Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] =
+        Present(Result.Failure(HttpProtocolException(detail)))
+
+    /** Helper: parse from multiple chunks offered before start. */
+    private def parseResponseFromChunks(
+        chunks: Seq[Array[Byte]],
+        maxHeaderSize: Int = 65536
+    ): (ParsedResponse, Span[Byte]) =
+        val channel = Channel.Unsafe.init[Span[Byte]](64)
+        chunks.foreach(chunk => discard(channel.offer(Span.fromUnsafe(chunk))))
+
+        var result: ParsedResponse = null.asInstanceOf[ParsedResponse]
+        var body: Span[Byte]       = Span.empty[Byte]
+        val parser                 = new Http1ResponseParser(
+            channel,
+            maxHeaderSize,
+            onResponseParsed = (resp, b) =>
+                result = resp
+                body = b
+        )
+        parser.start()
+        (result, body)
+    end parseResponseFromChunks
+
+    "Http1ResponseParser" - {
+
+        // Test 1
+        "parse valid 200 response with Content-Length and keep-alive" in {
+            val (resp, body) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.statusCode == 200)
+            assert(resp.contentLength == 4)
+            assert(!resp.isChunked)
+            assert(resp.isKeepAlive)
+            assert(body.size == 4)
+            assert(new String(body.toArray, StandardCharsets.US_ASCII) == "body")
+        }
+
+        // Test 2
+        "parse response with chunked transfer encoding" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.isChunked)
+            assert(resp.contentLength == -1)
+            assert(resp.statusCode == 200)
+        }
+
+        // A response naming chunked as its FINAL coding is chunked, whatever precedes it (RFC 9112 section 6.1). The old
+        // comparison stopped after seven bytes and so failed on "gzip, chunked", framing the response by Content-Length
+        // or by close instead. Unpinned until now.
+        "frames a response whose final coding is chunked (GHSA-jrpm-956j-96jg)" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+            assert(resp != null, "the response should parse")
+            assert(resp.isChunked, "chunked is the final coding, so the response is chunk-framed")
+        }
+
+        // RFC 9112 section 6.3 item 5: conflicting Content-Length values are unrecoverable. Letting the last one win is
+        // the response-side smuggling primitive, since a proxy honouring the first and this client the last disagree
+        // about where the body ends. The request side already refused this; the asymmetry was the gap.
+        "rejects a response with conflicting Content-Length values (GHSA-p83c-4wj9-p6w9)" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\nhello")
+            assert(resp == null, "two different Content-Length values leave the body length undeterminable")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\nhello") ==
+                refused("the response has conflicting Content-Length values"))
+        }
+
+        // The over-strictness control: a repeated but IDENTICAL value is not a conflict and must still parse.
+        "accepts a repeated identical Content-Length (GHSA-p83c-4wj9-p6w9)" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello")
+            assert(resp != null, "the two values agree, so the length is determinable")
+            assert(resp.contentLength == 5)
+        }
+
+        // RFC 9112 section 6.3 item 3: with both present, Transfer-Encoding determines the length and Content-Length is
+        // discarded. Leaving it readable keeps two framings in play for anything that later consults the wrong one.
+        "discards Content-Length when Transfer-Encoding is present (GHSA-p83c-4wj9-p6w9)" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n")
+            assert(resp != null, "this is resolvable, not malformed: chunked wins")
+            assert(resp.isChunked, "the response is chunk-framed")
+            assert(resp.contentLength == -1, s"Content-Length must be discarded, got ${resp.contentLength}")
+        }
+
+        // The response parser must reject an obs-fold (a header line beginning with SP or HTAB), as the request parser
+        // does. RFC 9112 section 5.2 makes rejecting or unfolding a recipient MUST, because a folded value read one way
+        // by this client and another by an intermediary is a header-interpretation disagreement. Dropping the colon-less
+        // fold line instead would truncate the value ("one two" becomes "one").
+        //
+        // Origin: RFC 9112 section 5.2; the response-side analog of the request-parser obs-fold reject.
+        "rejects an obs-folded response header (RFC 9112 section 5.2)" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 0\r\n\r\n")
+            assert(
+                resp == null,
+                s"an obs-folded header must be refused, but the response parsed with X-A=${
+                        if resp == null then "n/a" else resp.headers.get("X-A")
+                    }"
+            )
+            assert(refusal("HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 0\r\n\r\n") ==
+                refused("a response header line is folded"))
+        }
+
+        // A Content-Length that overflows the Int accumulator must be refused, not wrapped. Wrapped, "4294967301"
+        // (2^32 + 5) becomes 5: the client frames the body at 5 bytes, keeps the pooled keep-alive connection, and reads
+        // the attacker's trailing bytes as the next response on that connection.
+        //
+        // Origin: hyper RUSTSEC-2021-0078 (lenient Content-Length), the response-side analog of the request-side guard.
+        "rejects a response Content-Length that overflows Int" in {
+            val raw       = "HTTP/1.1 200 OK\r\nContent-Length: 4294967301\r\nConnection: keep-alive\r\n\r\nHELLO"
+            val (resp, _) = parseResponse(raw)
+            assert(resp == null, s"an overflowing Content-Length must be refused, but it parsed as ${resp.contentLength}")
+            assert(refusal(raw) == refused("the response Content-Length is not a valid length"))
+        }
+
+        // The response-side half of the Transfer-Encoding token check. "chunkedfoo" is a single token and is not
+        // "chunked" (RFC 9110 section 5.6.2 tokens are delimited, not prefixes), so a value comparison that stops
+        // after the 7 bytes of "chunked" matches it here. On this side the reader is the CLIENT, so the party that
+        // chooses the value is the SERVER: a malicious or compromised origin picks a value a conforming proxy frames
+        // one way and this client frames the other, and the disagreement lets it steer where this client believes
+        // one response ends and the next begins.
+        "Transfer-Encoding value is matched as a whole token, not by prefix (GHSA-jrpm-956j-96jg)" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunkedfoo\r\n\r\n"
+            )
+            assert(resp != null, "the response should still parse")
+            assert(!resp.isChunked, "\"chunkedfoo\" is not the token \"chunked\" and must not frame the response as chunked")
+        }
+
+        // Test 3
+        "parse response with explicit Connection: close" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(!resp.isKeepAlive)
+        }
+
+        // Test 4
+        "HTTP/1.0 response without Connection header defaults to non-keep-alive" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            // HTTP/1.0 default: keep-alive is false unless explicitly requested
+            assert(!resp.isKeepAlive, "HTTP/1.0 without Connection header should not be keep-alive")
+        }
+
+        // Test 5
+        "reject response with invalid status code 999" in {
+            val channel = Channel.Unsafe.init[Span[Byte]](16)
+            val raw     = "HTTP/1.1 999 Invalid\r\nContent-Length: 0\r\n\r\n"
+            discard(channel.offer(Span.fromUnsafe(raw.getBytes(StandardCharsets.US_ASCII))))
+
+            var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+            var parsed: ParsedResponse                                              = null.asInstanceOf[ParsedResponse]
+            val parser                                                              = new Http1ResponseParser(
+                channel,
+                onResponseParsed = (resp, _) => parsed = resp,
+                onFailure = f => failure = Present(f)
+            )
+            parser.start()
+
+            assert(failure == refused("the response status code 999 is outside 100 to 599"), s"observed: $failure")
+            assert(parsed == null, "Parser should not produce a response for status code 999")
+        }
+
+        // Test 6
+        "reject response with garbage status line" in {
+            val channel = Channel.Unsafe.init[Span[Byte]](16)
+            val raw     = "GARBAGE /bad HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+            discard(channel.offer(Span.fromUnsafe(raw.getBytes(StandardCharsets.US_ASCII))))
+
+            var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+            var parsed: ParsedResponse                                              = null.asInstanceOf[ParsedResponse]
+            val parser                                                              = new Http1ResponseParser(
+                channel,
+                onResponseParsed = (resp, _) => parsed = resp,
+                onFailure = f => failure = Present(f)
+            )
+            parser.start()
+
+            assert(failure == refused("the response status line does not begin with HTTP/1.x"), s"observed: $failure")
+            assert(parsed == null, "Parser should not produce a response for garbage status line")
+        }
+
+        // Test 7
+        "parse status line HTTP/1.1 404 Not Found correctly" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.statusCode == 404)
+        }
+
+        // Test 8
+        "parse HTTP/1.0 200 with no reason phrase" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.0 200\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.statusCode == 200)
+        }
+
+        // Test 9
+        "parse Content-Length 12345 correctly" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 12345\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.contentLength == 12345)
+        }
+
+        // Test 10
+        // The leaf is named for rejection and used to assert the opposite: the response parsed and the bad length was
+        // reported as absent. RFC 9112 section 6.3 item 4 makes an invalid Content-Length unrecoverable, and treating it
+        // as absent reads the response to connection close, which a proxy that DID parse a number out of "1a2b" frames
+        // differently, so the tail of one response becomes the head of the next. The name was right and the assertion
+        // was wrong.
+        "reject Content-Length with non-digit characters" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 1a2b\r\n\r\n"
+            )
+            assert(resp == null, "an invalid Content-Length leaves the framing undeterminable and must be refused")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 1a2b\r\n\r\n") ==
+                refused("the response Content-Length is not a valid length"))
+        }
+
+        // The spelling the duplicate check could not catch while a malformed value was tolerated: the first header
+        // leaves -1 behind, so a test against the running value never fires and the second value is silently adopted.
+        "rejects a malformed Content-Length followed by a valid one (GHSA-p83c-4wj9-p6w9)" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: abc\r\nContent-Length: 5\r\n\r\nhello"
+            )
+            assert(resp == null, "the first value is not recoverable, so the message is not framed by the second")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: abc\r\nContent-Length: 5\r\n\r\nhello") ==
+                refused("the response Content-Length is not a valid length"))
+        }
+
+        // Test 11
+        "parse case-insensitive content-length header" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\ncontent-length: 42\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.contentLength == 42, "Case-insensitive content-length should be extracted")
+        }
+
+        // Test 12
+        "parse multiple headers with various spacing" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/plain\r\n" +
+                    "X-Request-Id: abc123\r\n" +
+                    "Cache-Control:  no-cache\r\n" +
+                    "Content-Length: 0\r\n" +
+                    "\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            val headers = resp.headers
+            assert(headers.get("Content-Type") == Present("text/plain"))
+            assert(headers.get("X-Request-Id") == Present("abc123"))
+            // Leading space after colon should be skipped; value should be "no-cache"
+            assert(headers.get("Cache-Control") == Present("no-cache"))
+            assert(headers.get("Content-Length") == Present("0"))
+        }
+
+        // Test 13
+        "handle header with empty value" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nX-Empty: \r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            val headers = resp.headers
+            // After skipping the space, value is empty
+            assert(headers.get("X-Empty") == Present(""), "Header with only space value should be empty string")
+        }
+
+        // Test 14
+        "accumulate partial data across multiple calls" in {
+            val fullResponse = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            val bytes        = fullResponse.getBytes(StandardCharsets.US_ASCII)
+            val chunkSize    = 8
+            val chunks       = (0 until bytes.length by chunkSize).map { start =>
+                val end = math.min(start + chunkSize, bytes.length)
+                bytes.slice(start, end)
+            }.toSeq
+
+            val (resp, _) = parseResponseFromChunks(chunks)
+            assert(resp != null, "Response should have been parsed from incremental chunks")
+            assert(resp.statusCode == 200)
+            assert(resp.contentLength == 0)
+        }
+
+        // Test 15
+        "handle EOF during header parse — channel closes gracefully" in {
+            val channel                                                             = Channel.Unsafe.init[Span[Byte]](16)
+            var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+            val parser                                                              = new Http1ResponseParser(
+                channel,
+                onFailure = f => failure = Present(f)
+            )
+            // Close channel BEFORE start — parser gets Closed immediately
+            discard(channel.close())
+            parser.start()
+
+            assert(
+                failure == Present(Result.fail(HttpConnectionClosedException(HttpConnectionClosedException.Phase.BeforeHead))),
+                s"observed: $failure"
+            )
+        }
+
+        "a read that panics stays a panic carrying its own throwable" in {
+            val channel                                                             = Channel.Unsafe.init[Span[Byte]](16)
+            var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+            val parser                                                              = new Http1ResponseParser(
+                channel,
+                onFailure = f => failure = Present(f)
+            )
+            val cause = new RuntimeException("the read failed")
+            parser.onRead(Result.panic(cause))
+            assert(failure == Present(Result.panic(cause)), s"observed: $failure")
+        }
+
+        // Test 16
+        "reset and reuse parser for keep-alive" in {
+            val channel = Channel.Unsafe.init[Span[Byte]](64)
+
+            val resp1Bytes = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Seq: first\r\n\r\nhello"
+            val resp2Bytes = "HTTP/1.1 201 Created\r\nContent-Length: 6\r\nX-Seq: second\r\n\r\nworld!"
+
+            // Each response in its own read, as a client that sends the second request after reading the first receives them.
+            discard(channel.offer(Span.fromUnsafe(resp1Bytes.getBytes(StandardCharsets.US_ASCII))))
+            discard(channel.offer(Span.fromUnsafe(resp2Bytes.getBytes(StandardCharsets.US_ASCII))))
+
+            val responses                        = new scala.collection.mutable.ArrayBuffer[(ParsedResponse, Span[Byte])]()
+            lazy val parser: Http1ResponseParser = new Http1ResponseParser(
+                channel,
+                onResponseParsed = (resp, body) =>
+                    responses += ((resp, body))
+                    if responses.size < 2 then
+                        parser.reset(HttpMethod.GET, rawAfterHead = false)
+                        parser.start()
+            )
+            parser.start()
+
+            assert(responses.size == 2, s"Expected 2 responses but got ${responses.size}")
+            val (r1, b1) = responses(0)
+            assert(r1.statusCode == 200)
+            assert(r1.contentLength == 5)
+            assert(r1.headers.get("X-Seq") == Present("first"))
+            assert(new String(b1.toArray, StandardCharsets.US_ASCII) == "hello")
+
+            val (r2, b2) = responses(1)
+            assert(r2.statusCode == 201)
+            assert(r2.contentLength == 6)
+            assert(r2.headers.get("X-Seq") == Present("second"))
+            assert(new String(b2.toArray, StandardCharsets.US_ASCII) == "world!")
+        }
+
+        "bytes after a complete response in the same read are dropped and the connection is not reused (RFC 9112 section 6.3)" in {
+            val channel = Channel.Unsafe.init[Span[Byte]](64)
+            val read    = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil"
+            discard(channel.offer(Span.fromUnsafe(read.getBytes(StandardCharsets.US_ASCII))))
+
+            val responses                        = new scala.collection.mutable.ArrayBuffer[(Int, String, Boolean)]()
+            lazy val parser: Http1ResponseParser = new Http1ResponseParser(
+                channel,
+                onResponseParsed = (resp, body) =>
+                    responses += ((resp.statusCode, new String(body.toArray, StandardCharsets.US_ASCII), resp.isKeepAlive))
+                    parser.reset(HttpMethod.GET, rawAfterHead = false)
+                    parser.start()
+            )
+            parser.start()
+
+            assert(responses.toList == List((200, "hello", false)), s"observed: $responses")
+        }
+
+        "each body-less response ends at its head, so the bytes after it are dropped" in {
+            def outcome(method: HttpMethod, head: String): (Int, String, Boolean) =
+                val channel = Channel.Unsafe.init[Span[Byte]](16)
+                discard(channel.offer(Span.fromUnsafe((head + "extra").getBytes(StandardCharsets.US_ASCII))))
+                var result = (0, "", true)
+                val parser = new Http1ResponseParser(
+                    channel,
+                    onResponseParsed = (resp, body) =>
+                        result = (resp.statusCode, new String(body.toArray, StandardCharsets.US_ASCII), resp.isKeepAlive)
+                )
+                parser.reset(method, rawAfterHead = false)
+                parser.start()
+                result
+            end outcome
+            assert(outcome(HttpMethod.HEAD, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") == ((200, "", false)))
+            assert(outcome(HttpMethod.GET, "HTTP/1.1 204 No Content\r\n\r\n") == ((204, "", false)))
+            assert(outcome(HttpMethod.GET, "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n") == ((304, "", false)))
+            assert(outcome(HttpMethod.GET, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") == ((200, "", false)))
+        }
+
+        "on a raw exchange every byte after the head is the caller's" in {
+            val channel = Channel.Unsafe.init[Span[Byte]](16)
+            val read    = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\ntunnelled"
+            discard(channel.offer(Span.fromUnsafe(read.getBytes(StandardCharsets.US_ASCII))))
+            var result = (0, "", false)
+            val parser = new Http1ResponseParser(
+                channel,
+                onResponseParsed = (resp, body) =>
+                    result = (resp.statusCode, new String(body.toArray, StandardCharsets.US_ASCII), resp.isKeepAlive)
+            )
+            parser.reset(HttpMethod.GET, rawAfterHead = true)
+            parser.start()
+            assert(result == ((200, "tunnelled", true)), s"observed: $result")
+        }
+
+        // Test 17
+        "detect CRLF_CRLF header terminator correctly" in {
+            // Ensure parser correctly identifies \r\n\r\n at various offsets
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nHost: example.com\r\nAccept: */*\r\n\r\n"
+            )
+            assert(resp != null, "Response should be parsed when \\r\\n\\r\\n terminator is present")
+            assert(resp.statusCode == 200)
+            assert(resp.headers.get("Host") == Present("example.com"))
+            assert(resp.headers.get("Accept") == Present("*/*"))
+        }
+
+        // Test 18
+        "extract leftover body bytes after headers" in {
+            val (resp, body) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.contentLength == 13)
+            assert(body.size == 13)
+            assert(new String(body.toArray, StandardCharsets.US_ASCII) == "Hello, World!")
+        }
+
+        // Test 19
+        "handle response with body smaller than Content-Length in initial chunk" in {
+            // Content-Length says 100, but only 5 bytes arrive in the header chunk
+            // The parser should clamp body to what's available (5 bytes), not 100
+            val (resp, body) = parseResponse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.contentLength == 100)
+            // body extracted is min(remaining, contentLength) = min(5, 100) = 5
+            assert(body.size == 5)
+            assert(new String(body.toArray, StandardCharsets.US_ASCII) == "hello")
+        }
+
+        // Test 20
+        "response headers answer lookups by name" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/json\r\n" +
+                    "X-Correlation-Id: corr-789\r\n" +
+                    "Cache-Control: no-store\r\n" +
+                    "Content-Length: 2\r\n" +
+                    "\r\n{}"
+            )
+            assert(resp != null, "Response should have been parsed")
+            val headers = resp.headers
+            assert(headers.get("Content-Type") == Present("application/json"))
+            assert(headers.get("X-Correlation-Id") == Present("corr-789"))
+            assert(headers.get("Cache-Control") == Present("no-store"))
+            assert(headers.get("Content-Length") == Present("2"))
+            // Non-existent header should be Absent
+            assert(headers.get("X-Not-Present") == Absent)
+        }
+
+        // Test 21
+        "handle header offset array reallocation with many headers" in {
+            val sb = new StringBuilder
+            sb.append("HTTP/1.1 200 OK\r\n")
+            var i = 0
+            // 32+ headers forces hdrOffsets to reallocate (initial size is 128 int slots = 32 headers)
+            while i < 35 do
+                sb.append(s"X-Header-$i: value-$i\r\n")
+                i += 1
+            sb.append("\r\n")
+            val (resp, _) = parseResponse(sb.toString)
+            assert(resp != null, "Response with 35 headers should parse (triggers reallocation)")
+            assert(resp.statusCode == 200)
+            val headers = resp.headers
+            // Spot check first and last
+            assert(headers.get("X-Header-0") == Present("value-0"))
+            assert(headers.get("X-Header-34") == Present("value-34"))
+        }
+
+        // Test 22
+        "parse response with no headers (only status line)" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.statusCode == 200)
+            assert(resp.contentLength == -1)
+            assert(!resp.isChunked)
+        }
+
+        // RFC 9110 section 5.6.3: the optional whitespace around a field value is SP or HTAB.
+        "a field value after a tab, or after spaces and tabs, is read without them" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nX-Tab:\tafter-tab\r\nX-Mixed: \t \tmixed\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.headers.get("X-Tab") == Present("after-tab"), s"observed ${resp.headers.get("X-Tab")}")
+            assert(resp.headers.get("X-Mixed") == Present("mixed"), s"observed ${resp.headers.get("X-Mixed")}")
+        }
+
+        // Test 23
+        "ignore header line with no colon — malformed header line skipped" in {
+            val (resp, _) = parseResponse(
+                "HTTP/1.1 200 OK\r\nMalformedHeaderNoColon\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed despite malformed header")
+            assert(resp.statusCode == 200)
+            // Malformed line has no colon, so it's skipped; Content-Length still parsed
+            assert(resp.contentLength == 0)
+            // Malformed line should not appear in headers (no colon = not stored)
+            assert(resp.headers.get("MalformedHeaderNoColon") == Absent)
+        }
+
+        // Test 24
+        "handle response exceeding maxHeaderSize: onFailure called" in {
+            val smallMax     = 64
+            val channel      = Channel.Unsafe.init[Span[Byte]](16)
+            val longResponse =
+                "HTTP/1.1 200 OK\r\nX-Big: " + "x" * 200 + "\r\n\r\n"
+            discard(channel.offer(Span.fromUnsafe(longResponse.getBytes(StandardCharsets.US_ASCII))))
+
+            var failure: Maybe[Result.Error[Http1ClientConnection.ResponseFailure]] = Absent
+            var parsed: ParsedResponse                                              = null.asInstanceOf[ParsedResponse]
+            val parser                                                              = new Http1ResponseParser(
+                channel,
+                maxHeaderSize = smallMax,
+                onResponseParsed = (resp, _) => parsed = resp,
+                onFailure = f => failure = Present(f)
+            )
+            parser.start()
+
+            assert(
+                failure == Present(Result.fail(HttpProtocolException("the response head exceeds 64 bytes"))),
+                s"observed: $failure"
+            )
+            assert(parsed == null, "Parser should not produce a response when headers exceed maxHeaderSize")
+        }
+
+        // Test 25
+        "parse Content-Length: 0 correctly — contentLength is 0, not -1" in {
+            val (resp, body) = parseResponse(
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+            )
+            assert(resp != null, "Response should have been parsed")
+            assert(resp.statusCode == 204)
+            assert(resp.contentLength == 0, "Content-Length: 0 should be 0, not -1")
+            assert(body.size == 0)
+        }
+
+        // Test 26
+        // Response headers are stored as the raw octets they were parsed from and are re-emitted verbatim, so a
+        // value a peer smuggles past this parser reaches the wire again unchanged when a proxy echoes it. A bare
+        // LF is the vector RFC 9112 section 2.2 names: a downstream MAY read it as a line terminator.
+        "rejects a bare LF inside a header value" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: bar\nX-Evil: 1\r\n\r\n")
+            assert(resp == null, "a bare LF in a response field value must be rejected")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: bar\nX-Evil: 1\r\n\r\n") ==
+                refused("a response header line holds a bare CR or LF"))
+        }
+
+        // Test 27
+        // Bare CR is the same vector by the other byte (CVE-2022-35256 in Node.js).
+        "rejects a bare CR inside a header value" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: bar\rX-Evil: 1\r\n\r\n")
+            assert(resp == null, "a bare CR in a response field value must be rejected")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: bar\rX-Evil: 1\r\n\r\n") ==
+                refused("a response header line holds a bare CR or LF"))
+        }
+
+        // Test 28
+        // RFC 9110 section 5.5 names NUL alongside CR and LF in its recipient MUST.
+        "rejects a NUL inside a header value" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: ba\u0000r\r\n\r\n")
+            assert(resp == null, "a NUL in a response field value must be rejected")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Foo: ba\u0000r\r\n\r\n") ==
+                refused("a response header value holds a NUL"))
+        }
+
+        // Test 29
+        // A field name is a token (RFC 9110 section 5.6.2); "X Foo" re-emitted verbatim reads as the name "X"
+        // with the value "Foo: bar" to a recipient that splits on the first colon.
+        "rejects a header name that is not a token" in {
+            val (resp, _) = parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX Foo: bar\r\n\r\n")
+            assert(resp == null, "a response field name containing SP is not a token and must be rejected")
+            assert(refusal("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX Foo: bar\r\n\r\n") ==
+                refused("a response header name is not a token"))
+        }
+
+        // Test 30
+        // The over-strictness guard: an ordinary response must still parse once the checks above are in place.
+        "accepts a header name using the full tchar set" in {
+            val name      = "!#$%&'*+-.^_`|~0Az"
+            val (resp, _) = parseResponse(s"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n$name: ok\r\n\r\n")
+            assert(resp != null, s"'$name' is a valid token and must parse")
+            assert(resp.headers.get(name) == Present("ok"))
+        }
+    }
+
+end Http1ResponseParserTest

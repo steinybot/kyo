@@ -1,7 +1,6 @@
 package kyo
 
 import kyo.Result.Failure
-import scala.annotation.tailrec
 import scala.util.boundary
 
 /** Software Transactional Memory (STM) provides concurrent access to shared state using optimistic locking. Rather than acquiring locks
@@ -9,10 +8,11 @@ import scala.util.boundary
   * composability than manual locking, applications must be designed to handle potentially frequent transaction retries.
   *
   * > IMPORTANT: Transactions are atomic, isolated, and composable but may retry multiple times before success. Side effects (like I/O)
-  * inside transactions must be used with caution as they will be re-executed on retry. Pure operations that only modify transactional
-  * references are safe and encouraged, while external side effects should be performed after the transaction commits.
+  * > inside transactions must be used with caution as they will be re-executed on retry. Pure operations that only modify transactional
+  * > references are safe and encouraged, while external side effects should be performed after the transaction commits.
   *
   * The core operations are:
+  *
   *   - TRef.init creates transactional references that can be shared between threads
   *   - TRef.get and TRef.set read and modify references within transactions
   *   - STM.run executes transactions that either fully commit or rollback
@@ -20,6 +20,7 @@ import scala.util.boundary
   *   - Configurable retry schedules via STM.run's retrySchedule parameter
   *
   * The implementation uses optimistic execution with lock-based validation during commit:
+  *
   *   - Transactions execute without acquiring locks, tracking reads and writes in a local log
   *   - During commit, read-write locks are acquired on affected TRefs to ensure consistency:
   *     - Multiple readers can hold shared locks on a TRef during commit
@@ -39,8 +40,49 @@ opaque type STM <: (Var[TRefLog] & Abort[FailedTransaction] & Async) =
 
 object STM:
 
-    /** The default retry schedule for failed transactions */
-    val defaultRetrySchedule = Schedule.fixed(1.millis).jitter(0.5).take(20)
+    /** Monotonic tick value for STM conflict detection */
+    private[kyo] opaque type Tick <: Long = Long
+
+    private[kyo] object Tick:
+        given CanEqual[Tick, Tick] = CanEqual.derived
+
+        private val counter = AtomicLong.Unsafe.init(0)(using AllowUnsafe.embrace.danger)
+
+        /** Generate a new tick value */
+        def next()(using AllowUnsafe): Tick = counter.incrementAndGet()
+
+        /** Set counter value. For testing only. */
+        def testOnlySet(value: Long)(using AllowUnsafe): Unit = counter.set(value)
+
+    end Tick
+
+    private val currentTransaction = Local.initNoninheritable[Maybe[Tick]](Absent)
+
+    /** Use current transaction's tick (fails if not in transaction) */
+    private[kyo] inline def withCurrentTransaction[A, S](inline f: Tick => A < S)(using inline frame: Frame): A < (S & STM & Sync) =
+        Sync.withLocal(currentTransaction) {
+            case Absent        => bug("STM operation attempted outside of STM.run")
+            case Present(tick) => f(tick)
+        }
+
+    /** Use current transaction, or commit in a new one if not in a transaction */
+    private[kyo] inline def withCurrentTransactionOrNew[A, S](inline f: AllowUnsafe ?=> Tick => A < S)(using
+        inline frame: Frame
+    ): A < (S & Sync) =
+        Sync.Unsafe.withLocal(currentTransaction) {
+            case Absent        => f(Tick.next())
+            case Present(tick) => f(tick)
+        }
+
+    /** The default retry schedule for failed transactions.
+      *
+      * The retry budget scales with [[Async.defaultConcurrency]] because that is the level of concurrent contention a transaction faces
+      * when transactions are launched through the default-parallelism `Async` collection combinators. Under N-way contention a transaction
+      * needs O(N) retries to win its commit; the multiplier gives ample tail margin so a legitimately-contended transaction is not
+      * spuriously failed. The budget stays bounded — a transaction that genuinely cannot make progress still fails rather than looping
+      * forever.
+      */
+    val defaultRetrySchedule = Schedule.fixed(1.millis).jitter(0.5).take(Async.defaultConcurrency * 16)
 
     /** Forces a transaction retry by aborting the current transaction and rolling back all changes. This is useful when a transaction
       * detects that it cannot proceed due to invalid state.
@@ -93,51 +135,62 @@ object STM:
     private def run[E: ConcreteTag, A](retrySchedule: Schedule)(v: A < (STM & Abort[E] & Async))(
         using Frame
     ): A < (Async & Abort[E | FailedTransaction]) =
-        TID.useIO {
-            case -1L =>
-                TID.useNew { tid =>
-                    v.handle(
-                        Abort.recoverError[E] { error =>
-                            // Retry arbitrary E failures in case the transaction is inconsistent
-                            Var.use[TRefLog] { log =>
-                                Sync.Unsafe {
-                                    if !commit(tid, log, probe = true) then
-                                        // The ref log shows inconsistency, retry the transaction
-                                        Abort.fail(FailedTransaction(Present(error)))
-                                    else
-                                        // No inconsistency detected, just propagate the error
-                                        Abort.error(error)
-                                }
+        Sync.Unsafe.withLocal(currentTransaction) {
+            case Absent =>
+                // Optimistic retry loop: execute the transaction body, attempt commit, retry on conflict
+                def loop(schedule: Schedule, attempt: Int)(using AllowUnsafe): A < (Async & Abort[E | FailedTransaction]) =
+                    val tick = Tick.next()
+                    // After `bargeThreshold` polite attempts, commit barges past the
+                    // readTick fairness yield so a reader-starved writer can progress.
+                    val barge = attempt >= bargeThreshold()
+                    // Consult the schedule for the next retry delay, or fail if exhausted
+                    def retry: A < (Async & Abort[E | FailedTransaction]) =
+                        Clock.now.map { now =>
+                            schedule.next(now).map { (delay, next) =>
+                                Async.delay(delay)(Sync.Unsafe.defer(loop(next, attempt + 1)))
+                            }.getOrElse {
+                                Abort.fail(FailedTransaction())
                             }
-                        },
+                        }
+                    // Execute the transaction body with a fresh log, capturing the result
+                    v.handle(
+                        currentTransaction.let(Present(tick)),
+                        Abort.run[E | FailedTransaction],
                         Var.runTuple(TRefLog.empty)
                     ).map { (log, result) =>
-                        Sync.Unsafe {
-                            if !commit(tid, log) then
-                                Abort.fail(FailedTransaction())
-                            else
-                                result
-                        }
+                        result.foldError(
+                            // Successful transaction: try to commit, retry on conflict.
+                            a =>
+                                if !commit(tick, log, probe = false, barge = barge) then retry
+                                else a,
+                            {
+                                case Result.Failure(_: FailedTransaction) =>
+                                    // Explicit retry via STM.retry or early conflict detection
+                                    retry
+                                case error =>
+                                    // User error: probe-commit to check log validity. If stale,
+                                    // retry since the error may be from reading stale state.
+                                    if !commit(tick, log, probe = true, barge = barge) then retry
+                                    else Abort.error(error)
+                            }
+                        )
                     }
-                }.handle(
-                    Retry[FailedTransaction](retrySchedule)
-                )
-            case parent =>
+                end loop
+                loop(retrySchedule, 0)
+            case _ =>
                 // Nested transaction inherits parent's transaction context but isolates RefLog.
                 // On success: changes propagate to parent. On failure: changes are rolled back
                 // without affecting parent's state.
                 val result = TRefLog.isolate.run(v)
-
-                // Can't return `result` directly since it has a pending STM effect
-                // but it's safe to cast because, if there's a parent transaction,
-                // then there's a frame upper in the stack that will handle the
-                // STM effect in the parent transaction's `run`.
+                // Safe to cast: the parent STM.run higher in the call stack handles the pending STM effect
                 result.asInstanceOf[A < (Async & Abort[E | FailedTransaction])]
         }
 
     end run
 
-    private def commit[A, S](tid: Long, log: TRefLog, probe: Boolean = false)(using AllowUnsafe): Boolean =
+    import CommitBuffer.*
+
+    private def commit[A, S](tick: Tick, log: TRefLog, probe: Boolean, barge: Boolean)(using AllowUnsafe): Boolean =
         val logMap = log.toMap
         logMap.size match
             case 0 =>
@@ -146,107 +199,58 @@ object STM:
             case 1 =>
                 // Fast-path for a single ref
                 val (ref, entry) = logMap.head
-                // No need to pre-validate since `lock` validates and
-                // there's a single ref
-                val ok = ref.lock(entry)
-                if ok then
-                    if !probe then ref.commit(tid, entry)
-                    ref.unlock(entry)
-                ok
+                entry match
+                    case _: TRefLog.Read[?] =>
+                        // Read-only: just validate, no locking needed
+                        ref.validate(entry)
+                    case _ =>
+                        // Has write: need to lock and commit
+                        val ok = ref.lock(tick, entry, barge)
+                        if ok then
+                            if !probe then ref.commit(Tick.next(), entry)
+                            ref.unlock(entry)
+                        ok
+                end match
             case size =>
-                // Commit multiple refs
-                // Flattened representation of the log
-                val array = new Array[Any](size * 2)
+                // Commit multiple refs using a thread-local cached buffer
+                CommitBuffer.withBuffer { buffer =>
+                    boundary {
+                        var hasWrites = false
+                        // Pre-validate and dump the log to the buffer
+                        logMap.foreachEntry { (ref, entry) =>
+                            // This code uses `boundary`/`break` because
+                            // foreachEntry is the only way to traverse the
+                            // map without allocating tuples, so throwing via `break`
+                            // is the workaround to short circuit
+                            if !ref.validate(entry) then boundary.break(false)
+                            hasWrites |= entry.isInstanceOf[TRefLog.Write[?]]
+                            buffer.append(ref, entry)
+                        }
 
-                boundary {
+                        // Read-only transaction: already validated, no locking needed
+                        if !hasWrites then boundary.break(true)
 
-                    var i = 0
-                    // Pre-validate and dump the log to the flat array
-                    logMap.foreachEntry { (ref, entry) =>
-                        // This code uses `boundary`/`break` because
-                        // foreachEntry is the only way to traverse the
-                        // map without allocating tuples, so throwing via `break`
-                        // is the workaround to short circuit
-                        if !ref.validate(entry) then boundary.break(false)
-                        array(i) = ref
-                        array(i + 1) = entry
-                        i += 2
+                        // Sort references by id to prevent deadlocks
+                        buffer.sort(size)
+
+                        val acquired = buffer.lock(tick, size, barge)
+                        if acquired != size then
+                            // Failed to acquire some locks - rollback and retry
+                            buffer.unlock(acquired)
+                            boundary.break(false)
+                        end if
+
+                        // Successfully locked all references - commit changes
+                        if !probe then buffer.commit(Tick.next(), size)
+
+                        // Release all locks
+                        buffer.unlock(size)
+                        true
                     }
-
-                    // Sort references by identity to prevent deadlocks
-                    quickSort(array, size)
-
-                    // Convenience accessors to the flat log
-                    inline def ref(idx: Int)   = array(idx * 2).asInstanceOf[TRef[Any]]
-                    inline def entry(idx: Int) = array(idx * 2 + 1).asInstanceOf[TRefLog.Entry[Any]]
-
-                    @tailrec def lock(idx: Int): Int =
-                        if idx == size then size
-                        else if !ref(idx).lock(entry(idx)) then idx
-                        else lock(idx + 1)
-
-                    @tailrec def unlock(idx: Int, upTo: Int): Unit =
-                        if idx < upTo then
-                            ref(idx).unlock(entry(idx))
-                            unlock(idx + 1, upTo)
-
-                    @tailrec def commit(idx: Int): Unit =
-                        if idx < size then
-                            ref(idx).commit(tid, entry(idx))
-                            commit(idx + 1)
-
-                    val acquired = lock(0)
-                    if acquired != size then
-                        // Failed to acquire some locks - rollback and retry
-                        unlock(0, acquired)
-                        boundary.break(false)
-                    end if
-
-                    // Successfully locked all references - commit changes
-                    if !probe then commit(0)
-
-                    // Release all locks
-                    unlock(0, size)
-                    true
                 }
         end match
     end commit
 
-    private def quickSort(array: Array[Any], size: Int): Unit =
-        def swap(i: Int, j: Int): Unit =
-            val temp = array(i)
-            array(i) = array(j)
-            array(j) = temp
-            val temp2 = array(i + 1)
-            array(i + 1) = array(j + 1)
-            array(j + 1) = temp2
-        end swap
-
-        def getHash(idx: Int): Int =
-            array(idx * 2).hashCode()
-
-        @tailrec def partitionLoop(low: Int, hi: Int, pivot: Int, i: Int, j: Int): Int =
-            if j >= hi then
-                swap(i * 2, pivot * 2)
-                i
-            else if getHash(j) < getHash(pivot) then
-                swap(i * 2, j * 2)
-                partitionLoop(low, hi, pivot, i + 1, j + 1)
-            else
-                partitionLoop(low, hi, pivot, i, j + 1)
-
-        def partition(low: Int, hi: Int): Int =
-            partitionLoop(low, hi, hi, low, low)
-
-        def loop(low: Int, hi: Int): Unit =
-            if low < hi then
-                val p = partition(low, hi)
-                loop(low, p - 1)
-                loop(p + 1, hi)
-
-        if size > 0 then
-            loop(0, size - 1)
-    end quickSort
 end STM
 
 /** A FailedTransaction exception that is thrown when a transaction fails to commit. Contains the frame where the failure occurred.
@@ -260,3 +264,9 @@ final class FailedTransaction(error: Maybe[Result.Error[?]] = Absent)(using Fram
                 case _             => error.show
         }
     )
+
+/** Number of commit attempts an STM transaction makes politely (yielding the write lock to any fresher reader) before it begins to barge,
+  * acquiring the lock regardless of `readTick`. Bounds writer starvation under sustained reader pressure to this many attempts while
+  * keeping the common, low-contention path fully polite. Configurable via the `kyo.bargeThreshold` system property.
+  */
+private[kyo] object bargeThreshold extends StaticFlag[Int](4, n => Right(n.max(0)))

@@ -1,0 +1,471 @@
+/*
+ * kyo_uring.c: real-symbol shim over liburing's static-inline helpers.
+ *
+ * Most of liburing's hot path (io_uring_get_sqe, every io_uring_prep_*, the
+ * set_data64 / cqe_get_data64 / cqe_seen accessors, peek_cqe, and the wait
+ * helpers) is `static inline` in <liburing.h>: it has no exported symbol, so it
+ * is unreachable by Panama's SymbolLookup.libraryLookup on the JVM or by Scala
+ * Native's @link. Each kyo_uring_* function below is a one-line wrapper that
+ * calls the inline helper and exposes it as a real exported symbol the
+ * IoUringBindings trait can resolve. liburing is statically linked into this
+ * shim, so the four directly-bound exports (io_uring_queue_init / queue_exit /
+ * submit / wait_cqes) resolve here too and the shipped artifact carries no
+ * runtime liburing dependency.
+ *
+ * macOS safety: io_uring is a Linux kernel feature and liburing exists only on
+ * Linux. The #if guard below selects the real liburing calls on Linux and a full
+ * set of failing stubs on every other platform (and on a Linux host that lacks the
+ * liburing headers), so the library builds with zero liburing symbols referenced
+ * and the C compiler needs no -luring there. Every symbol the binding names is
+ * still DEFINED off Linux, which is what keeps a macOS Scala Native link whole:
+ * this file is compiled on the machine that links, so the platform decision is
+ * made against the target rather than against whichever host published the
+ * artifact. io_uring's absence stays a runtime answer, kyo_uring_probe_available
+ * returning 0, and the backend probe reports it unavailable.
+ */
+#include "kyo_net_api.h"
+
+#if defined(__linux__) && __has_include(<liburing.h>)
+
+/* POLLRDHUP (peer half-close) is a Linux extension gated behind _GNU_SOURCE; define it before any header so kyo_uring_poll_peer_closed sees it. */
+#define _GNU_SOURCE 1
+
+#include <errno.h>
+#include <liburing.h>
+#include <poll.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+
+/* ---- ring sizing ---- */
+
+/* sizeof(struct io_uring): byte size the caller allocates for the ring Buffer. */
+KYO_NET_API long kyo_uring_sizeof(void) {
+    return (long)sizeof(struct io_uring);
+}
+
+/* ---- ring lifecycle ---- */
+
+/*
+ * io_uring_queue_init / queue_exit / submit are real exported liburing symbols, unlike the
+ * static-inline helpers the rest of this file wraps, so binding them directly would work on
+ * Linux. They are wrapped anyway so that EVERY symbol IoUringBindings names is owned by kyo
+ * and defined by this translation unit on every platform. A binding is emitted once, when kyo
+ * is compiled, but linked on the consumer's host; a direct `io_uring_*` extern therefore turns
+ * into an undefined symbol on any host without liburing (a macOS Scala Native link), even
+ * though the io_uring backend is never selected there. Routing through kyo_uring_* keeps this
+ * file's #if guard the single place the platform decision is made, on the machine that links.
+ *
+ * `entries` and `flags` are signed on the Scala side and unsigned in liburing; a negative
+ * would wrap to a huge unsigned ring depth at the cast, so both are refused at the C trust
+ * boundary (CWE-190) and reported as -EINVAL, the negative-errno convention queue_init uses.
+ */
+KYO_NET_API int kyo_uring_queue_init(int entries, struct io_uring* ring, int flags) {
+    if (entries <= 0 || flags < 0) return -EINVAL;
+    return io_uring_queue_init((unsigned)entries, ring, (unsigned)flags);
+}
+
+/* io_uring_queue_exit: tear the ring down and release its mapped queues. */
+KYO_NET_API void kyo_uring_queue_exit(struct io_uring* ring) {
+    io_uring_queue_exit(ring);
+}
+
+/* io_uring_submit: hand the prepared SQEs to the kernel. Returns the submitted count or -errno. */
+KYO_NET_API int kyo_uring_submit(struct io_uring* ring) {
+    return io_uring_submit(ring);
+}
+
+/* ---- SQE acquisition + preparation ---- */
+
+/* io_uring_get_sqe: next free SQE, or NULL (Absent) when the submission queue is full. */
+KYO_NET_API struct io_uring_sqe* kyo_uring_get_sqe(struct io_uring* ring) {
+    return io_uring_get_sqe(ring);
+}
+
+/*
+ * Non-negativity guard at the C trust boundary (CWE-190 / CWE-195 / CWE-805): the
+ * length args below are signed (int nbytes / long len) on the Scala side but the
+ * io_uring_prep_* helpers take an unsigned (unsigned / size_t). A negative length
+ * would wrap to a huge unsigned at the cast and become an out-of-bounds kernel
+ * read/write at submission. So each prep_* function checks the length BEFORE the
+ * cast and refuses to prepare the SQE when it is negative, returning -1 (rejected)
+ * instead of 0 (prepared). The Scala caller (IoUringDriver) maps a non-zero return
+ * to an OBSERVABLE failure (fails the read/write promise) rather than letting it pass
+ * silently: a bare drop here would leave the ring waiting on a CQE that never comes.
+ * For a non-negative length the guard is a no-op (the cast proceeds unchanged); today's
+ * callers always pass a positive length, so this only guards against a future signedness bug.
+ */
+
+KYO_NET_API int kyo_uring_prep_read(struct io_uring_sqe* sqe, int fd, void* buf, int nbytes, long offset) {
+    if (nbytes < 0) return -1;
+    io_uring_prep_read(sqe, fd, buf, (unsigned)nbytes, (__u64)offset);
+    return 0;
+}
+
+KYO_NET_API int kyo_uring_prep_write(struct io_uring_sqe* sqe, int fd, void* buf, int nbytes, long offset) {
+    if (nbytes < 0) return -1;
+    io_uring_prep_write(sqe, fd, buf, (unsigned)nbytes, (__u64)offset);
+    return 0;
+}
+
+KYO_NET_API int kyo_uring_prep_recv(struct io_uring_sqe* sqe, int fd, void* buf, long len, int flags) {
+    if (len < 0) return -1;
+    io_uring_prep_recv(sqe, fd, buf, (size_t)len, flags);
+    return 0;
+}
+
+KYO_NET_API int kyo_uring_prep_send(struct io_uring_sqe* sqe, int fd, void* buf, long len, int flags) {
+    if (len < 0) return -1;
+    io_uring_prep_send(sqe, fd, buf, (size_t)len, flags);
+    return 0;
+}
+
+KYO_NET_API void kyo_uring_prep_accept(struct io_uring_sqe* sqe, int fd, void* addr, void* addrlen, int flags) {
+    io_uring_prep_accept(sqe, fd, (struct sockaddr*)addr, (socklen_t*)addrlen, flags);
+}
+
+/* Multishot accept: IORING_OP_ACCEPT with IORING_ACCEPT_MULTISHOT. One submission re-fires an accept CQE per incoming connection. */
+KYO_NET_API void kyo_uring_prep_multishot_accept(struct io_uring_sqe* sqe, int fd, void* addr, void* addrlen, int flags) {
+    io_uring_prep_multishot_accept(sqe, fd, (struct sockaddr*)addr, (socklen_t*)addrlen, flags);
+}
+
+/* Kernel version as major*1000+minor (e.g. 6.1 -> 6001) via uname(2). Returns 0 on failure. */
+KYO_NET_API int kyo_uring_kernel_version(void) {
+    struct utsname u;
+    if (uname(&u) != 0) return 0;
+    int major = 0, minor = 0;
+    if (sscanf(u.release, "%d.%d", &major, &minor) != 2) return 0;
+    return major * 1000 + minor;
+}
+
+/* Read the kernel feature bits from an already-initialized ring (ring->features, set by io_uring_queue_init).
+ * IORING_FEAT_NODROP (bit 1, = 2, kernel >= 5.5): the kernel never drops a CQE; it applies backpressure on
+ * submit instead. When set, the wake eventfd's multishot CQE cannot be lost under any load, making the
+ * indefinite park safe by kernel contract. */
+KYO_NET_API unsigned int kyo_uring_get_features(struct io_uring* ring) {
+    return ring->features;
+}
+
+/* CQE flags word. IORING_CQE_F_MORE (= 2) set means more completions are coming on this key before it is removed. */
+KYO_NET_API int kyo_uring_cqe_get_flags(long cqe) {
+    return ((struct io_uring_cqe*)(intptr_t)cqe)->flags;
+}
+
+/* IORING_RECV_MULTISHOT flag value for kyo_uring_prep_recv's flags argument. */
+KYO_NET_API int kyo_uring_recv_multishot_flag(void) {
+    return IORING_RECV_MULTISHOT;
+}
+
+/*
+ * Fused submit-and-wait: one io_uring_enter both submits prepared SQEs and waits for the next CQE.
+ * Returns 0 on a ready CQE, -ETIME on timeout, -errno otherwise.
+ *
+ * liburing's io_uring_submit_and_wait_timeout returns the count of SQEs submitted (>= 0) on success
+ * (with wait_nr=1 guaranteeing at least one CQE ready), -ETIME on timeout, or -errno on failure.
+ * We normalize: any non-negative ret means "CQE ready" and we return 0. Negative ret passes through
+ * unchanged so -ETIME and real errors are still distinguishable.
+ */
+KYO_NET_API int kyo_uring_submit_and_wait_timeout(struct io_uring* ring, void* cqePtr, long timeoutNs) {
+    struct __kernel_timespec ts;
+    struct __kernel_timespec* tsp = NULL;
+    /* timeoutNs < 0 => NULL timespec => wait indefinitely for at least one CQE (woken by a real completion or by the
+     * driver's wake eventfd POLL_ADD). A non-negative timeoutNs keeps the bounded-park behavior. */
+    if (timeoutNs >= 0) {
+        ts.tv_sec  = (long long)(timeoutNs / 1000000000L);
+        ts.tv_nsec = (long long)(timeoutNs % 1000000000L);
+        tsp = &ts;
+    }
+    struct io_uring_cqe* cqe = NULL;
+    int ret = io_uring_submit_and_wait_timeout(ring, &cqe, 1, tsp, NULL);
+    *((struct io_uring_cqe**)cqePtr) = cqe;
+    return ret >= 0 ? 0 : ret;
+}
+
+/* Multishot poll: IORING_OP_POLL_ADD with IORING_POLL_ADD_MULTI. One submission re-fires a CQE every time `fd`
+ * becomes readable for `poll_mask` (e.g. POLLIN), staying armed across completions (each carries IORING_CQE_F_MORE).
+ * Used to arm a persistent watch on the driver's wake eventfd: a cross-carrier eventfd_write makes the eventfd
+ * readable, the armed poll fires a CQE, and the parked submit_and_wait returns so the reap loop drains its queue. */
+KYO_NET_API void kyo_uring_prep_poll_multishot(struct io_uring_sqe* sqe, int fd, int poll_mask) {
+    io_uring_prep_poll_multishot(sqe, fd, (unsigned)poll_mask);
+}
+
+/*
+ * Non-blocking poll(2) for a backpressured fd's peer-close state, off the io_uring ring (a parked ReadPump arms no recv, so a peer FIN/RST cannot
+ * surface through a completion; the grace poll asks the kernel directly). POLLRDHUP surfaces the peer half-close even when the receive buffer is
+ * FULL of undrained data (the FIN sits behind it, so a MSG_PEEK recv would return those bytes and never see the FIN). POLLHUP and POLLERR (e.g. RST)
+ * are always reported in revents regardless of the events mask, hence the wider revents check. Returns 1 peer gone, 0 open, -1 on a poll error.
+ */
+KYO_NET_API int kyo_uring_poll_peer_closed(int fd) {
+    struct pollfd pfd;
+    pfd.fd      = fd;
+    pfd.events  = POLLRDHUP;
+    pfd.revents = 0;
+    int r = poll(&pfd, 1, 0);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    return (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR)) != 0 ? 1 : 0;
+}
+
+KYO_NET_API void kyo_uring_prep_connect(struct io_uring_sqe* sqe, int fd, void* addr, int addrlen) {
+    io_uring_prep_connect(sqe, fd, (struct sockaddr*)addr, (socklen_t)addrlen);
+}
+
+/*
+ * io_uring_prep_cancel64: ask the kernel to cancel the in-flight op carrying user_data.
+ * The submission this targets is identified by its key, not by its fd, because a connect
+ * SQE is backed by an internal poll wait that close(2) alone does not complete: without
+ * this the op never reaps, so no completion ever decrements the caller's in-flight count.
+ */
+KYO_NET_API void kyo_uring_prep_cancel64(struct io_uring_sqe* sqe, long user_data, int flags) {
+    io_uring_prep_cancel64(sqe, (__u64)user_data, flags);
+}
+
+/*
+ * io_uring_prep_nop: make an already-acquired SQE into a no-op.
+ *
+ * io_uring_get_sqe advances the submission tail as it hands the entry out, so the
+ * slot is committed to the kernel from that moment: there is no way to give it back.
+ * A caller that acquires an SQE and then cannot use it (a marshalling failure, a
+ * rejected length) must therefore leave something WELL-DEFINED in the slot. liburing
+ * does not clear a reused SQE, so an abandoned one carries whatever the previous
+ * occupant wrote and would re-issue that stale opcode against a stale fd. Preparing
+ * a nop is what makes abandonment safe; the caller still has to set a user_data the
+ * completion side recognises and drops.
+ */
+KYO_NET_API void kyo_uring_prep_nop(struct io_uring_sqe* sqe) {
+    io_uring_prep_nop(sqe);
+}
+
+/* io_uring_sqe_set_data64: store the per-op key the completion is matched against. */
+KYO_NET_API void kyo_uring_sqe_set_data64(struct io_uring_sqe* sqe, long data) {
+    io_uring_sqe_set_data64(sqe, (__u64)data);
+}
+
+/* ---- completion reaping ---- */
+
+/*
+ * Bounded wait: wrap io_uring_wait_cqes with a __kernel_timespec so the
+ * carrier is returned each timeoutNs cycle. The ready CQE pointer is written into
+ * the 1-element cqePtr buffer. Returns 0 on a ready CQE, -ETIME on timeout,
+ * -errno otherwise (the negated return io_uring_wait_cqes already yields).
+ */
+KYO_NET_API int kyo_uring_wait_cqe_timeout(struct io_uring* ring, void* cqePtr, long timeoutNs) {
+    struct __kernel_timespec ts;
+    ts.tv_sec  = (long long)(timeoutNs / 1000000000L);
+    ts.tv_nsec = (long long)(timeoutNs % 1000000000L);
+    struct io_uring_cqe* cqe = NULL;
+    int ret = io_uring_wait_cqes(ring, &cqe, 1, &ts, NULL);
+    *((struct io_uring_cqe**)cqePtr) = cqe;
+    return ret;
+}
+
+/*
+ * io_uring_peek_cqe: drain the next already-ready CQE into cqePtr without
+ * blocking. Returns 0 when one was placed, nonzero (-EAGAIN) when the completion
+ * queue is empty.
+ */
+KYO_NET_API int kyo_uring_peek_cqe(struct io_uring* ring, void* cqePtr) {
+    struct io_uring_cqe* cqe = NULL;
+    int ret = io_uring_peek_cqe(ring, &cqe);
+    *((struct io_uring_cqe**)cqePtr) = cqe;
+    return ret;
+}
+
+/* io_uring_cqe_get_data64: read back the key set with kyo_uring_sqe_set_data64. */
+KYO_NET_API long kyo_uring_cqe_get_data64(long cqe) {
+    return (long)io_uring_cqe_get_data64((struct io_uring_cqe*)cqe);
+}
+
+/* CQE result: >= 0 is the byte count or accepted fd, < 0 is -errno. */
+KYO_NET_API int kyo_uring_cqe_res(long cqe) {
+    return ((struct io_uring_cqe*)cqe)->res;
+}
+
+/* io_uring_cqe_seen: advance the completion queue past cqe. */
+KYO_NET_API void kyo_uring_cqe_seen(struct io_uring* ring, long cqe) {
+    io_uring_cqe_seen(ring, (struct io_uring_cqe*)cqe);
+}
+
+/* ---- reap-loop wakeup eventfd ---- */
+
+/*
+ * eventfd(2) counter used to wake the reap loop. The reap carrier owns the ring and is the only producer of SQEs, so a
+ * cross-carrier submission (an app fiber arming a recv, a write, a close) cannot enter the SQ itself; it enqueues the op
+ * and writes this eventfd. A persistent multishot POLL_ADD (kyo_uring_prep_poll_multishot) armed on the eventfd then
+ * fires a CQE, returning the parked submit_and_wait so the reap loop drains its queue. eventfd_write is atomic and safe
+ * from any carrier without touching the SQ. Created EFD_NONBLOCK | EFD_CLOEXEC by the caller.
+ */
+KYO_NET_API int kyo_uring_eventfd_create(int initval, int flags) {
+    return eventfd((unsigned int)initval, flags);
+}
+
+/* Add 1 to the counter (thread-safe), making the eventfd readable so the armed multishot poll fires. Returns 0 or -1/errno. */
+KYO_NET_API int kyo_uring_eventfd_write(int fd) {
+    return eventfd_write(fd, (eventfd_t)1);
+}
+
+/* Drain the counter back to 0 after a wake so the level-readable eventfd does not immediately re-fire the poll. With
+ * EFD_NONBLOCK a single read returns the whole accumulated count, or -1/EAGAIN when already drained. Returns 0 or -1. */
+KYO_NET_API int kyo_uring_eventfd_read(int fd) {
+    eventfd_t v;
+    return eventfd_read(fd, &v);
+}
+
+/* close(2) the wake eventfd at ring teardown. Synchronous; returns 0 or -1/errno. */
+KYO_NET_API int kyo_uring_eventfd_close(int fd) {
+    return close(fd);
+}
+
+/* ---- availability probe ---- */
+
+/*
+ * One-shot availability probe for the io_uring backend's isAvailable: set up a ring at the default
+ * production depth (256, the floor IoUringDriver.init uses) then tear it down. Returns 1 when
+ * io_uring_queue_init succeeds (the kernel supports io_uring and the runtime is not sandboxed away from
+ * it), 0 otherwise. Marshalled as a platform int (1/0) the Boolean binding reads back.
+ *
+ * Probing at production depth (not a token depth of 2) is deliberate: on some sandboxes (containers
+ * with a restrictive RLIMIT_MEMLOCK or seccomp policy) a tiny ring initializes but a production-depth
+ * ring does not. A depth-2 probe would then report io_uring available and selection would build the
+ * real driver only for its production-depth queue_init to fail, so the probe must exercise the depth
+ * the driver actually uses.
+ */
+KYO_NET_API int kyo_uring_probe_available(int depth) {
+    struct io_uring ring;
+    int ret = io_uring_queue_init(depth, &ring, 0);
+    if (ret != 0) return 0;
+    io_uring_queue_exit(&ring);
+    return 1;
+}
+
+#else
+
+/*
+ * Non-Linux (or Linux without liburing headers): every kyo_uring_* entry point is
+ * defined here as a stub that reports failure. No liburing symbol is referenced,
+ * so the shared library still links with no -luring on these hosts.
+ *
+ * The stubs exist because the Scala binding is emitted when kyo is COMPILED while
+ * the Scala Native link happens on the CONSUMER's host. An artifact published from
+ * Linux carries @extern declarations for all 30 symbols; leaving this translation
+ * unit empty off Linux made those symbols undefined at a macOS link ("ld: symbol(s)
+ * not found for architecture arm64") and no user-side flag could remove them, since
+ * backend selection is a runtime decision and every backend is statically reachable.
+ * Defining the symbols here keeps the link graph whole on every target and leaves
+ * io_uring's absence where it belongs: kyo_uring_probe_available returns 0, so the
+ * backend probe reports it unavailable and selection falls through.
+ *
+ * struct io_uring and struct io_uring_sqe do not exist off Linux; the stubs take
+ * void* where the Linux definitions take those pointers, which is the same ABI and
+ * the same Ptr[Byte] the generated binding passes.
+ */
+
+#include <errno.h>
+
+KYO_NET_API long kyo_uring_sizeof(void) { return 0; }
+
+KYO_NET_API int kyo_uring_queue_init(int entries, void* ring, int flags) {
+    (void)entries; (void)ring; (void)flags;
+    return -ENOSYS;
+}
+
+KYO_NET_API void kyo_uring_queue_exit(void* ring) { (void)ring; }
+
+KYO_NET_API int kyo_uring_submit(void* ring) { (void)ring; return -ENOSYS; }
+
+KYO_NET_API void* kyo_uring_get_sqe(void* ring) { (void)ring; return 0; }
+
+KYO_NET_API int kyo_uring_prep_read(void* sqe, int fd, void* buf, int nbytes, long offset) {
+    (void)sqe; (void)fd; (void)buf; (void)nbytes; (void)offset;
+    return -1;
+}
+
+KYO_NET_API int kyo_uring_prep_write(void* sqe, int fd, void* buf, int nbytes, long offset) {
+    (void)sqe; (void)fd; (void)buf; (void)nbytes; (void)offset;
+    return -1;
+}
+
+KYO_NET_API int kyo_uring_prep_recv(void* sqe, int fd, void* buf, long len, int flags) {
+    (void)sqe; (void)fd; (void)buf; (void)len; (void)flags;
+    return -1;
+}
+
+KYO_NET_API int kyo_uring_prep_send(void* sqe, int fd, void* buf, long len, int flags) {
+    (void)sqe; (void)fd; (void)buf; (void)len; (void)flags;
+    return -1;
+}
+
+KYO_NET_API void kyo_uring_prep_accept(void* sqe, int fd, void* addr, void* addrlen, int flags) {
+    (void)sqe; (void)fd; (void)addr; (void)addrlen; (void)flags;
+}
+
+KYO_NET_API void kyo_uring_prep_multishot_accept(void* sqe, int fd, void* addr, void* addrlen, int flags) {
+    (void)sqe; (void)fd; (void)addr; (void)addrlen; (void)flags;
+}
+
+KYO_NET_API int kyo_uring_kernel_version(void) { return 0; }
+
+KYO_NET_API unsigned int kyo_uring_get_features(void* ring) { (void)ring; return 0; }
+
+KYO_NET_API int kyo_uring_cqe_get_flags(long cqe) { (void)cqe; return 0; }
+
+KYO_NET_API int kyo_uring_recv_multishot_flag(void) { return 0; }
+
+KYO_NET_API int kyo_uring_submit_and_wait_timeout(void* ring, void* cqePtr, long timeoutNs) {
+    (void)ring; (void)cqePtr; (void)timeoutNs;
+    return -ENOSYS;
+}
+
+KYO_NET_API void kyo_uring_prep_poll_multishot(void* sqe, int fd, int poll_mask) {
+    (void)sqe; (void)fd; (void)poll_mask;
+}
+
+KYO_NET_API int kyo_uring_poll_peer_closed(int fd) { (void)fd; return 0; }
+
+KYO_NET_API void kyo_uring_prep_connect(void* sqe, int fd, void* addr, int addrlen) {
+    (void)sqe; (void)fd; (void)addr; (void)addrlen;
+}
+
+KYO_NET_API void kyo_uring_prep_cancel64(void* sqe, long user_data, int flags) {
+    (void)sqe; (void)user_data; (void)flags;
+}
+
+KYO_NET_API void kyo_uring_prep_nop(void* sqe) { (void)sqe; }
+
+KYO_NET_API void kyo_uring_sqe_set_data64(void* sqe, long data) { (void)sqe; (void)data; }
+
+KYO_NET_API int kyo_uring_wait_cqe_timeout(void* ring, void* cqePtr, long timeoutNs) {
+    (void)ring; (void)cqePtr; (void)timeoutNs;
+    return -ENOSYS;
+}
+
+KYO_NET_API int kyo_uring_peek_cqe(void* ring, void* cqePtr) {
+    (void)ring; (void)cqePtr;
+    return -ENOSYS;
+}
+
+KYO_NET_API long kyo_uring_cqe_get_data64(long cqe) { (void)cqe; return 0; }
+
+KYO_NET_API int kyo_uring_cqe_res(long cqe) { (void)cqe; return -ENOSYS; }
+
+KYO_NET_API void kyo_uring_cqe_seen(void* ring, long cqe) { (void)ring; (void)cqe; }
+
+KYO_NET_API int kyo_uring_eventfd_create(int initval, int flags) {
+    (void)initval; (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+KYO_NET_API int kyo_uring_eventfd_write(int fd) { (void)fd; errno = ENOSYS; return -1; }
+
+KYO_NET_API int kyo_uring_eventfd_read(int fd) { (void)fd; errno = ENOSYS; return -1; }
+
+KYO_NET_API int kyo_uring_eventfd_close(int fd) { (void)fd; errno = ENOSYS; return -1; }
+
+KYO_NET_API int kyo_uring_probe_available(int depth) { (void)depth; return 0; }
+
+#endif

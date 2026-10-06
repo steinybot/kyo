@@ -1,7 +1,8 @@
 package kyo.grpc.internal
 
 import io.grpc.ClientCall.Listener
-import io.grpc.{Metadata, Status}
+import io.grpc.Metadata
+import io.grpc.Status
 import kyo.*
 import kyo.grpc.CallClosed
 
@@ -25,6 +26,7 @@ private[grpc] class ServerStreamingClientCallListener[Response](
         given Frame = Frame.internal
         discard(responseChannel.unsafe.closeAwaitEmpty())
         completionPromise.unsafe.completeDiscard(Result.succeed(CallClosed(status, trailers)))
+        readySignal.unsafe.set(true)
     end onClose
 
     override def onReady(): Unit =

@@ -1,0 +1,763 @@
+package kyo.ffi.sbt
+
+import java.io.File
+import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.matchers.should.Matchers
+
+class CCompilerTest extends AnyFunSuite with Matchers {
+
+    // --- Compiler-family detection -------------------------------------------
+
+    test("detectFamily: gcc") {
+        CCompiler.detectFamily("cc") shouldBe CCompiler.Gcc
+        CCompiler.detectFamily("gcc") shouldBe CCompiler.Gcc
+        CCompiler.detectFamily("/usr/bin/gcc") shouldBe CCompiler.Gcc
+        CCompiler.detectFamily("/usr/local/bin/gcc-14") shouldBe CCompiler.Gcc
+    }
+
+    test("detectFamily: clang") {
+        CCompiler.detectFamily("clang") shouldBe CCompiler.Clang
+        CCompiler.detectFamily("/usr/bin/clang") shouldBe CCompiler.Clang
+        CCompiler.detectFamily("clang-18") shouldBe CCompiler.Clang
+    }
+
+    test("detectFamily: MSVC (cl.exe)") {
+        CCompiler.detectFamily("cl.exe") shouldBe CCompiler.Msvc
+        CCompiler.detectFamily("C:\\VS\\cl.exe") shouldBe CCompiler.Msvc
+        CCompiler.detectFamily("C:/tools/bin/cl.exe") shouldBe CCompiler.Msvc
+        CCompiler.detectFamily("cl") shouldBe CCompiler.Msvc
+    }
+
+    test("detectFamily: zig cc") {
+        CCompiler.detectFamily("zig cc") shouldBe CCompiler.ZigCc
+        CCompiler.detectFamily("/usr/bin/zig cc") shouldBe CCompiler.ZigCc
+        CCompiler.detectFamily("zig") shouldBe CCompiler.ZigCc
+    }
+
+    // --- MSVC flag translation -----------------------------------------------
+
+    test("translateFlagMsvc: -shared → /LD") {
+        CCompiler.translateFlagMsvc("-shared") shouldBe Seq("/LD")
+    }
+
+    test("translateFlagMsvc: -fPIC drops") {
+        CCompiler.translateFlagMsvc("-fPIC") shouldBe Nil
+    }
+
+    test("translateFlagMsvc: -O2 → /O2") {
+        CCompiler.translateFlagMsvc("-O2") shouldBe Seq("/O2")
+    }
+
+    test("translateFlagMsvc: -Wall → /W3") {
+        CCompiler.translateFlagMsvc("-Wall") shouldBe Seq("/W3")
+    }
+
+    test("translateFlagMsvc: -I<dir> → /I<dir>") {
+        CCompiler.translateFlagMsvc("-I/path/to/headers") shouldBe Seq("/I/path/to/headers")
+    }
+
+    test("translateFlagMsvc: -l<name> → <name>.lib") {
+        CCompiler.translateFlagMsvc("-lssl") shouldBe Seq("ssl.lib")
+    }
+
+    test("translateFlagMsvc: unknown flag passes through") {
+        CCompiler.translateFlagMsvc("-DFOO=1") shouldBe Seq("-DFOO=1")
+    }
+
+    // --- buildCommand shape: gcc ---------------------------------------------
+
+    test("buildCommand: gcc POSIX shape") {
+        val src = new File("/tmp/foo.c")
+        val out = new File("/tmp/libkyo_tcp-linux-x86_64.so")
+        val inc = new File("/tmp/include")
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC", "-Wall"),
+            linkFlags = Seq("-pthread"),
+            linkLibs = Seq("ssl", "crypto"),
+            sources = Seq(src),
+            includes = Seq(inc),
+            outFile = out,
+            staticLink = false
+        )
+        cmd.head shouldBe "gcc"
+        cmd should contain("-shared")
+        cmd should contain("-O2")
+        cmd should contain("-fPIC")
+        cmd should contain("-Wall")
+        cmd.containsSlice(Seq("-I", inc.getAbsolutePath)) shouldBe true
+        cmd should contain(src.getAbsolutePath)
+        cmd.containsSlice(Seq("-o", out.getAbsolutePath)) shouldBe true
+        cmd should contain("-lssl")
+        cmd should contain("-lcrypto")
+        cmd should contain("-pthread")
+    }
+
+    test("buildCommand: an MSVC DLL gets the dynamic CRT, so it shares errno with its loader") {
+        // cl defaults to the static CRT, which gives the library a private errno the host's Panama
+        // capture cannot see. staticLink is about vendored archives and must not change this.
+        val cmd = CCompiler.buildCommand(
+            cc = "cl",
+            family = CCompiler.Msvc,
+            cFlags = Seq("-O2", "-Wall"),
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/foo.dll"),
+            staticLink = true,
+            os = "windows"
+        )
+        cmd should contain("/MD")
+        cmd should not contain "/MT"
+    }
+
+    test("buildCommand: an explicit CRT model in cFlags is kept, not overridden") {
+        val cmd = CCompiler.buildCommand(
+            cc = "cl",
+            family = CCompiler.Msvc,
+            cFlags = Seq("/MT", "-O2"),
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/foo.dll"),
+            staticLink = false,
+            os = "windows"
+        )
+        cmd should contain("/MT")
+        cmd.count(_ == "/MD") shouldBe 0
+    }
+
+    test("buildCommand: a gcc-style Windows compile drops -fPIC, which clang-msvc rejects") {
+        // A gcc-style compiler may target Windows: on aarch64 the image's MinGW gcc emits
+        // x64 objects. clang targeting aarch64-pc-windows-msvc errors on -fPIC rather than ignoring it,
+        // so a Windows DLL built through the gcc-style path must not carry it. cl gets the same result
+        // through translateFlagMsvc.
+        val cmd = CCompiler.buildCommand(
+            cc = "clang",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC", "-Wall"),
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/kyonet_posix_uring-windows-aarch64.dll"),
+            staticLink = false,
+            os = "windows"
+        )
+        cmd should not contain "-fPIC"
+        cmd should contain("-O2")
+        cmd should contain("-Wall")
+    }
+
+    test("buildCommand: a gcc-style non-Windows compile keeps -fPIC") {
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC", "-Wall"),
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/libfoo-linux-x86_64.so"),
+            staticLink = false,
+            os = "linux"
+        )
+        cmd should contain("-fPIC")
+    }
+
+    test("buildCommand: MSVC routes /LIBPATH and libs through /link so the linker finds a vendored .lib") {
+        // Regression: `/LIBPATH:` is a linker option cl silently ignores on the compiler command line,
+        // so a vendored library named by linkLibs + libDirs (e.g. aeron_driver_static.lib staged under a
+        // build dir) is unfindable unless the search dir and the lib follow `/link` (LNK1181 otherwise).
+        val src    = new File("/tmp/kyo_aeron.c")
+        val out    = new File("/tmp/kyo_aeron-windows-x86_64.dll")
+        val libDir = new File("/tmp/staged/lib")
+        val cmd    = CCompiler.buildCommand(
+            cc = "cl",
+            family = CCompiler.Msvc,
+            cFlags = Seq("/MD"),
+            linkFlags = Nil,
+            linkLibs = Seq("aeron_driver_static", "ws2_32"),
+            sources = Seq(src),
+            includes = Nil,
+            outFile = out,
+            staticLink = false,
+            libDirs = Seq(libDir),
+            os = "windows"
+        )
+        val linkIdx    = cmd.indexOf("/link")
+        val libPathIdx = cmd.indexWhere(_ == "/LIBPATH:" + libDir.getAbsolutePath)
+        val libIdx     = cmd.indexOf("aeron_driver_static.lib")
+        linkIdx should be >= 0
+        libPathIdx should be > linkIdx
+        libIdx should be > linkIdx
+        cmd should contain("ws2_32.lib")
+    }
+
+    test("buildCommand: linkFlags (C++ runtime) come AFTER linkLibs so GNU ld resolves archive C++ symbols") {
+        // Regression: a vendored C++ static archive (e.g. BoringSSL) needs its C++ runtime (-lstdc++ / -lc++)
+        // AFTER the archive on the GNU ld command line; before, ld leaves the archive's C++ symbols undefined
+        // and the loadable .so fails to dlopen. The runtime is passed via linkFlags; the archives via linkLibs.
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Nil,
+            linkFlags = Seq("-lstdc++"),
+            linkLibs = Seq("ssl", "crypto"),
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = true,
+            libDirs = Seq(new File("/tmp/staged/lib")),
+            os = "linux"
+        )
+        cmd.indexOf("-lstdc++") should be > cmd.indexOf("-lssl")
+        cmd.indexOf("-lstdc++") should be > cmd.indexOf("-lcrypto")
+    }
+
+    test("buildCommand: clang same POSIX shape as gcc") {
+        val src = new File("/tmp/foo.c")
+        val out = new File("/tmp/libfoo.dylib")
+        val cmd = CCompiler.buildCommand(
+            cc = "clang",
+            family = CCompiler.Clang,
+            cFlags = Seq("-O2"),
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(src),
+            includes = Nil,
+            outFile = out,
+            staticLink = false
+        )
+        cmd.head shouldBe "clang"
+        cmd should contain("-shared")
+        cmd should contain("-O2")
+        cmd should contain(src.getAbsolutePath)
+        cmd.containsSlice(Seq("-o", out.getAbsolutePath)) shouldBe true
+    }
+
+    test("buildCommand: zig cc uses gcc/clang-style flags but splits into 2 argv tokens") {
+        val src = new File("/tmp/foo.c")
+        val out = new File("/tmp/libfoo.so")
+        val cmd = CCompiler.buildCommand(
+            cc = "zig cc",
+            family = CCompiler.ZigCc,
+            cFlags = Seq("-O2", "-fPIC"),
+            linkFlags = Nil,
+            linkLibs = Seq("m"),
+            sources = Seq(src),
+            includes = Nil,
+            outFile = out,
+            staticLink = false
+        )
+        cmd.take(2) shouldBe Seq("zig", "cc")
+        cmd should contain("-shared")
+        cmd should contain("-fPIC")
+        cmd should contain("-lm")
+    }
+
+    // --- buildCommand shape: MSVC --------------------------------------------
+
+    test("buildCommand: MSVC cl.exe shape") {
+        val src = new File("C:/tmp/foo.c")
+        val out = new File("C:/tmp/kyo_tcp-windows-x86_64.dll")
+        val inc = new File("C:/tmp/include")
+        val cmd = CCompiler.buildCommand(
+            cc = "cl.exe",
+            family = CCompiler.Msvc,
+            cFlags = Seq("-O2", "-fPIC", "-Wall"),
+            linkFlags = Nil,
+            linkLibs = Seq("ws2_32"),
+            sources = Seq(src),
+            includes = Seq(inc),
+            outFile = out,
+            staticLink = false
+        )
+        cmd.head shouldBe "cl.exe"
+        cmd should contain("/LD")
+        cmd should contain("/O2")
+        cmd should contain("/W3")
+        cmd should contain("/I" + inc.getAbsolutePath)
+        cmd should contain("/Fo:" + out.getAbsoluteFile.getParentFile.getAbsolutePath + File.separator)
+        cmd should contain("/Fe:" + out.getAbsolutePath)
+        cmd should contain("ws2_32.lib")
+        // -fPIC is dropped on Windows (PIC is default for DLLs):
+        cmd.exists(_.toLowerCase.contains("fpic")) shouldBe false
+    }
+
+    // --- Static-link flag matrix --------------------------------------------
+
+    test("staticLink: gcc folds named libs via -Wl,-Bstatic … -Wl,-Bdynamic (no bare -static)") {
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Seq("uring"),
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = true
+        )
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic")) shouldBe true
+        cmd should not contain ("-static")
+        cmd should not contain ("-static-libgcc")
+        cmd should not contain ("-static-libstdc++")
+    }
+
+    test("staticLink: clang folds named libs via -Wl,-Bstatic … -Wl,-Bdynamic (no bare -static)") {
+        val cmd = CCompiler.buildCommand(
+            cc = "clang",
+            family = CCompiler.Clang,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Seq("uring"),
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = true
+        )
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic")) shouldBe true
+        cmd should not contain ("-static")
+    }
+
+    test("staticLink: zig folds named libs via -Wl,-Bstatic … -Wl,-Bdynamic (no bare -static)") {
+        val cmd = CCompiler.buildCommand(
+            cc = "zig cc",
+            family = CCompiler.ZigCc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Seq("m"),
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = true
+        )
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-lm", "-Wl,-Bdynamic")) shouldBe true
+        cmd should not contain ("-static")
+    }
+
+    test("staticLink: no-op when linkLibs is empty (gcc), no -Wl,-Bstatic, no -static") {
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = true
+        )
+        cmd should not contain ("-Wl,-Bstatic")
+        cmd should not contain ("-Wl,-Bdynamic")
+        cmd should not contain ("-static")
+    }
+
+    test("staticLink: io_uring regression, gcc + linkLibs=uring produces a valid -shared link") {
+        // Reproduces the real failure: `-static` + `-shared` pulled libc.a into the .so and
+        // GNU ld failed on __fini_array_* / _dl_debug_state. The fix scopes static linking to
+        // liburing only via the -Bstatic/-Bdynamic toggle so libc stays dynamic.
+        val cmd = CCompiler.buildCommand(
+            cc = "cc",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC"),
+            linkFlags = Nil,
+            linkLibs = Seq("uring"),
+            sources = Seq(new File("/tmp/kyo_uring.c")),
+            includes = Nil,
+            outFile = new File("/tmp/libkyonet_posix_uring-linux-aarch64.so"),
+            staticLink = true
+        )
+        cmd should contain("-shared")
+        // liburing is folded statically; libc/everything-else stays dynamic:
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic")) shouldBe true
+        cmd should not contain ("-static")
+        // -luring must appear inside the -Bstatic window, never as a bare dynamic -l:
+        val bStatic = cmd.indexOf("-Wl,-Bstatic")
+        val luring  = cmd.indexOf("-luring")
+        val bDyn    = cmd.indexOf("-Wl,-Bdynamic")
+        assert(bStatic >= 0 && luring > bStatic && bDyn > luring)
+    }
+
+    test("staticLink: MSVC does NOT let it pick the CRT model") {
+        // staticLink folds vendored third-party archives in; /MT swaps the CRT. They are different
+        // things, and a DLL built with the static CRT gets a private errno and malloc heap its loader
+        // cannot read. The DLL keeps the dynamic CRT whatever staticLink says.
+        val cmd = CCompiler.buildCommand(
+            cc = "cl.exe",
+            family = CCompiler.Msvc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("C:/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("C:/tmp/out.dll"),
+            staticLink = true
+        )
+        cmd should contain("/MD")
+        cmd should not contain "/MT"
+    }
+
+    test("staticLink: false produces no static flags (gcc)") {
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Nil,
+            outFile = new File("/tmp/out.so"),
+            staticLink = false
+        )
+        cmd should not contain ("-static")
+        cmd should not contain ("-static-libgcc")
+        cmd should not contain ("-static-libstdc++")
+    }
+
+    test("foldedLinkLibFlags: static folds via -Wl,-Bstatic … -Wl,-Bdynamic; non-static is plain; empty is Nil") {
+        CCompiler.foldedLinkLibFlags(Seq("uring"), staticLink = true) shouldBe
+            Seq("-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic")
+        CCompiler.foldedLinkLibFlags(Seq("uring"), staticLink = false) shouldBe
+            Seq("-luring")
+        CCompiler.foldedLinkLibFlags(Nil, staticLink = true) shouldBe Nil
+    }
+
+    // --- Vendored static-archive link flags (BoringSSL: libDirs + os-dependent toggle) --------
+
+    test("vendoredArchiveLinkFlags: linux static emits -L<dir> + the -Bstatic fold") {
+        val libDir = new File("/tmp/bssl/lib")
+        val flags  = CCompiler.vendoredArchiveLinkFlags(Seq(libDir), Seq("ssl", "crypto"), staticLink = true, os = "linux")
+        flags shouldBe Seq(
+            s"-L${libDir.getAbsolutePath}",
+            "-Wl,-Bstatic",
+            "-lssl",
+            "-lcrypto",
+            "-Wl,-Bdynamic"
+        )
+    }
+
+    test("vendoredArchiveLinkFlags: darwin static links each .a by full path (no -Bstatic)") {
+        // ld64 has no -Bstatic; the staged archive is named by full path so the link is static.
+        // The path is a HOST filesystem path (the linker runs on the host), so the expectation
+        // is derived through File rather than a hardcoded separator style.
+        val libDir = new File("/tmp/bssl/lib")
+        val flags  = CCompiler.vendoredArchiveLinkFlags(Seq(libDir), Seq("ssl", "crypto"), staticLink = true, os = "darwin")
+        // Archives are named by absolute path under libDir; no -L, no -Bstatic on darwin.
+        flags should have size 2
+        flags(0) shouldBe new File(libDir, "libssl.a").getAbsolutePath
+        flags(1) shouldBe new File(libDir, "libcrypto.a").getAbsolutePath
+        flags should not contain ("-Wl,-Bstatic")
+        flags should not contain ("-Wl,-Bdynamic")
+        flags.foreach(f => f should not startWith ("-L"))
+    }
+
+    test("vendoredArchiveLinkFlags: non-static emits plain -L<dir> + -l<name> on every OS") {
+        val libDir = new File("/tmp/bssl/lib")
+        CCompiler.vendoredArchiveLinkFlags(Seq(libDir), Seq("ssl"), staticLink = false, os = "darwin") shouldBe
+            Seq(s"-L${libDir.getAbsolutePath}", "-lssl")
+        CCompiler.vendoredArchiveLinkFlags(Seq(libDir), Seq("ssl"), staticLink = false, os = "linux") shouldBe
+            Seq(s"-L${libDir.getAbsolutePath}", "-lssl")
+    }
+
+    test("vendoredArchiveLinkFlags: no libs is Nil regardless of dirs/os") {
+        CCompiler.vendoredArchiveLinkFlags(Seq(new File("/tmp/lib")), Nil, staticLink = true, os = "linux") shouldBe Nil
+        CCompiler.vendoredArchiveLinkFlags(Seq(new File("/tmp/lib")), Nil, staticLink = true, os = "darwin") shouldBe Nil
+    }
+
+    test("vendoredArchiveForceLoadFlags: linux static force-loads via -Wl,--whole-archive so the link is order-independent") {
+        // Regression: Scala Native places the bundled C objects AFTER nativeConfig.linkingOptions, so a plain
+        // -Wl,-Bstatic -lssl fold is searched before the object that references it and GNU ld drops every member
+        // as unreferenced (undefined reference to SSL_CTX_new ...). --whole-archive forces all members in.
+        val libDir = new File("/tmp/bssl/lib")
+        val flags  = CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Seq("ssl", "crypto"), staticLink = true, os = "linux")
+        flags shouldBe Seq(
+            s"-L${libDir.getAbsolutePath}",
+            "-Wl,--whole-archive",
+            "-lssl",
+            "-lcrypto",
+            "-Wl,--no-whole-archive"
+        )
+    }
+
+    test("vendoredArchiveForceLoadFlags: darwin static force-loads each .a by full path via -Wl,-force_load") {
+        // ld64 has no --whole-archive; -force_load pulls every object out of the named archive regardless of position.
+        val libDir = new File("/tmp/bssl/lib")
+        val flags  = CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Seq("ssl", "crypto"), staticLink = true, os = "darwin")
+        flags should have size 2
+        flags(0) shouldBe s"-Wl,-force_load,${new File(libDir, "libssl.a").getAbsolutePath}"
+        flags(1) shouldBe s"-Wl,-force_load,${new File(libDir, "libcrypto.a").getAbsolutePath}"
+        flags should not contain ("-Wl,--whole-archive")
+    }
+
+    test("vendoredArchiveForceLoadFlags: non-static / no-libs falls back to the plain vendoredArchiveLinkFlags shape") {
+        val libDir = new File("/tmp/bssl/lib")
+        // Non-static: plain -L + -l, no force-load, on both OSes.
+        CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Seq("ssl"), staticLink = false, os = "linux") shouldBe
+            Seq(s"-L${libDir.getAbsolutePath}", "-lssl")
+        CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Seq("ssl"), staticLink = false, os = "darwin") shouldBe
+            Seq(s"-L${libDir.getAbsolutePath}", "-lssl")
+        // No libs: Nil on both OSes.
+        CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Nil, staticLink = true, os = "linux") shouldBe Nil
+        CCompiler.vendoredArchiveForceLoadFlags(Seq(libDir), Nil, staticLink = true, os = "darwin") shouldBe Nil
+    }
+
+    test("buildCommand: libDirs + static on linux folds the vendored archives via -L + -Bstatic") {
+        val src    = new File("/tmp/kyo_net_tls.c")
+        val out    = new File("/tmp/libkyonet_boringssl-linux-aarch64.so")
+        val incDir = new File("/tmp/bssl/include")
+        val libDir = new File("/tmp/bssl/lib")
+        val cmd    = CCompiler.buildCommand(
+            cc = "cc",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC"),
+            linkFlags = Nil,
+            linkLibs = Seq("ssl", "crypto"),
+            sources = Seq(src),
+            includes = Seq(incDir),
+            outFile = out,
+            staticLink = true,
+            libDirs = Seq(libDir),
+            os = "linux"
+        )
+        cmd should contain("-shared")
+        cmd.containsSlice(Seq("-I", incDir.getAbsolutePath)) shouldBe true
+        cmd should contain(s"-L${libDir.getAbsolutePath}")
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-lssl", "-lcrypto", "-Wl,-Bdynamic")) shouldBe true
+        cmd should not contain ("-static")
+    }
+
+    test("buildCommand: libDirs + static on darwin links each .a by full path, no -Bstatic") {
+        val src    = new File("/tmp/kyo_net_tls.c")
+        val out    = new File("/tmp/libkyonet_boringssl-darwin-aarch64.dylib")
+        val incDir = new File("/tmp/bssl/include")
+        val libDir = new File("/tmp/bssl/lib")
+        val cmd    = CCompiler.buildCommand(
+            cc = "clang",
+            family = CCompiler.Clang,
+            cFlags = Seq("-O2", "-fPIC"),
+            linkFlags = Nil,
+            linkLibs = Seq("ssl", "crypto"),
+            sources = Seq(src),
+            includes = Seq(incDir),
+            outFile = out,
+            staticLink = true,
+            libDirs = Seq(libDir),
+            os = "darwin"
+        )
+        cmd should contain("-shared")
+        cmd.containsSlice(Seq("-I", incDir.getAbsolutePath)) shouldBe true
+        cmd should contain(new File(libDir, "libssl.a").getAbsolutePath)
+        cmd should contain(new File(libDir, "libcrypto.a").getAbsolutePath)
+        cmd should not contain ("-Wl,-Bstatic")
+        cmd should not contain ("-static")
+    }
+
+    test("buildCommand: empty libDirs keeps the original io_uring fold (unchanged)") {
+        // Regression guard: the io_uring path declares no libDirs, so its link must stay
+        // byte-for-byte the prior `foldedLinkLibFlags` shape.
+        val cmd = CCompiler.buildCommand(
+            cc = "cc",
+            family = CCompiler.Gcc,
+            cFlags = Seq("-O2", "-fPIC"),
+            linkFlags = Nil,
+            linkLibs = Seq("uring"),
+            sources = Seq(new File("/tmp/kyo_uring.c")),
+            includes = Nil,
+            outFile = new File("/tmp/libkyonet_posix_uring-linux-aarch64.so"),
+            staticLink = true,
+            libDirs = Nil,
+            os = "linux"
+        )
+        cmd.containsSlice(Seq("-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic")) shouldBe true
+        cmd.exists(_.startsWith("-L")) shouldBe false
+    }
+
+    // --- Includes translation across families --------------------------------
+
+    test("includes: multiple -I dirs (POSIX)") {
+        val a   = new File("/tmp/inc-a")
+        val b   = new File("/tmp/inc-b")
+        val cmd = CCompiler.buildCommand(
+            cc = "gcc",
+            family = CCompiler.Gcc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("/tmp/foo.c")),
+            includes = Seq(a, b),
+            outFile = new File("/tmp/out.so"),
+            staticLink = false
+        )
+        cmd.containsSlice(Seq("-I", a.getAbsolutePath)) shouldBe true
+        cmd.containsSlice(Seq("-I", b.getAbsolutePath)) shouldBe true
+    }
+
+    test("includes: multiple /I dirs (MSVC)") {
+        val a   = new File("C:/tmp/inc-a")
+        val b   = new File("C:/tmp/inc-b")
+        val cmd = CCompiler.buildCommand(
+            cc = "cl.exe",
+            family = CCompiler.Msvc,
+            cFlags = Nil,
+            linkFlags = Nil,
+            linkLibs = Nil,
+            sources = Seq(new File("C:/tmp/foo.c")),
+            includes = Seq(a, b),
+            outFile = new File("C:/tmp/out.dll"),
+            staticLink = false
+        )
+        cmd should contain("/I" + a.getAbsolutePath)
+        cmd should contain("/I" + b.getAbsolutePath)
+    }
+
+    // --- splitCc -------------------------------------------------------------
+
+    test("splitCc: single token") {
+        CCompiler.splitCc("cc") shouldBe Seq("cc")
+    }
+
+    test("splitCc: two tokens (zig cc)") {
+        CCompiler.splitCc("zig cc") shouldBe Seq("zig", "cc")
+    }
+
+    test("splitCc: trimmed whitespace") {
+        CCompiler.splitCc("  clang  ") shouldBe Seq("clang")
+    }
+
+    // --- detectOs musl probing ------------------------------------------------
+    //
+    // Mirrors NativeLoader.detectOs (kyo-ffi/jvm runtime): Linux + presence of a musl loader
+    // under /lib/ld-musl-<arch>.so.1 → "linux-musl"; absence → "linux".
+
+    test("detectOs: plain linux (no musl loader)") {
+        CCompiler.detectOsWith("Linux", _ => false) shouldBe "linux"
+    }
+
+    test("detectOs: linux-musl via x86_64 loader") {
+        val present: String => Boolean = _ == "/lib/ld-musl-x86_64.so.1"
+        CCompiler.detectOsWith("Linux", present) shouldBe "linux-musl"
+    }
+
+    test("detectOs: linux-musl via aarch64 loader") {
+        val present: String => Boolean = _ == "/lib/ld-musl-aarch64.so.1"
+        CCompiler.detectOsWith("Linux", present) shouldBe "linux-musl"
+    }
+
+    test("detectOs: macOS unaffected by musl probe") {
+        CCompiler.detectOsWith("Mac OS X", _ => true) shouldBe "darwin"
+    }
+
+    test("detectOs: windows unaffected by musl probe") {
+        CCompiler.detectOsWith("Windows 11", _ => true) shouldBe "windows"
+    }
+
+    // --- Target os/arch resolution --------------------------------------------
+    //
+    // The target is what names the artifact and its resource directory. Unset means the host, so an
+    // ordinary build is unchanged; set means a cross-build or a foreign staging lands where the
+    // runtime for THAT platform looks, not where this machine's runtime would.
+
+    test("resolveTargetOsArch: None is the build host") {
+        CCompiler.resolveTargetOsArch(None) shouldBe ((CCompiler.detectOs(), CCompiler.detectArch()))
+    }
+
+    test("resolveTargetOsArch: an explicit tag overrides the host") {
+        CCompiler.resolveTargetOsArch(Some("darwin-x86_64")) shouldBe (("darwin", "x86_64"))
+        CCompiler.resolveTargetOsArch(Some("linux-aarch64")) shouldBe (("linux", "aarch64"))
+    }
+
+    test("parseOsArch: splits at the last hyphen so linux-musl keeps its own hyphen") {
+        CCompiler.parseOsArch("linux-musl-x86_64") shouldBe (("linux-musl", "x86_64"))
+        CCompiler.parseOsArch("linux-musl-aarch64") shouldBe (("linux-musl", "aarch64"))
+        CCompiler.parseOsArch("linux-x86_64") shouldBe (("linux", "x86_64"))
+        CCompiler.parseOsArch("windows-x86_64") shouldBe (("windows", "x86_64"))
+    }
+
+    test("parseOsArch: an unsupported tag is a hard error, never a plausible-looking guess") {
+        // Silently accepting `linux-armv7` would name an artifact no NativeLoader lookup resolves.
+        val e = intercept[RuntimeException](CCompiler.parseOsArch("linux-armv7"))
+        e.getMessage should include("linux-armv7")
+        intercept[RuntimeException](CCompiler.parseOsArch("solaris-x86_64"))
+        intercept[RuntimeException](CCompiler.parseOsArch("x86_64"))
+        intercept[RuntimeException](CCompiler.parseOsArch(""))
+    }
+
+    test("supportedOsArchTags: the full matrix, in os-then-arch order") {
+        CCompiler.supportedOsArchTags shouldBe Seq(
+            "linux-x86_64",
+            "linux-aarch64",
+            "linux-musl-x86_64",
+            "linux-musl-aarch64",
+            "darwin-x86_64",
+            "darwin-aarch64",
+            "windows-x86_64",
+            "windows-aarch64"
+        )
+    }
+
+    // --- Artifact naming ------------------------------------------------------
+
+    test("libExtension: linux-musl shares linux's .so (the diagnostic task used to reject it)") {
+        CCompiler.libExtension("linux") shouldBe "so"
+        CCompiler.libExtension("linux-musl") shouldBe "so"
+        CCompiler.libExtension("darwin") shouldBe "dylib"
+        CCompiler.libExtension("windows") shouldBe "dll"
+        intercept[RuntimeException](CCompiler.libExtension("solaris"))
+    }
+
+    test("artifactName: names the output for the TARGET os/arch, not the host") {
+        CCompiler.artifactName("kyo_tcp", "linux", "x86_64") shouldBe "libkyo_tcp-linux-x86_64.so"
+        CCompiler.artifactName("kyo_tcp", "linux-musl", "aarch64") shouldBe "libkyo_tcp-linux-musl-aarch64.so"
+        CCompiler.artifactName("kyo_tcp", "darwin", "x86_64") shouldBe "libkyo_tcp-darwin-x86_64.dylib"
+        CCompiler.artifactName("kyo_tcp", "darwin", "aarch64") shouldBe "libkyo_tcp-darwin-aarch64.dylib"
+        // Windows drops the `lib` prefix.
+        CCompiler.artifactName("kyo_tcp", "windows", "x86_64") shouldBe "kyo_tcp-windows-x86_64.dll"
+    }
+
+    test("artifactName: the unset-target name is the host's, unchanged from the host-only behavior") {
+        val (os, arch) = CCompiler.resolveTargetOsArch(None)
+        val expected   = s"${CCompiler.libPrefix(os)}kyo_tcp-$os-$arch.${CCompiler.libExtension(os)}"
+        CCompiler.artifactName("kyo_tcp", os, arch) shouldBe expected
+        // And an override moves the name off the host (checked against a target this host is not).
+        val foreign      = if (os == "darwin") "linux-x86_64" else "darwin-aarch64"
+        val (fOs, fArch) = CCompiler.parseOsArch(foreign)
+        CCompiler.artifactName("kyo_tcp", fOs, fArch) should not be expected
+    }
+
+    // --- Artifact-name parsing (attributing a staged prebuilt) -----------------
+
+    test("parseArtifactName: round-trips every supported tag") {
+        CCompiler.supportedOsArchTags.foreach { tag =>
+            val (os, arch) = CCompiler.parseOsArch(tag)
+            val name       = CCompiler.artifactName("kyo_tcp", os, arch)
+            CCompiler.parseArtifactName(name) shouldBe Some(("kyo_tcp", os, arch))
+        }
+    }
+
+    test("parseArtifactName: prefers the longest tag so linux-musl is not read as linux") {
+        CCompiler.parseArtifactName("libkyo_tcp-linux-musl-x86_64.so") shouldBe Some(("kyo_tcp", "linux-musl", "x86_64"))
+    }
+
+    test("parseArtifactName: rejects a name whose extension contradicts its os") {
+        // `libfoo-darwin-x86_64.so` is not something the plugin produces; treating it as a darwin
+        // artifact would package a .so under darwin-x86_64/.
+        CCompiler.parseArtifactName("libfoo-darwin-x86_64.so") shouldBe None
+        CCompiler.parseArtifactName("libfoo-linux-x86_64.dylib") shouldBe None
+    }
+
+    test("parseArtifactName: None for names outside the convention") {
+        CCompiler.parseArtifactName("libfoo.so") shouldBe None
+        CCompiler.parseArtifactName("libfoo-linux-armv7.so") shouldBe None
+        CCompiler.parseArtifactName("lib-linux-x86_64.so") shouldBe None // empty library id
+        CCompiler.parseArtifactName("README") shouldBe None
+    }
+
+    test("parseArtifactName: a library id containing a hyphen is preserved") {
+        CCompiler.parseArtifactName("libkyo-tcp-linux-x86_64.so") shouldBe Some(("kyo-tcp", "linux", "x86_64"))
+    }
+}

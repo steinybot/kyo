@@ -1,0 +1,106 @@
+package kyo
+
+import kyo.internal.TestClasspaths
+import kyo.internal.TestClasspaths2
+
+/** Characteristics of the live JVM standard classpath: a version-pinned given-instance count baseline, cacheDir write-collision handling,
+  * cold-init stability on a real 80k-symbol corpus, and JPMS module count via jrt:/.
+  */
+class StandardClasspathFidelityTest extends kyo.test.Test[Any]:
+
+    // Each of these four leaves cold-inits the standard 81k-symbol classpath (one also walks java.base via
+    // jrt:/). A single leaf is about a second uncontended, but by default the four run concurrently, and on a
+    // contended CI box (4 vCPUs, two parallel forks) that pile-up of concurrent decodes starves every leaf
+    // past the timeout. The leaves also share the jar reader pool (computeIfAbsent) and the jrt:/ singleton, so
+    // concurrency serializes them on those too. It is not heap pressure (peak is about 1.6GB against the 5GB
+    // fork cap). Run the leaves sequentially so each gets full CPU and no shared-resource contention.
+    override def config = super.config.sequential
+
+    // jrt:/ cold loads can still be slow on a contended runner; keep a generous per-leaf budget.
+    override def timeout = Duration.fromJava(java.time.Duration.ofMinutes(3))
+
+    // Given-enumeration fidelity is pinned to scala-library, the one root with a fixed external version. The full `standard`
+    // classpath also carries kyo-tasty/kyo-data/fixtures, whose given count shifts with every kyo change; measured against scala-library
+    // alone it only moves on a deliberate stdlib bump (where re-pinning re-validates the decoder). The leaves below still use the full corpus.
+    // The pin records the version it was validated against, so a bump fails here until the count is re-checked, even when it is unchanged.
+    private val pinnedScalaLibrary = "scala-library-3.9.0.jar"
+    private val pinnedGivenCount   = 409
+
+    "given-instance count on scala-library matches the count pinned for its version" in {
+        val jar = java.nio.file.Paths.get(TestClasspaths.scala3LibraryJar).getFileName.toString
+        assert(
+            jar == pinnedScalaLibrary,
+            s"the given-instance count is pinned for $pinnedScalaLibrary but the classpath carries $jar: re-check the count against " +
+                "the new scala-library and re-pin both values"
+        )
+        TestClasspaths.withClasspath(TestClasspaths.scalaLibrary)(Tasty.classpath).map { classpath =>
+            val count = classpath.symbols.count(_.isGiven)
+            assert(
+                count == pinnedGivenCount,
+                s"Expected exactly $pinnedGivenCount given instances in $pinnedScalaLibrary; found $count: the decoder's given " +
+                    "enumeration regressed."
+            )
+            succeed
+        }
+    }
+
+    "two concurrent cold-init writers to same cacheDir produce one .krfl file" in {
+        val cacheDir = TestClasspaths2.createTempDir("kyo-concurrent-writers")
+        val roots    = TestClasspaths2.standardRoots
+        Async.zip(
+            Tasty.withClasspath(roots, Maybe.Present(cacheDir))(Tasty.classpath),
+            Tasty.withClasspath(roots, Maybe.Present(cacheDir))(Tasty.classpath)
+        ).map { (classpath1, classpath2) =>
+            val krflFiles = TestClasspaths2.listFilesWithSuffix(cacheDir, ".krfl")
+            assert(
+                krflFiles.length == 1,
+                s"Expected exactly 1 .krfl file after concurrent writes; found ${krflFiles.length}"
+            )
+            assert(
+                classpath1.symbols.size == classpath2.symbols.size,
+                s"Concurrent-written snapshots produce different symbol counts: ${classpath1.symbols.size} vs ${classpath2.symbols.size}"
+            )
+            assert(
+                classpath1.symbols.size > 0,
+                s"Expected > 0 symbols after concurrent cold-init; got ${classpath1.symbols.size}"
+            )
+            succeed
+        }
+    }
+
+    "standard classpath cold-init is stable across repeated loads (>= 80,000 symbols each)" in {
+        val roots                                   = TestClasspaths2.standardRoots
+        def load: Int < (Async & Abort[TastyError]) =
+            TestClasspaths.withClasspath(roots)(Tasty.classpath).map { classpath =>
+                // >= 80,000: the standard classpath measures ~80,321 after finalizeMerge's package dedup collapses
+                // duplicate Package headers. Real classes/members are unaffected (unioned into the canonical package).
+                assert(classpath.symbols.size >= 80000, s"Expected >= 80,000 symbols; got ${classpath.symbols.size}")
+                classpath.symbols.size
+            }
+        load.map { n1 =>
+            load.map { n2 =>
+                load.map { n3 =>
+                    assert(
+                        n1 == n2 && n2 == n3,
+                        s"Cold-init symbol count is not stable across repeated loads: $n1, $n2, $n3"
+                    )
+                    succeed
+                }
+            }
+        }
+    }
+
+    "JPMS module count >= 65 on platform-modules classpath" in {
+        TestClasspaths2.standardWithPlatformModules.map { classpath =>
+            // The JDK module set varies by platform (e.g. Windows ships jdk.crypto.mscapi), so assert a lower bound
+            // rather than an exact count. 69 was measured on JDK 25; the >= 65 floor matches JpmsFidelity2Test.
+            val count = classpath.indices.modulesIndex.size
+            assert(
+                count >= 65,
+                s"Expected >= 65 JPMS modules (measured 69 on JDK 25); got $count"
+            )
+            succeed
+        }
+    }
+
+end StandardClasspathFidelityTest

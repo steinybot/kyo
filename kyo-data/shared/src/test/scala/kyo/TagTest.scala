@@ -1,13 +1,167 @@
 package kyo
 
-import izumi.reflect.Tag as ITag
 import kyo.*
 import kyo.internal.RegisterFunction
+import kyo.internal.TagHash
 import kyo.internal.TagTestMacro.test
 import scala.annotation.nowarn
-import scala.concurrent.Future
 
-class TagTest extends Test:
+class TagTest extends kyo.test.Test[Any]:
+
+    "ordinary operations are portable in the macro host" in {
+        val failures = kyo.internal.TagTestMacro.portabilityFailures()
+        assert(failures.isEmpty, failures.mkString("\n"))
+    }
+
+    "colliding nominal hashes" - {
+        class Aa
+        class BB
+
+        "the independently derived encodings collide" in {
+            val a        = Tag[Aa]
+            val b        = Tag[BB]
+            val encodedA = Tag.internal.encode[Aa](a.tpe.staticDB)
+            val encodedB = Tag.internal.encode[BB](b.tpe.staticDB)
+            assert(encodedA != encodedB)
+            assert(encodedA.hashCode == encodedB.hashCode)
+            assert(TagHash.of(a) == TagHash.of(b))
+            assert(a.show != b.show)
+        }
+
+        "distinct types agree with the compiler" - {
+            test[Aa, BB]
+        }
+
+        "same types agree with the compiler" - {
+            test[Aa, Aa]
+        }
+
+        "an equal encoding that is not the same instance still compares equal" in {
+            // The `eq` short circuit answers every pair of derived literals, so nothing else reaches the
+            // comparison with an equal pair. A copy does. `=:=` treats a false here as final for a concrete
+            // tag, so a false negative would report a type as different from itself.
+            // On JVM and Native the copy is a distinct instance, so the comparison runs for real. On JS
+            // reference identity is value equality, so the short circuit answers it and the leaf is trivial.
+            val derived = Tag[Aa]
+            val copy    = new String(Tag.internal.encode[Aa](derived.tpe.staticDB)).asInstanceOf[Tag[Aa]]
+            assert(copy =:= derived)
+            assert(derived =:= copy)
+            assert(copy <:< derived)
+            assert(!(copy =!= derived))
+        }
+
+        "a cached successful subtype does not admit a colliding type" in {
+            val accepted = Tag[List[Aa]]
+            val rejected = Tag[List[BB]]
+            val target   = Tag[Seq[Aa]]
+            assert(TagHash.of(accepted) == TagHash.of(rejected))
+            assert(TagHash.of(accepted) != TagHash.of(target))
+            for _ <- 0 until 3 do
+                assert(accepted <:< target)
+                assert(!(rejected <:< target))
+        }
+
+        "a cached rejected subtype does not reject a colliding type" in {
+            val rejected = Tag[Vector[Aa]]
+            val accepted = Tag[Vector[BB]]
+            val target   = Tag[Seq[BB]]
+            assert(TagHash.of(accepted) == TagHash.of(rejected))
+            assert(TagHash.of(accepted) != TagHash.of(target))
+            for _ <- 0 until 3 do
+                assert(!(rejected <:< target))
+                assert(accepted <:< target)
+        }
+    }
+
+    "dynamic captured lambda bodies" - {
+        trait Higher[F[_]]
+        def original[A: Tag]: Tag[Higher[[X] =>> Either[A, X]]] = Tag.dynamic[Higher[[X] =>> Either[A, X]]]
+        def renamed[A: Tag]: Tag[Higher[[Y] =>> Either[A, Y]]]  = Tag.dynamic[Higher[[Y] =>> Either[A, Y]]]
+
+        "alpha-equivalent bodies agree with the compiler" - {
+            test[Higher[[X] =>> Either[Int, X]], Higher[[Y] =>> Either[Int, Y]]](using
+                original[Int],
+                renamed[Int],
+                summon[RegisterFunction],
+                summon[Frame]
+            )
+        }
+
+        "different captured bodies agree with the compiler" - {
+            test[Higher[[X] =>> Either[Int, X]], Higher[[X] =>> Either[String, X]]](using
+                original[Int],
+                original[String],
+                summon[RegisterFunction],
+                summon[Frame]
+            )
+        }
+
+        "dynamic and static bodies agree with the compiler" - {
+            test[Higher[[X] =>> Either[Int, X]], Higher[[X] =>> Either[Int, X]]](using
+                original[Int],
+                Tag[Higher[[X] =>> Either[Int, X]]],
+                summon[RegisterFunction],
+                summon[Frame]
+            )
+        }
+    }
+
+    "original literal representation" - {
+        "typed literal payloads retain NUL and unpaired surrogate code units" in {
+            val tag                           = Tag["\u0000\ud800x\udfff"]
+            val _: Tag["\u0000\ud800x\udfff"] = tag
+            val shown                         = tag.show
+            assert(shown.length == 4)
+            assert(shown.charAt(0).toInt == 0)
+            assert(shown.charAt(1).toInt == 0xd800)
+            assert(shown.charAt(2).toInt == 120)
+            assert(shown.charAt(3).toInt == 0xdfff)
+        }
+
+        "derived literals retain the exact original encoding" in {
+            def check[A](tag: Tag[A]): Unit =
+                val encoded = Tag.internal.encode[A](tag.tpe.staticDB)
+                assert(tag.equals(encoded))
+                assert(TagHash.of(tag) == kyo.internal.XXHashPlatform.stringHash(encoded))
+                assert(Tag.internal.decode(encoded).toString == tag.show)
+            end check
+            check(Tag[Int])
+            check(Tag[String])
+            check(Tag[List[Int]])
+            check(Tag[Int | String])
+            check(Tag["λ\u0000\ud800"])
+        }
+
+        "dynamic hashes retain the original parent and child representation" in {
+            def nested[A: Tag, B: Tag]: Tag[Map[A, List[B]]] = Tag.dynamic[Map[A, List[B]]]
+            val tag                                          = nested[String, Int]
+            val _: Tag[Map[String, List[Int]]]               = tag
+            val tpe                                          = tag.tpe
+            val encoded                                      = Tag.internal.encode[Map[String, List[Int]]](tpe.staticDB)
+            assert(tpe.dynamicDB.nonEmpty)
+            val original = Tag.internal.Dynamic(encoded, tpe.dynamicDB)
+            assert(original.hashCode == tag.hash)
+            assert(original.tpe.toString == tag.show)
+            assert(Tag.internal.Dynamic(encoded, tpe.dynamicDB.toSeq.reverse.toMap).hashCode == tag.hash)
+            assert(nested[String, Int].hash == tag.hash)
+            assert(nested[Int, String].hash != tag.hash)
+        }
+
+        "dispatch hashes retain zero, negative values and UTF-16 code units" in {
+            val cases = Span(
+                (Span(1, 19, 3, 29, 11, 19, 2), 0),
+                (Span(4, 1, 4, 8, 11, 0, 4), Int.MinValue),
+                (Span(0, 26, 21, 10, 21, 30, 6), 0xd800dc00),
+                (Span(1, 19, 4, 0, 7, 4, 25), 0x0000d800)
+            )
+            cases.foreach { (digits, expected) =>
+                val original = "." + digits.map(_.toChar).mkString
+                assert(kyo.internal.XXHashPlatform.stringHash(original) == expected)
+                assert(TagHash.of(original) == expected)
+                assert(TagHash.of(original) == expected)
+            }
+        }
+    }
 
     "without variance" - {
         "equal tags" - {
@@ -184,6 +338,10 @@ class TagTest extends Test:
         opaque type Pair[A, B] = (A, B)
         opaque type Nested[A]  = Box[Box[A]]
 
+        opaque type Covariant[+A]     = List[A]
+        opaque type Contravariant[-A] = A => Unit
+        opaque type Mixed[+A, -B]     = B => A
+
     end OpaqueTypes
 
     "with opaque types" - {
@@ -218,26 +376,26 @@ class TagTest extends Test:
 
         "opaque types with explicit bounds" - {
             test[BoundedInt, AnyVal]
-            test[Int, BoundedInt](skipIzumiWarning = true)
+            test[Int, BoundedInt]
             test[BoundedString, AnyRef]
-            test[String, BoundedString](skipIzumiWarning = true)
+            test[String, BoundedString]
         }
 
         "opaque types with bounds different from underlying" - {
             test[BoundedCat, Animal]
-            test[Cat, BoundedCat](skipIzumiWarning = true)
+            test[Cat, BoundedCat]
             test[BoundedCat, Mammal]
         }
 
         "bounded opaque types with union underlying type" - {
             test[UnionWithBounds, Any]
-            test[Int, UnionWithBounds](skipIzumiWarning = true)
+            test[Int, UnionWithBounds]
             test[String, UnionWithBounds]
         }
 
         "bounded opaque types with intersection underlying type" - {
             test[IntersectionWithBounds, Readable]
-            test[FileImpl, IntersectionWithBounds](skipIzumiWarning = true)
+            test[FileImpl, IntersectionWithBounds]
             test[IntersectionWithBounds, Writable]
         }
 
@@ -261,8 +419,249 @@ class TagTest extends Test:
                 test[Nested[Int], Box[Box[Int]]]
                 test[Nested[Int], List[List[Int]]]
             }
+
+            "different type arguments are different types" - {
+                test[Box[Int], Box[String]]
+                test[Box[String], Box[Int]]
+                test[Pair[Int, String], Pair[String, Int]]
+                test[Nested[Int], Nested[String]]
+            }
+
+            "invariant type parameter" - {
+                test[Box[Int], Box[Any]]
+                test[Box[Any], Box[Int]]
+            }
+
+            "covariant type parameter" - {
+                test[Covariant[Int], Covariant[Any]]
+                test[Covariant[Any], Covariant[Int]]
+            }
+
+            "contravariant type parameter" - {
+                test[Contravariant[Any], Contravariant[Int]]
+                test[Contravariant[Int], Contravariant[Any]]
+            }
+
+            "mixed variance" - {
+                test[Mixed[Int, Any], Mixed[Any, Int]]
+                test[Mixed[Any, Int], Mixed[Int, Any]]
+            }
         }
 
+    }
+
+    // Inside the template that declares an opaque type, and inside its companion, the compiler
+    // replaces the opaque type with its underlying type wherever it infers, before any macro runs.
+    // Nothing there can say whether a Long means Meters or Long, so such a derivation is refused;
+    // naming the opaque type in Tag.derive survives the substitution and agrees with the outside.
+    // The refusal probes sit inside the scope because that is where the substitution happens.
+    object ScopedMeters:
+        opaque type Meters = Long
+        object Meters:
+            def apply(value: Long): Meters = value
+
+            def infer[A](a: A)(using t: Tag[A]): Tag[A] = t
+
+            def bare: Tag[Meters]                = Tag.derive[Meters]
+            def nested: Tag[List[Meters]]        = Tag.derive[List[Meters]]
+            def deeper: Tag[Map[String, Meters]] = Tag.derive[Map[String, Meters]]
+            def inUnion: Tag[Meters | String]    = Tag.derive[Meters | String]
+            def unrelated: Tag[List[Int]]        = Tag.derive[List[Int]]
+
+            def summoned(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag[Meters]")("[Tag.opaque.collapsed]")
+            def inferred(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("infer(Meters(1L))")("[Tag.opaque.collapsed]")
+            def underlying(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Long]")("[Tag.opaque.collapsed]")
+            def nestedUnderlying(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[List[Long]]")("[Tag.opaque.collapsed]")
+            def inArgument(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Map[String, Long]]")("[Tag.opaque.collapsed]")
+            def declaredGiven(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("given metersTag: Tag[Meters] = Tag.derive[Meters]")("[Tag.opaque.given]")
+        end Meters
+    end ScopedMeters
+
+    // A second brand over the same underlying type, in its own scope.
+    object ScopedFeet:
+        opaque type Feet = Long
+        object Feet:
+            def bare: Tag[Feet] = Tag.derive[Feet]
+    end ScopedFeet
+
+    // Two brands over one underlying type in one scope: the underlying names both.
+    object ScopedAmbiguous:
+        opaque type Feet   = Double
+        opaque type Metres = Double
+        object Probe:
+            def ambiguous(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Double]")("[Tag.opaque.collapsed]")
+    end ScopedAmbiguous
+
+    // A union underlying type. A union with extra members may be the opaque type in a union.
+    object ScopedUnion:
+        opaque type Id = String | Long
+        object Id:
+            def bare: Tag[Id]                                  = Tag.derive[Id]
+            def nested: Tag[List[Id]]                          = Tag.derive[List[Id]]
+            def wildcard: Tag[Set[? <: Id]]                    = Tag.derive[Set[? <: Id]]
+            def member: Tag[String]                            = Tag.derive[String]
+            def union(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Long | String]")("[Tag.opaque.collapsed]")
+            def wider(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[String | Long | Int]")("[Tag.opaque.collapsed]")
+        end Id
+    end ScopedUnion
+
+    // A parameterized opaque type collapses to its underlying applied to the node's arguments.
+    object ScopedBoxed:
+        opaque type Boxed[A] = List[A]
+        object Boxed:
+            def bare: Tag[Boxed[Int]]                               = Tag.derive[Boxed[Int]]
+            def nested: Tag[Map[String, Boxed[Int]]]                = Tag.derive[Map[String, Boxed[Int]]]
+            def other: Tag[Vector[Int]]                             = Tag.derive[Vector[Int]]
+            def underlying(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[List[Int]]")("[Tag.opaque.collapsed]")
+            def argument(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Boxed[List[Int]]]")("[Tag.opaque.collapsed]")
+        end Boxed
+    end ScopedBoxed
+
+    // An opaque type constructor used unapplied reaches the macro as the underlying type lambda.
+    object ScopedHigher:
+        trait Higher[F[_]]
+        opaque type Boxed[A] = List[A]
+        object Boxed:
+            val value: Higher[Boxed] = new Higher[Boxed] {}
+
+            def infer[F[_]](x: Higher[F])(using t: Tag[Higher[F]]): Tag[Higher[F]] = t
+
+            def explicitInside: Tag[Higher[Boxed]] = Tag.derive[Higher[Boxed]]
+            // The constructor inferred for F collapses to the underlying type lambda.
+            def inferred(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("infer(value)")("[Tag.opaque.collapsed]")
+            def underlying(using kyo.test.AssertScope, Frame): Unit =
+                typeCheckFailure("Tag.derive[Higher[List]]")("[Tag.opaque.collapsed]")
+        end Boxed
+    end ScopedHigher
+
+    // One opaque type over another, each in its own scope. Inside Level2 an Outer collapses to
+    // Inner, which is opaque there, so Inner itself cannot be named on a tag surface in Level2.
+    object ScopedChain:
+        object Level1:
+            opaque type Inner = Int
+            object Inner:
+                def apply(value: Int): Inner = value
+                def bare: Tag[Inner]         = Tag.derive[Inner]
+            end Inner
+        end Level1
+
+        object Level2:
+            import Level1.Inner
+            opaque type Outer = Inner
+            object Outer:
+                def bare: Tag[Outer]                               = Tag.derive[Outer]
+                def plain: Tag[Int]                                = Tag.derive[Int]
+                def inner(using kyo.test.AssertScope, Frame): Unit =
+                    typeCheckFailure("Tag.derive[Inner]")("[Tag.opaque.collapsed]")
+            end Outer
+        end Level2
+    end ScopedChain
+
+    "with an opaque type in its own scope" - {
+        import ScopedMeters.*
+        import ScopedFeet.*
+
+        "a tag derived inside by name equals one derived outside" - {
+            "bare" in assert(Meters.bare =:= Tag[Meters])
+            "nested in a type argument" in assert(Meters.nested =:= Tag[List[Meters]])
+            "nested deeper" in assert(Meters.deeper =:= Tag[Map[String, Meters]])
+            "in a union" in assert(Meters.inUnion =:= Tag[Meters | String])
+            "an unrelated type" in assert(Meters.unrelated =:= Tag[List[Int]])
+        }
+
+        "and is not the underlying type's tag" - {
+            "bare" in assert(Meters.bare =!= Tag[Long])
+            "nested in a type argument" in assert(Meters.nested =!= Tag[List[Long]])
+        }
+
+        "two opaque types over the same underlying stay distinct" - {
+            "derived inside their own scopes" in assert(Meters.bare =!= Feet.bare)
+            "derived outside" in assert(Tag[Meters] =!= Tag[Feet])
+        }
+
+        "a derivation that cannot tell the opaque type from its underlying is refused" - {
+            "summoned rather than derived by name" in Meters.summoned
+            "inferred from a value" in Meters.inferred
+            "the bare underlying type" in Meters.underlying
+            "nested in a type argument" in Meters.nestedUnderlying
+            "in one argument of several" in Meters.inArgument
+            "when two opaque types share the underlying" in ScopedAmbiguous.Probe.ambiguous
+        }
+
+        "a given Tag for the opaque type is refused in its scope" in Meters.declaredGiven
+
+        "with a union underlying type" - {
+            import ScopedUnion.*
+            "bare" in assert(Id.bare =:= Tag[Id])
+            "nested in a type argument" in assert(Id.nested =:= Tag[List[Id]])
+            "in a wildcard bound" in assert(Id.wildcard =:= Tag[Set[? <: Id]])
+            "not the underlying union's tag" in assert(Id.nested =!= Tag[List[String | Long]])
+            "a single member is not the union" in assert(Id.member =:= Tag[String])
+            "the underlying union is refused" in Id.union
+            "a wider union is refused" in Id.wider
+        }
+
+        "with type parameters" - {
+            import ScopedBoxed.*
+            "bare" in assert(Boxed.bare =:= Tag[Boxed[Int]])
+            "nested in a type argument" in assert(Boxed.nested =:= Tag[Map[String, Boxed[Int]]])
+            "an unrelated constructor" in assert(Boxed.other =:= Tag[Vector[Int]])
+            "not the underlying type's tag" in assert(Boxed.bare =!= Tag[List[Int]])
+            "distinct per type argument" in assert(Tag[Boxed[Int]] =!= Tag[Boxed[String]])
+            "the underlying applied is refused" in Boxed.underlying
+            "the underlying as an argument is refused" in Boxed.argument
+        }
+
+        "used unapplied in a higher-kinded position" - {
+            import ScopedHigher.*
+            "explicitly written inside the scope" in {
+                assert(Boxed.explicitInside =:= Tag[Higher[Boxed]])
+            }
+            "and is not the underlying type constructor's tag" in {
+                assert(Boxed.explicitInside =!= Tag[Higher[List]])
+            }
+            "inferred inside the scope it is refused" in Boxed.inferred
+            "the underlying constructor is refused" in Boxed.underlying
+        }
+
+        "the scoped types answer subtyping the way the compiler does" - {
+            import ScopedMeters.*
+            import ScopedBoxed.*
+            test[Meters, Long]
+            test[Long, Meters]
+            test[Meters, Any]
+            test[Boxed[Int], List[Int]]
+            test[List[Int], Boxed[Int]]
+            test[Boxed[Int], Boxed[String]]
+        }
+
+        "one opaque type over another" - {
+            import ScopedChain.Level1.Inner
+            import ScopedChain.Level2.Outer
+            "each agrees with its own scope" in {
+                assert(Inner.bare =:= Tag[Inner])
+                assert(Outer.bare =:= Tag[Outer])
+                assert(Outer.plain =:= Tag[Int])
+            }
+            "and all three stay distinct" in {
+                assert(Tag[Outer] =!= Tag[Inner])
+                assert(Tag[Inner] =!= Tag[Int])
+                assert(Tag[Outer] =!= Tag[Int])
+            }
+            "the inner type is refused where the outer collapses to it" in Outer.inner
+        }
     }
 
     "show" - {
@@ -281,10 +680,10 @@ class TagTest extends Test:
             assert(Tag[Thread].show == "java.lang.Thread")
         }
 
-        "type params" in pendingUntilFixed {
-            class Test[A]
-            assert(Tag[Test[Int]].show == s"${classOf[Test[?]].getName}[scala.Int]")
-            ()
+        "type params" in {
+            val tag                           = Tag[TagTest.ShowType[Int]]
+            val _: Tag[TagTest.ShowType[Int]] = tag
+            assert(tag.show == "kyo.TagTest$.ShowType[scala.Int]", tag.show)
         }
 
         "primitive" in {
@@ -296,7 +695,8 @@ class TagTest extends Test:
         }
         "custom" in {
             trait CustomType
-            assert(Tag[CustomType].show == "kyo.TagTest._$CustomType")
+            // kyo-test runs leaf bodies in a deferred closure (the AssertScope context function), which adds one owner level to leaf-local type names.
+            assert(Tag[CustomType].show == "kyo.TagTest._$_$CustomType")
         }
     }
 
@@ -304,6 +704,57 @@ class TagTest extends Test:
         class A0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789
         val tag = Tag[A0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789]
         assert(tag =:= tag && tag <:< tag)
+    }
+
+    // Regression: deriving a Tag for a type whose Java supertypes are *parameterized*
+    // crashed the macro. A Java wildcard `<?>` argument surfaces through `typeArgs`
+    // as a bare `TypeBounds(Nothing, FromJavaObject)`, which `TagMacro` did not
+    // handle, raising `AssertionError: TypeBounds(...)` inside the dotty compiler.
+    "Java parameterized supertypes (wildcard type args)" - {
+        "LocalDateTime derives without crashing" in {
+            val tag = Tag[java.time.LocalDateTime]
+            assert(tag.show.nonEmpty)
+            assert(tag =:= tag)
+            assert(tag <:< tag)
+        }
+
+        "OffsetDateTime derives without crashing" in {
+            val tag = Tag[java.time.OffsetDateTime]
+            assert(tag.show.nonEmpty)
+            assert(tag =:= tag && tag <:< tag)
+        }
+
+        "ZonedDateTime derives without crashing" in {
+            val tag = Tag[java.time.ZonedDateTime]
+            assert(tag.show.nonEmpty)
+            assert(tag =:= tag && tag <:< tag)
+        }
+
+        "LocalDate / LocalTime still derive (unparameterized supertypes)" in {
+            assert(Tag[java.time.LocalDate].show.nonEmpty)
+            assert(Tag[java.time.LocalTime].show.nonEmpty)
+        }
+
+        "distinct java.time tags are not equal" in {
+            assert(Tag[java.time.LocalDateTime] =!= Tag[java.time.LocalDate])
+            assert(Tag[java.time.LocalDateTime] =!= Tag[java.time.LocalTime])
+            assert(Tag[java.time.LocalDateTime] =!= Tag[java.time.OffsetDateTime])
+        }
+
+        "direct wildcard-parameterized Java type derives" in {
+            // java.lang.Class is declared as Class<T> with no wildcard; use a
+            // type whose own supertype list contains a parameterized interface.
+            val tag = Tag[java.util.concurrent.atomic.AtomicReference[String]]
+            assert(tag.show.nonEmpty)
+            assert(tag =:= tag)
+        }
+
+        "case class with a LocalDateTime field can summon its field Tag" in {
+            final case class HasTime(at: java.time.LocalDateTime, label: String)
+            val tag = Tag[HasTime]
+            assert(tag.show.nonEmpty)
+            assert(tag =:= tag && tag <:< tag)
+        }
     }
 
     "type unions" - {
@@ -470,8 +921,9 @@ class TagTest extends Test:
                 trait A
                 trait B
 
-                assert(Tag[A].show == "kyo.TagTest._$A")
-                assert(showSet(Tag[A | B]) == Set("kyo.TagTest._$B", "kyo.TagTest._$A"))
+                // kyo-test runs leaf bodies in a deferred closure (the AssertScope context function), which adds one owner level to leaf-local type names.
+                assert(Tag[A].show == "kyo.TagTest._$_$A")
+                assert(showSet(Tag[A | B]) == Set("kyo.TagTest._$_$B", "kyo.TagTest._$_$A"))
             }
         }
     }
@@ -666,7 +1118,7 @@ class TagTest extends Test:
         }
         "Any" - {
             test[Any, Any]
-            test[Any, AnyRef](skipIzumiWarning = true) // known izumi limitation
+            test[Any, AnyRef]
             test[Any, AnyVal]
             test[List[Any], List[Int]]
         }
@@ -718,7 +1170,7 @@ class TagTest extends Test:
             test[Box[Big.Small], Box[Big.Small]]
 
             class Box2[A]
-            def test2[A: Tag: izumi.reflect.Tag] = test[Box2[A], Box2[A]]
+            def test2[A: Tag] = test[Box2[A], Box2[A]]
             test2[Big.Sub]
         }
     }
@@ -846,6 +1298,8 @@ class TagTest extends Test:
         }
 
         "opaque types" - {
+            import Opaques.*
+
             "simple opaque type" in {
                 def testOpaque = Tag[MyInt]
                 typeCheck("testOpaque")
@@ -863,10 +1317,15 @@ class TagTest extends Test:
         }
     }
 
-    opaque type MyInt     = Int
-    opaque type MyList[A] = List[A]
-    opaque type Inner[A]  = List[A]
-    opaque type Outer[B]  = Inner[B]
+    // Declared in their own object so their aliases are transparent only inside it. Declared at
+    // class level they would be transparent throughout the suite, which both makes every derivation
+    // mentioning Int or List ambiguous and silently turns Tag[MyInt] here into Tag[Int].
+    object Opaques:
+        opaque type MyInt     = Int
+        opaque type MyList[A] = List[A]
+        opaque type Inner[A]  = List[A]
+        opaque type Outer[B]  = Inner[B]
+    end Opaques
 
     "type lambdas in super types" - {
         "simple super type with type lambda" - {
@@ -1033,14 +1492,20 @@ class TagTest extends Test:
 
         "different types with similar string representation" - {
             test[1, 1.0]
-            test[1, 1L](skipIzumiWarning = true)
+            test[1, 1L]
             test['a', "a"]
             test[true, "true"]
-            test[1.0f, 1.0](skipIzumiWarning = true)
+            test[1.0f, 1.0]
             test[0, 0.0]
-            test[0, 0L](skipIzumiWarning = true)
+            test[0, 0L]
             class Box[A]
             test[Box[1], Box[1.0]]
+        }
+
+        "Null vs literals" - {
+            test[Null, 1]
+            test[Null, "A"]
+            test[List[Null], List["A"]]
         }
     }
 
@@ -1057,8 +1522,14 @@ class TagTest extends Test:
         test[C, A & B]
     }
 
-    opaque type V <: Vector[Any] = Vector[Any]
-    "opaque type bounds with variance (bug #1368)" in pendingUntilFixed {
+    // In its own object so `Vector[Any]` below still means `Vector[Any]`; declared at class level
+    // the compiler would substitute V for it throughout the suite.
+    object Bounded:
+        opaque type V <: Vector[Any] = Vector[Any]
+    end Bounded
+
+    "opaque type bounds with variance (bug #1368)" in {
+        import Bounded.*
         abstract class Variant[+A]:
             def method[AA >: A](using Tag[AA]): Unit
 
@@ -1069,9 +1540,244 @@ class TagTest extends Test:
         typeCheck("x.method")
     }
 
+    "tuple spellings" - {
+
+        "a cons chain and its TupleN equal each other" in {
+            assert(Tag[String *: Int *: EmptyTuple] =:= Tag[Tuple2[String, Int]])
+            assert(Tag[String *: Int *: EmptyTuple].hash == Tag[Tuple2[String, Int]].hash)
+        }
+
+        "a chain ending in Tuple1 equals its TupleN" in {
+            assert(Tag[String *: String *: Tuple1[String]] =:= Tag[Tuple3[String, String, String]])
+            assert(Tag[String *: String *: Tuple1[String]].hash == Tag[Tuple3[String, String, String]].hash)
+        }
+
+        "a Concat-reduced tuple equals the written spelling" in {
+            type Concatenated = Tuple.Concat[Tuple.Concat[Tuple1[String], Tuple1[Int]], Tuple1[Boolean]]
+            assert(Tag[Concatenated] =:= Tag[(String, Int, Boolean)])
+            assert(Tag[Concatenated].hash == Tag[(String, Int, Boolean)].hash)
+        }
+
+        "a Concat-reduced named tuple equals the written spelling" in {
+            type Concatenated = NamedTuple.Concat[NamedTuple.Concat[(a: String), (b: Int)], (c: Boolean)]
+            assert(Tag[Concatenated] =:= Tag[(a: String, b: Int, c: Boolean)])
+            assert(Tag[Concatenated].hash == Tag[(a: String, b: Int, c: Boolean)].hash)
+        }
+
+        "the spelling agrees inside a type constructor" in {
+            type Concatenated = NamedTuple.Concat[(a: String), (b: Int)]
+            assert(Tag[Chunk[Concatenated]] =:= Tag[Chunk[(a: String, b: Int)]])
+            assert(Tag[Chunk[Concatenated]].hash == Tag[Chunk[(a: String, b: Int)]].hash)
+        }
+
+        "tuples that differ stay distinct" in {
+            assert(!(Tag[String *: Int *: EmptyTuple] =:= Tag[(Int, String)]))
+            assert(!(Tag[(a: String, b: Int)] =:= Tag[(b: String, a: Int)]))
+            assert(!(Tag[Tuple1[String]] =:= Tag[(String, String)]))
+        }
+
+        "EmptyTuple keeps its own tag" in {
+            assert(Tag[EmptyTuple] =:= Tag[EmptyTuple])
+            assert(!(Tag[EmptyTuple] =:= Tag[Tuple1[String]]))
+        }
+    }
+
+    "show determinism" - {
+
+        "intersection order is canonical" - {
+            trait SA
+            trait SB
+            trait SC
+
+            "A & B == B & A" in {
+                assert(Tag[SA & SB].show == Tag[SB & SA].show)
+            }
+
+            "A & B & C == C & B & A" in {
+                assert(Tag[SA & SB & SC].show == Tag[SC & SB & SA].show)
+            }
+
+            "A & B & C == B & C & A" in {
+                assert(Tag[SA & SB & SC].show == Tag[SB & SC & SA].show)
+            }
+        }
+
+        "union order is canonical" - {
+            trait SA
+            trait SB
+            trait SC
+
+            "A | B == B | A" in {
+                assert(Tag[SA | SB].show == Tag[SB | SA].show)
+            }
+
+            "A | B | C == C | B | A" in {
+                assert(Tag[SA | SB | SC].show == Tag[SC | SB | SA].show)
+            }
+
+            "A | B | C == B | C | A" in {
+                assert(Tag[SA | SB | SC].show == Tag[SB | SC | SA].show)
+            }
+        }
+
+        // An opaque type's arguments reach the encoding, so whatever canonical order the encoder
+        // gives a union or an intersection has to survive being one.
+        "opaque type arguments are canonical" - {
+            import OpaqueTypes.*
+            trait SA
+            trait SB
+
+            "Box[A | B] == Box[B | A]" in {
+                assert(Tag[Box[SA | SB]].show == Tag[Box[SB | SA]].show)
+                assert(Tag[Box[SA | SB]].hash == Tag[Box[SB | SA]].hash)
+            }
+
+            "Box[A & B] == Box[B & A]" in {
+                assert(Tag[Box[SA & SB]].show == Tag[Box[SB & SA]].show)
+                assert(Tag[Box[SA & SB]].hash == Tag[Box[SB & SA]].hash)
+            }
+
+            "Pair[A & B, Int] == Pair[B & A, Int]" in {
+                assert(Tag[Pair[SA & SB, Int]].show == Tag[Pair[SB & SA, Int]].show)
+                assert(Tag[Pair[SA & SB, Int]].hash == Tag[Pair[SB & SA, Int]].hash)
+            }
+
+            "argument order is not canonicalized away" in {
+                assert(Tag[Pair[Int, String]].show != Tag[Pair[String, Int]].show)
+            }
+        }
+
+        "nested intersection and union" - {
+            trait SA
+            trait SB
+            trait SC
+            trait SD
+
+            "(A & B) | (C & D) == (D & C) | (B & A)" in {
+                assert(Tag[(SA & SB) | (SC & SD)].show == Tag[(SD & SC) | (SB & SA)].show)
+            }
+
+            "(A | B) & (C | D) == (D | C) & (B | A)" in {
+                assert(Tag[(SA | SB) & (SC | SD)].show == Tag[(SD | SC) & (SB | SA)].show)
+            }
+        }
+
+        "parameterized types" - {
+            "List[Int] is stable" in {
+                assert(Tag[List[Int]].show == Tag[List[Int]].show)
+            }
+
+            "Map[String, Int] is stable" in {
+                assert(Tag[Map[String, Int]].show == Tag[Map[String, Int]].show)
+            }
+        }
+
+        "dynamic tags" - {
+            "simple dynamic tag is stable" in {
+                def mkTag[A: Tag] = Tag[List[A]].show
+                assert(mkTag[Int] == mkTag[Int])
+                assert(mkTag[String] == mkTag[String])
+                assert(mkTag[Int] != mkTag[String])
+            }
+
+            "dynamic intersection is canonical" in {
+                def mkIntersectionAB[A: Tag, B: Tag] = Tag[A & B].show
+                def mkIntersectionBA[A: Tag, B: Tag] = Tag[B & A].show
+                assert(mkIntersectionAB[Int, String] == mkIntersectionBA[Int, String])
+            }
+
+            "dynamic union is canonical" in {
+                def mkUnionAB[A: Tag, B: Tag] = Tag[A | B].show
+                def mkUnionBA[A: Tag, B: Tag] = Tag[B | A].show
+                assert(mkUnionAB[Int, String] == mkUnionBA[Int, String])
+            }
+
+            "nested dynamic is stable" in {
+                def mkTag[A: Tag, B: Tag] = Tag[Map[A, List[B]]].show
+                assert(mkTag[String, Int] == mkTag[String, Int])
+                assert(mkTag[String, Int] != mkTag[Int, String])
+            }
+
+            "dynamic with intersection reorder" in {
+                def mk1[A: Tag, B: Tag, C: Tag] = Tag[A & B & C].show
+                def mk2[A: Tag, B: Tag, C: Tag] = Tag[C & A & B].show
+                assert(mk1[Int, String, Boolean] == mk2[Int, String, Boolean])
+            }
+        }
+
+        "repeated calls produce same result" in {
+            trait SA
+            trait SB
+            val results = (1 to 10).map(_ => Tag[SA & SB].show)
+            assert(results.distinct.size == 1)
+        }
+    }
+
+    "hash content-stability" - {
+
+        "intersection order is canonical (the hash is content-derived, not identity)" in {
+            trait HA
+            trait HB
+            assert(Tag[HA & HB].hash == Tag[HB & HA].hash)
+        }
+
+        "repeated calls produce the same hash" in {
+            trait HC
+            assert((1 to 10).map(_ => Tag[HC].hash).distinct.size == 1)
+        }
+
+        "distinct types have distinct hashes" in {
+            assert(Tag[Int].hash != Tag[String].hash)
+            assert(Tag[List[Int]].hash != Tag[List[String]].hash)
+        }
+
+        // kyo-aeron derives aeron stream ids from `Tag.hash`, so a publish and a subscribe of the same
+        // type in separate JVM processes must hash identically. Pinning to constants is the in-JVM proxy:
+        // the hash is content-derived (XXH32 applied to the encoded tag's JLS string hash), so it
+        // reproduces these values on any JVM. An identity-derived hash would vary across processes
+        // and break that.
+        "is pinned to its content-derived constant (process-independent determinism)" in {
+            assert(Tag[Int].hash == -1492440803, s"Tag[Int].hash = ${Tag[Int].hash}")
+            assert(Tag[String].hash == -59591402, s"Tag[String].hash = ${Tag[String].hash}")
+        }
+    }
+
+    // `TagHash` is the dispatch hash, not the content-stable `Tag.hash` above: it memoizes on the
+    // platforms whose `String.hashCode` does not. What has to hold is that memoizing changes nothing,
+    // so each case reads a tag twice, once filling the memo and once through it.
+    "dispatch hash memoization" - {
+
+        "agrees with hashCode, before and after the memo is filled" in {
+            trait MA
+            val tag    = Tag[MA]
+            val direct = tag.hashCode
+            assert(TagHash.of(tag) == direct)
+            assert(TagHash.of(tag) == direct)
+        }
+
+        "distinct types keep distinct dispatch hashes" in {
+            assert(TagHash.of(Tag[Int]) != TagHash.of(Tag[String]))
+        }
+
+        "repeated comparisons hold their verdict once the memo is warm" in {
+            trait MB
+            trait MC extends MB
+            val sub    = (1 to 10).map(_ => Tag[MC] <:< Tag[MB])
+            val notSub = (1 to 10).map(_ => Tag[MB] <:< Tag[MC])
+            val notEq  = (1 to 10).map(_ => Tag[MB] =:= Tag[MC])
+            assert(sub.distinct.size == 1 && sub.head)
+            assert(notSub.distinct.size == 1 && !notSub.head)
+            assert(notEq.distinct.size == 1 && !notEq.head)
+        }
+    }
+
     // TODO: fix this to use `pendingUntilFixed` instead of `ignore`
     given RegisterFunction = (name, test, pending) =>
-        if pending then name ignore Future.successful(test)
-        else name in Future.successful(test)
+        if pending then name.ignore in test
+        else name in { test; succeed("the real check is the scala.Predef.assert inside test; succeed registers the leaf with AssertScope") }
 
+end TagTest
+
+object TagTest:
+    class ShowType[A]
 end TagTest

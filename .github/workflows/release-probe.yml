@@ -1,0 +1,124 @@
+name: release-probe
+# Builds every artifact the release workflow publishes, without credentials and without
+# uploading anything, so a change that would break publishing fails on its PR instead of after
+# it lands on main.
+#
+# publishLocal runs the same resolve, compile, ffiCompile, javadoc, and packaging that
+# publishSigned does, and differs only in signing and uploading. That means no secrets, so it
+# runs on pull requests from forks, and no snapshots are published as a side effect. The
+# existing `/release` comment trigger is the heavyweight alternative: it needs secrets and does
+# publish snapshots, so it is not usable as a routine per-PR check.
+#
+# JVM only. Both failures this exists to catch surfaced on the JVM leg: a plugin dependency that
+# could not be resolved (kyo-compat-plugin / update) and a missing native library for a C shim
+# (kyo-aeronJVM / ffiCompile, which the JVM leg compiles). ci.yml covers JS, Native, and Wasm.
+#
+# The provisioning is shared with release.yml through .github/actions/release-setup rather than
+# copied, so this probe cannot drift away from the environment it is vouching for.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One probe per PR: a follow-up push supersedes the run it invalidated rather than queueing a
+# second full build behind it.
+concurrency:
+  group: release-probe-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    # release.yml already builds the release artifacts on an upstream main push, so there the probe
+    # only needs to run for pull requests. In a fork release.yml is guarded off, so the probe also
+    # runs on pushes to the fork's main to keep publishability checked. On an upstream main push the
+    # guard skips the job, so no runner is used and the run entry is inert.
+    if: github.event_name == 'pull_request' || github.repository != 'getkyo/kyo'
+    # arm64, not x64. This is an early warning, not the gate: release.yml builds every native
+    # platform (darwin, linux-x86_64, linux-aarch64, windows-x86_64, windows-aarch64) on every main
+    # push, so whichever arch the probe picks, the rest are still validated before anything is
+    # published. Given that, it belongs on the pool with queue headroom rather than the saturated
+    # one. release-setup stages the natives for whichever architecture it runs on.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      # Full history: a pull request diffs against the main commit its merge ref is built on.
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/release-setup
+      # An artifact is built from a module's main sources and the build, so a pull request probes only
+      # the modules whose main side its diff reaches (`testKyo --phase publish`): the changed modules and
+      # their dependents, or every module when the build itself changed. A test or README change probes
+      # nothing. Each step below takes this plan; without one (a push in a fork) every step runs whole.
+      - name: Select modules
+        id: plan
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "scoped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$(git rev-parse HEAD^1)"
+          scripts/sbt.sh tool -Dplatform=JVM \
+            "testKyo --phase publish --dry-run --plan-file target/publish-plan-jvm $base JVM" \
+            "testKyo --phase publish --dry-run --plan-file target/publish-plan-js $base JS"
+          {
+            echo "scoped=true"
+            echo "jvm=$(paste -sd' ' target/publish-plan-jvm)"
+            echo "js=$(paste -sd' ' target/publish-plan-js)"
+          } >> "$GITHUB_OUTPUT"
+      # What a producer job runs. publishLocal compiles this host's natives as a side effect but never
+      # invokes ffiCompileAll, which is what decides whether every module's vendored dependency was
+      # staged. A module added without its staging step passes publishLocal and kills every producer.
+      # On a scoped run each command below takes the plan as arguments; unscoped, it takes none and covers every module.
+      - name: Compile every module's natives (producer path)
+        if: steps.plan.outputs.scoped != 'true' || steps.plan.outputs.jvm != ''
+        shell: bash
+        env:
+          PLAN: ${{ steps.plan.outputs.jvm }}
+        run: scripts/sbt.sh tool -Dplatform=JVM "ffiCompileAll${PLAN:+ $PLAN}"
+      - name: Build publishable artifacts (JVM)
+        if: steps.plan.outputs.scoped != 'true' || steps.plan.outputs.jvm != ''
+        shell: bash
+        env:
+          PLAN: ${{ steps.plan.outputs.jvm }}
+        run: |
+          if [ -n "$PLAN" ]; then
+            scripts/sbt.sh publish -Dplatform=JVM "testKyo --phase publish --modules ${PLAN// /,} JVM"
+          else
+            scripts/sbt.sh publish -Dplatform=JVM +publishLocal
+          fi
+      # The half of the publish job's guard a single host can answer: completeness needs every
+      # producer's artifacts pooled, so the full ffiPackagingCheckAll cannot pass on a pull request.
+      # This half catches a native filed under a platform it is not for.
+      - name: FFI native packaging guard, every module (formats only)
+        if: steps.plan.outputs.scoped != 'true' || steps.plan.outputs.jvm != '' || steps.plan.outputs.js != ''
+        shell: bash
+        env:
+          SCOPED: ${{ steps.plan.outputs.scoped }}
+          JVM_PLAN: ${{ steps.plan.outputs.jvm }}
+          JS_PLAN: ${{ steps.plan.outputs.js }}
+        run: |
+          if [ "$SCOPED" != true ] || [ -n "$JVM_PLAN" ]; then
+            scripts/sbt.sh tool -Dplatform=JVM "ffiPackagingFormatCheckAll${JVM_PLAN:+ $JVM_PLAN}"
+          fi
+          if [ "$SCOPED" != true ] || [ -n "$JS_PLAN" ]; then
+            scripts/sbt.sh tool -Dplatform=JS "ffiPackagingFormatCheckAll${JS_PLAN:+ $JS_PLAN}"
+          fi
+      # The darwin producer cross-builds by prefixing ffiCompileAll with a build-level append, and no
+      # pull request runs that producer: release.yml triggers only on a main push, a tag, or a
+      # `/release` comment, and the comment path runs main's copy of the workflow rather than the
+      # branch's. The prefix resolves against the build's settings before any C is compiled, so an FFI
+      # setting that cannot take a build-level value fails the whole command here, on this host,
+      # whatever the target. The define is inert and only makes the append observable. Runs last so
+      # nothing above consumes natives built with it.
+      - name: Cross-build command shape (producer path)
+        if: steps.plan.outputs.scoped != 'true' || steps.plan.outputs.jvm != ''
+        shell: bash
+        env:
+          PLAN: ${{ steps.plan.outputs.jvm }}
+        run: scripts/sbt.sh tool -Dplatform=JVM 'set ThisBuild / ffiCFlags ++= Seq("-DKYO_FFI_PROBE=1")' "ffiCompileAll${PLAN:+ $PLAN}"

@@ -89,7 +89,7 @@ object TestVariant {
 
                 var expectedSize: Option[Int] = None
 
-                val processed: State = content.split("\n").zipWithIndex.foldLeft(State.zero)({
+                val processed: State = content.split("\\r?\\n").zipWithIndex.foldLeft(State.zero)({
                     case (state, (str, n)) => {
                         val lineNumber = n + 1
 
@@ -114,7 +114,7 @@ object TestVariant {
                         }
 
                         val line: Line = state.mode match {
-                            case Mode.Continue => Line.Raw(str)
+                            case Mode.Continue             => Line.Raw(str)
                             case Mode.Replace(testVariant) =>
                                 if (str.contains(testVariant.base))
                                     Line.Variants(testVariant.replacements.map(r => str.replace(testVariant.base, r)))
@@ -136,10 +136,13 @@ object TestVariant {
 
                 val writers: Seq[PrintWriter] = files.map(file => new PrintWriter(file))
 
+                // LF explicitly, never println: the platform separator would emit CRLF
+                // variants on Windows, and generated sources must be byte-identical on
+                // every platform.
                 processed.lines.foreach({
-                    case Line.Raw(str) => writers.foreach(_.println(str))
+                    case Line.Raw(str)        => writers.foreach(_.print(str + "\n"))
                     case Line.Variants(lines) => lines.zip(writers).foreach({
-                            case (str, writer) => writer.println(str)
+                            case (str, writer) => writer.print(str + "\n")
                         })
 
                 })

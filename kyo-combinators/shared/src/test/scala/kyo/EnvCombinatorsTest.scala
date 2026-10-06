@@ -1,6 +1,6 @@
 package kyo
 
-class EnvCombinatorsTest extends Test:
+class EnvCombinatorsTest extends kyo.test.Test[Any]:
 
     class Dep(val value: Int)
     object DepImpl extends Dep(1)
@@ -49,7 +49,7 @@ class EnvCombinatorsTest extends Test:
                 val layerString = Layer("value")
                 val layerInt    = Layer(1)
                 val layerBool   = Layer(false)
-                val handled =
+                val handled     =
                     effect
                         .provideLayer(layerChar)
                         .provideLayer(layerString)
@@ -58,14 +58,14 @@ class EnvCombinatorsTest extends Test:
                 assert(Memo.run(handled).eval == 23)
             }
 
-            "should provide all layers and infer types correctly" in run {
+            "should provide all layers and infer types correctly" in {
                 val effect: Int < Env[String & Int & Boolean & Char] =
                     Env.get[String] *> Env.get[Int] *> Env.get[Boolean] *> Env.get[Char].andThen(23)
                 val layerChar   = Layer(Kyo.defer('c'))
                 val layerString = Layer("value")
                 val layerInt    = Layer(1)
                 val layerBool   = Layer(false)
-                val handled =
+                val handled     =
                     effect
                         .provide(
                             layerChar,

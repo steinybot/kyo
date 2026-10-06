@@ -17,7 +17,7 @@ object Duration:
     inline given CanEqual[Duration, Duration] = CanEqual.derived
 
     /** Exception thrown for invalid duration parsing. */
-    class InvalidDuration(message: Text)(using Frame) extends KyoException(message)
+    class InvalidDuration(message: String)(using Frame) extends KyoException(message)
 
     /** Parses a string representation of a duration.
       *
@@ -29,14 +29,14 @@ object Duration:
     def parse(s: String)(using Frame): Result[InvalidDuration, Duration] =
         val pattern = """(\d+)\s*([a-zA-Z]+)""".r
         s.trim.toLowerCase match
-            case "infinity" | "inf" => Result.succeed(Infinity)
+            case "infinity" | "inf"   => Result.succeed(Infinity)
             case pattern(value, unit) =>
                 for
                     longValue <-
                         Result.catching[NumberFormatException](value.toLong)
                             .mapFailure(_ => InvalidDuration(s"Invalid number: $value"))
                     unitEnum <-
-                        Units.values.find(_.names.exists(_.startsWith(unit)))
+                        Units.all.find(_.names.exists(_.startsWith(unit)))
                             .map(Result.succeed)
                             .getOrElse(Result.fail(InvalidDuration(s"Invalid unit: $unit")))
                 yield fromUnits(longValue, unitEnum)
@@ -49,6 +49,17 @@ object Duration:
 
     /** Represents infinite duration. */
     val Infinity: Duration = Long.MaxValue
+
+    /** How many digits an exact rendering may carry in [[Duration.show]] before scaling reads better than exactness. Four keeps every
+      * duration a person writes down (`90.seconds`, `26.hours`, `999.millis`) exact, and catches the figures nobody reads.
+      */
+    private inline val ShowExactDigits = 4
+
+    /** [[ShowExactDigits]] as the value it bounds. */
+    private inline val ShowExactCeiling = 10000L
+
+    /** Rounding scale for a scaled [[Duration.show]]: two decimal places. */
+    private inline val ShowScale = 100.0
 
     /** Creates a Duration from nanoseconds.
       *
@@ -116,7 +127,10 @@ object Duration:
     end Units
 
     object Units:
-        private val byChronoUnit: Map[ChronoUnit, Units] = Units.values.map(u => (u.chronoUnit, u)).toMap
+
+        val all = Units.values
+
+        private val byChronoUnit: Map[ChronoUnit, Units] = Units.all.map(u => (u.chronoUnit, u)).toMap
 
         def fromJava(chronoUnit: ChronoUnit): Units =
             byChronoUnit.get(chronoUnit)
@@ -149,9 +163,19 @@ object Duration:
             val sum: Long = self.toLong + that.toLong
             if sum >= 0 then sum else Duration.Infinity
 
-        infix def -(that: Duration): Duration =
-            val diff: Long = self.toLong - that.toLong
-            if diff > 0 then diff else Duration.Zero
+        /** `self` less `that`, or `Absent` when `that` is longer.
+          *
+          * A duration is a magnitude, so a longer `that` has no answer: the caller decides what that means, or asks [[minusOrZero]] for the
+          * clamp. `Infinity` less any finite duration is `Infinity`.
+          */
+        def minus(that: Duration): Maybe[Duration] =
+            if that > self then Absent
+            else if self == Duration.Infinity && that != Duration.Infinity then Present(Duration.Infinity)
+            else Present(self.toLong - that.toLong)
+
+        /** `self` less `that`, or `Zero` when `that` is longer: [[minus]] with the clamp named at the call site. */
+        def minusOrZero(that: Duration): Duration =
+            minus(that).getOrElse(Duration.Zero)
 
         infix def *(factor: Double): Duration =
             if factor <= 0 || self.toLong <= 0L then Duration.Zero
@@ -204,6 +228,12 @@ object Duration:
 
         /** Converts the Duration to a human-readable string at the most coarse possible resolution without losing information.
           *
+          * The exact rendering is preferred while its number stays legible: the coarsest unit that divides the duration evenly, so a whole
+          * number of seconds reads as seconds and 90 seconds reads as `90.seconds` rather than `1.5.minutes`, which is the more useful
+          * reading of a timeout. Past [[ShowExactDigits]] digits that preference inverts, since the figure stops being one anybody reads: 14
+          * seconds and 31 microseconds divides evenly only at microseconds and used to render as `14031085.micros`. Then the duration is
+          * scaled to the coarsest unit holding at least one whole part and rounded, giving `14.03.seconds`.
+          *
           * @return
           *   A string representation of the Duration
           */
@@ -212,14 +242,20 @@ object Duration:
             else if self == Infinity then "Duration.Infinity"
             else
                 val nanos = self.toNanos
-                Units.values.reverse.find(unit => nanos % unit.factor.toLong == 0) match
-                    case Some(unit) =>
-                        val value = (nanos / unit.factor).toLong
-                        val name  = unit.toString.toLowerCase
-                        s"$value.$name"
-                    case None =>
-                        s"$nanos.nanos"
-                end match
+                val exact =
+                    Units.all.reverse.collectFirst {
+                        case unit if nanos % unit.factor.toLong == 0 && nanos / unit.factor.toLong < ShowExactCeiling =>
+                            s"${nanos / unit.factor.toLong}.${unit.toString.toLowerCase}"
+                    }
+                exact.getOrElse {
+                    // No exact unit reads well, so scale instead. `find` walks coarse to fine and stops at the first unit the duration
+                    // fills at least once; the finest unit always qualifies, since a Duration is a whole number of nanoseconds.
+                    val unit    = Units.all.reverse.find(unit => nanos >= unit.factor).getOrElse(Units.Nanos)
+                    val scaled  = nanos / unit.factor
+                    val rounded = Math.round(scaled * ShowScale) / ShowScale
+                    val value   = if rounded == Math.floor(rounded) then rounded.toLong.toString else rounded.toString
+                    s"$value.${unit.toString.toLowerCase}"
+                }
 
         /** Checks if the Duration is finite.
           *
@@ -229,6 +265,32 @@ object Duration:
         // TODO Is this Robust enough?
         private[kyo] def isFinite: Boolean = self < Duration.Infinity
     end extension
+
+    /** Parses a Duration from a string like "5s", "100ms", "2 hours", "infinity".
+      *
+      * This reimplements Duration's parsing logic directly to avoid the Frame requirement of Duration.parse.
+      */
+    given Flag.Reader.Scalar[Duration] with
+        private val pattern = """(\d+)\s*([a-zA-Z]+)""".r
+
+        def apply(s: String): Either[Throwable, Duration] =
+            s.trim.toLowerCase match
+                case "infinity" | "inf"   => Right(Duration.Infinity)
+                case pattern(value, unit) =>
+                    val parsedLong: Either[Throwable, Long] =
+                        try Right(value.toLong)
+                        catch case _: NumberFormatException => Left(new IllegalArgumentException(s"Invalid duration number: $value"))
+                    parsedLong.flatMap { longValue =>
+                        Duration.Units.values.find(_.names.exists(_ == unit))
+                            .orElse(Duration.Units.values.find(_.names.exists(_.startsWith(unit)))) match
+                            case None           => Left(new IllegalArgumentException(s"Invalid duration unit: $unit"))
+                            case Some(unitEnum) => Right(Duration.fromUnits(longValue, unitEnum))
+                    }
+                case _ => Left(new IllegalArgumentException(s"Invalid duration format: $s"))
+        end apply
+
+        def typeName: String = "Duration"
+    end given
 
 end Duration
 

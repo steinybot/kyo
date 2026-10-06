@@ -1,6 +1,6 @@
 package kyo
 
-class RandomTest extends Test:
+class RandomTest extends kyo.test.Test[Any]:
 
     "mocked" - {
         val testRandom = Random(
@@ -18,139 +18,146 @@ class RandomTest extends Test:
                 def nextString(length: Int, chars: Seq[Char])(using AllowUnsafe) = chars.last.toString * length
                 def nextBytes(length: Int)(using AllowUnsafe)                    = Seq.fill(length)(1.toByte)
                 def shuffle[A](seq: Seq[A])(using AllowUnsafe)                   = seq.reverse
+                override def uuid()(using AllowUnsafe)                           = "mocked-uuid"
         )
 
-        "nextInt" in run {
+        "nextInt" in {
             Random.let(testRandom)(Random.nextInt).map { v =>
                 assert(v == 10)
             }
         }
 
-        "nextInt(n)" in run {
+        "nextInt(n)" in {
             Random.let(testRandom)(Random.nextInt(42)).map { v =>
                 assert(v == 41)
             }
         }
 
-        "nextLong" in run {
+        "nextLong" in {
             Random.let(testRandom)(Random.nextLong).map { v =>
                 assert(v == 20L)
             }
         }
 
-        "nextBoolean" in run {
+        "nextBoolean" in {
             Random.let(testRandom)(Random.nextBoolean).map { v =>
                 assert(v == true)
             }
         }
 
-        "nextDouble" in run {
+        "nextDouble" in {
             Random.let(testRandom)(Random.nextDouble).map { v =>
                 assert(v == 30d)
             }
         }
 
-        "nextFloat" in run {
+        "nextFloat" in {
             Random.let(testRandom)(Random.nextFloat).map { v =>
                 assert(v == 40f)
             }
         }
 
-        "nextGaussian" in run {
+        "nextGaussian" in {
             Random.let(testRandom)(Random.nextGaussian).map { v =>
                 assert(v == 50d)
             }
         }
 
-        "nextValue" in run {
+        "nextValue" in {
             Random.let(testRandom)(Random.nextValue(List(1, 2))).map { v =>
                 assert(v == 2)
             }
         }
 
-        "nextValues" in run {
+        "nextValues" in {
             Random.let(testRandom)(Random.nextValues(3, List(1, 2))).map { v =>
                 assert(v == List(2, 2, 2))
             }
         }
 
-        "nextString" in run {
+        "nextString" in {
             Random.let(testRandom)(Random.nextStringAlphanumeric(5)).map { v =>
                 assert(v == "aaaaa")
             }
         }
 
-        "nextString with chars" in run {
+        "nextString with chars" in {
             Random.let(testRandom)(Random.nextString(3, List('x', 'y', 'z'))).map { v =>
                 assert(v == "zzz")
             }
         }
 
-        "nextBytes" in run {
+        "nextBytes" in {
             Random.let(testRandom)(Random.nextBytes(4)).map { v =>
                 assert(v == Seq(1.toByte, 1.toByte, 1.toByte, 1.toByte))
             }
         }
 
-        "shuffle" in run {
+        "shuffle" in {
             Random.let(testRandom)(Random.shuffle(Seq(1, 2, 3))).map { v =>
                 assert(v == Seq(3, 2, 1))
+            }
+        }
+
+        "uuid" in {
+            Random.let(testRandom)(Random.uuid).map { v =>
+                assert(v == "mocked-uuid")
             }
         }
     }
 
     "live" - {
-        "nextInt" in run {
-            Random.nextInt.map { v =>
-                assert(v >= Int.MinValue && v <= Int.MaxValue)
+        "nextInt" in {
+            Random.nextInt.map { _ =>
+                succeed("nextInt draws an unbounded Int; every Int value is valid so there is no tighter bound to assert")
             }
         }
 
-        "nextInt(n)" in run {
+        "nextInt(n)" in {
             val n = 10
             Random.nextInt(n).map { v =>
                 assert(v >= 0 && v < n)
             }
         }
 
-        "nextLong" in run {
-            Random.nextLong.map { v =>
-                assert(v >= Long.MinValue && v <= Long.MaxValue)
+        "nextLong" in {
+            Random.nextLong.map { _ =>
+                succeed("nextLong draws an unbounded Long; every Long value is valid so there is no tighter bound to assert")
             }
         }
 
-        "nextBoolean" in run {
-            Random.nextBoolean.map { v =>
-                assert(v == true || v == false)
+        "nextBoolean" in {
+            Random.nextBoolean.map { _ =>
+                succeed("nextBoolean draws a Boolean; both true and false are valid so there is no tighter value to assert")
             }
         }
 
-        "nextDouble" in run {
+        "nextDouble" in {
             Random.nextDouble.map { v =>
                 assert(v >= 0.0 && v < 1.0)
             }
         }
 
-        "nextFloat" in run {
+        "nextFloat" in {
             Random.nextFloat.map { v =>
                 assert(v >= 0.0f && v < 1.0f)
             }
         }
 
-        "nextGaussian" in run {
+        "nextGaussian" in {
             Random.nextGaussian.map { v =>
                 assert(v >= Double.MinValue && v <= Double.MaxValue)
             }
         }
 
-        "nextValue" in run {
+        "nextValue" in {
             val seq = List(1, 2, 3, 4, 5)
             Random.nextValue(seq).map { v =>
                 assert(seq.contains(v))
             }
         }
 
-        "nextValues" in run {
+        "nextValues" in {
             val seq    = List(1, 2, 3, 4, 5)
             val length = 3
             Random.nextValues(length, seq).map { v =>
@@ -159,7 +166,7 @@ class RandomTest extends Test:
             }
         }
 
-        "nextString" in run {
+        "nextString" in {
             val length = 5
             Random.nextStringAlphanumeric(length).map { v =>
                 assert(v.length == length)
@@ -169,7 +176,7 @@ class RandomTest extends Test:
             }
         }
 
-        "nextString with chars" in run {
+        "nextString with chars" in {
             val length = 3
             val chars  = List('x', 'y', 'z')
             Random.nextString(length, chars).map { v =>
@@ -178,18 +185,39 @@ class RandomTest extends Test:
             }
         }
 
-        "nextBytes" in run {
+        "nextBytes" in {
             val length = 4
             Random.nextBytes(length).map { v =>
                 assert(v.length == length)
-                assert(v.forall(b => b == 0.toByte || b == 1.toByte))
             }
         }
 
-        "shuffle" in run {
+        // Regression: the default generator once drew every byte from {0, 1} (nextValues over Seq(0, 1)) rather than the full byte range.
+        // A real fill over 512 bytes spans far more than two distinct values, so this fails loudly if that defect returns.
+        "nextBytes fills the full byte range, not just {0, 1}" in {
+            Random.nextBytes(512).map { v =>
+                assert(v.toSet.size > 2, s"nextBytes produced only ${v.toSet.size} distinct byte values, expected the full range")
+            }
+        }
+
+        "shuffle" in {
             Random.shuffle(Seq(1, 2, 3)).map { v =>
                 assert(v.length == 3)
                 assert(v.toSet == Set(1, 2, 3))
+            }
+        }
+
+        "uuid" in {
+            Random.uuid.map { v =>
+                assert(v.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
+            }
+        }
+
+        "uuid uniqueness" in {
+            Random.uuid.map { a =>
+                Random.uuid.map { b =>
+                    assert(a != b)
+                }
             }
         }
     }
@@ -200,8 +228,8 @@ class RandomTest extends Test:
         val testUnsafe = new TestUnsafe()
 
         "should generate nextInt correctly" in {
-            val result = testUnsafe.nextInt()
-            assert(result >= Int.MinValue && result <= Int.MaxValue)
+            discard(testUnsafe.nextInt())
+            succeed("unsafe nextInt draws an unbounded Int; every Int value is valid so there is no tighter bound to assert")
         }
 
         "should generate nextInt with bound correctly" in {
@@ -211,8 +239,8 @@ class RandomTest extends Test:
         }
 
         "should generate nextLong correctly" in {
-            val result = testUnsafe.nextLong()
-            assert(result >= Long.MinValue && result <= Long.MaxValue)
+            discard(testUnsafe.nextLong())
+            succeed("unsafe nextLong draws an unbounded Long; every Long value is valid so there is no tighter bound to assert")
         }
 
         "should generate nextDouble correctly" in {
@@ -221,8 +249,8 @@ class RandomTest extends Test:
         }
 
         "should generate nextBoolean correctly" in {
-            val result = testUnsafe.nextBoolean()
-            assert(result == true || result == false)
+            discard(testUnsafe.nextBoolean())
+            succeed("unsafe nextBoolean draws a Boolean; both true and false are valid so there is no tighter value to assert")
         }
 
         "should generate nextFloat correctly" in {
@@ -278,9 +306,15 @@ class RandomTest extends Test:
             assert(result.toSet == seq.toSet)
         }
 
+        "should generate uuid correctly" in {
+            val result = testUnsafe.uuid()
+            assert(result.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
+        }
+
         "should convert to safe Random" in {
-            val safeRandom = testUnsafe.safe
-            assert(safeRandom.isInstanceOf[Random])
+            val safeRandom: Random = testUnsafe.safe
+            discard(safeRandom)
+            succeed("Unsafe.safe returns a safe Random wrapper (verified by the Random ascription)")
         }
     }
 
@@ -299,9 +333,10 @@ class RandomTest extends Test:
             def nextString(length: Int, chars: Seq[Char])(using Frame) = chars.last.toString * length
             def nextBytes(length: Int)(using Frame)                    = Seq.fill(length)(1.toByte)
             def shuffle[A](seq: Seq[A])(using Frame)                   = seq.reverse
+            def uuid(using Frame)                                      = "context-uuid"
             def unsafe                                                 = ???
 
-        "get should return current Random instance" in run {
+        "get should return current Random instance" in {
             Random.let(testRandom) {
                 Random.get.map { random =>
                     assert(random.equals(testRandom))
@@ -309,7 +344,7 @@ class RandomTest extends Test:
             }
         }
 
-        "use should execute function with current Random" in run {
+        "use should execute function with current Random" in {
             Random.let(testRandom) {
                 Random.use(_.nextInt).map { result =>
                     assert(result == 42)
@@ -317,7 +352,7 @@ class RandomTest extends Test:
             }
         }
 
-        "withSeed should create deterministic Random" in run {
+        "withSeed should create deterministic Random" in {
             val seed = 12345
             for
                 result1 <- Random.withSeed(seed)(Random.nextInt)
@@ -326,7 +361,7 @@ class RandomTest extends Test:
             end for
         }
 
-        "withSeed should produce different results with different seeds" in run {
+        "withSeed should produce different results with different seeds" in {
             for
                 result1 <- Random.withSeed(12345)(Random.nextInt)
                 result2 <- Random.withSeed(54321)(Random.nextInt)
@@ -337,14 +372,14 @@ class RandomTest extends Test:
     class TestUnsafe extends Random.Unsafe:
         private val javaRandom = new java.util.Random()
 
-        def nextInt()(using AllowUnsafe): Int                    = javaRandom.nextInt()
-        def nextInt(exclusiveBound: Int)(using AllowUnsafe): Int = javaRandom.nextInt(exclusiveBound)
-        def nextLong()(using AllowUnsafe): Long                  = javaRandom.nextLong()
-        def nextDouble()(using AllowUnsafe): Double              = javaRandom.nextDouble()
-        def nextBoolean()(using AllowUnsafe): Boolean            = javaRandom.nextBoolean()
-        def nextFloat()(using AllowUnsafe): Float                = javaRandom.nextFloat()
-        def nextGaussian()(using AllowUnsafe): Double            = javaRandom.nextGaussian()
-        def nextValue[A](seq: Seq[A])(using AllowUnsafe): A      = seq(javaRandom.nextInt(seq.size))
+        def nextInt()(using AllowUnsafe): Int                                  = javaRandom.nextInt()
+        def nextInt(exclusiveBound: Int)(using AllowUnsafe): Int               = javaRandom.nextInt(exclusiveBound)
+        def nextLong()(using AllowUnsafe): Long                                = javaRandom.nextLong()
+        def nextDouble()(using AllowUnsafe): Double                            = javaRandom.nextDouble()
+        def nextBoolean()(using AllowUnsafe): Boolean                          = javaRandom.nextBoolean()
+        def nextFloat()(using AllowUnsafe): Float                              = javaRandom.nextFloat()
+        def nextGaussian()(using AllowUnsafe): Double                          = javaRandom.nextGaussian()
+        def nextValue[A](seq: Seq[A])(using AllowUnsafe): A                    = seq(javaRandom.nextInt(seq.size))
         def nextValues[A](length: Int, seq: Seq[A])(using AllowUnsafe): Seq[A] =
             Seq.fill(length)(nextValue(seq))
         def nextStringAlphanumeric(length: Int)(using AllowUnsafe): String =

@@ -1,33 +1,38 @@
 package kyo
 
 import kyo.*
-import org.scalatest.compatible.Assertion
-import scala.concurrent.Future
-import zio.Cause
-import zio.Runtime
 import zio.Task
-import zio.Unsafe
 import zio.ZIO
 import zio.stream.ZStream
 
-class ZStreamsTest extends Test:
+class ZStreamsTest extends kyo.test.Test[Any]:
 
-    def runZIO[T](v: Task[T]): T =
-        zio.Unsafe.unsafe(implicit u =>
-            zio.Runtime.default.unsafe.run(v).getOrThrow()
-        )
+    // Run the body THROUGH the ZIO runtime (preserving the kyo<->ZIO interop these tests cover), bridging the
+    // resulting Future back into a kyo computation so it can be a kyo-test leaf body.
+    def runZIO(v: Task[Unit]): Unit < Async =
+        Async.fromFuture(zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.runToFuture(v)))
 
-    def runKyo(v: => Assertion < (Abort[Throwable] & Async)): Future[Assertion] =
-        zio.Unsafe.unsafe(implicit u =>
-            zio.Runtime.default.unsafe.runToFuture(
-                ZIOs.run(v)
-            )
-        )
+    def runKyo(v: => Unit < (Abort[Throwable] & Async)): Unit < Async =
+        Async.fromFuture(zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.runToFuture(ZIOs.run(v))))
 
     case object Error extends RuntimeException("error")
 
     ".get" - {
-        "infinite" in runKyo {
+        "finite stream" in runKyo {
+            val zioStream = ZStream.fromIterable(List(1, 2, 3, 4, 5))
+            val kyoStream = ZStreams.get(zioStream)
+            kyoStream.run.map { chunk =>
+                assert(chunk == Chunk(1, 2, 3, 4, 5))
+            }
+        }
+        "empty stream" in runKyo {
+            val zioStream = ZStream.empty
+            val kyoStream = ZStreams.get[Nothing, Int](zioStream)
+            kyoStream.run.map { chunk =>
+                assert(chunk.isEmpty)
+            }
+        }
+        "infinite stream with take" in runKyo {
             val zioStream = ZStream.iterate(0)(_ + 1)
             val kyoStream = ZStreams.get(zioStream)
             kyoStream.take(1024).run.map(v => assert(v == Chunk.range(0, 1024)))
@@ -35,9 +40,11 @@ class ZStreamsTest extends Test:
         "stack safety" in runKyo {
             val zioStream = ZStream.repeatZIO(ZIO.succeed(0))
             val kyoStream = ZStreams.get(zioStream)
-            kyoStream.take(10_000).discard.andThen(succeed)
+            // This test proves that consuming 10_000 elements does not overflow the stack.
+            // No concrete value to check; absence of a stack overflow IS the assertion.
+            kyoStream.take(10_000).discard.andThen(succeed("consuming 10_000 elements did not overflow the stack"))
         }
-        "failing" in runKyo {
+        "failing stream" in runKyo {
             val zioStream = ZStream.fromIterable(List.tabulate(5)(identity)) ++
                 ZStream.fail(Error) ++
                 ZStream.iterate(0)(_ + 1)
@@ -46,7 +53,16 @@ class ZStreamsTest extends Test:
                 assert(result == Result.fail(Error))
             }
         }
-        "parallel + async" in runKyo {
+        "stream with async effects" in runKyo {
+            val zioStream = ZStream.fromIterable(List(1, 2, 3, 4, 5)).mapZIO { v =>
+                ZIO.sleep(1.milli.toJava) *> ZIO.succeed(v * 2)
+            }
+            val kyoStream = ZStreams.get(zioStream)
+            kyoStream.run.map { chunk =>
+                assert(chunk == Chunk(2, 4, 6, 8, 10))
+            }
+        }
+        "parallel processing" in runKyo {
             val zioStream =
                 ZStream
                     .fromIterable(List.tabulate(20)(identity))
@@ -58,6 +74,266 @@ class ZStreamsTest extends Test:
             kyoStream.run.map { v =>
                 assert(v.sorted == Chunk.range(0, 20))
             }
+        }
+        "interruption propagates to zio stream" in runKyo {
+            Latch.init(1).map { started =>
+                Latch.init(1).map { finalized =>
+                    import AllowUnsafe.embrace.danger
+
+                    val zioStream = ZStream.unfoldZIO(0) { n =>
+                        if n == 0 then
+                            ZIO.succeed(started.unsafe.release()) *> ZIO.succeed(Some((n, n + 1)))
+                        else
+                            // Park until interrupted: after the first element the stream stays genuinely running (not a
+                            // paced sleep), so it can only end via this test's interruption.
+                            ZIO.never
+                    }.ensuring(ZIO.succeed(finalized.unsafe.release()))
+
+                    val kyoStream = ZStreams.get(zioStream)
+
+                    Scope.run {
+                        Fiber.init(kyoStream.take(5).run).map { fiber =>
+                            started.await.andThen {
+                                Abort.run[Interrupted](fiber.interrupt).map { _ =>
+                                    // finalized.await releases only when the ZIO stream's ensuring block fires,
+                                    // proving that interruption propagated to the ZIO stream finalizer.
+                                    finalized.await.andThen(succeed("interruption propagated to the ZIO stream finalizer"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "concurrent stream consumption" in runKyo {
+            val zioStream = ZStream.fromIterable(List.range(0, 100))
+            val kyoStream = ZStreams.get(zioStream)
+
+            Async.zip(
+                kyoStream.run,
+                kyoStream.run,
+                kyoStream.run
+            ).map { case (r1, r2, r3) =>
+                // Each should get the full stream
+                assert(r1 == Chunk.from(List.range(0, 100)))
+                assert(r2 == Chunk.from(List.range(0, 100)))
+                assert(r3 == Chunk.from(List.range(0, 100)))
+            }
+        }
+        "concurrent kyo streams racing on shared zio stream with mutable state" in runKyo {
+            import java.util.concurrent.atomic.AtomicInteger
+
+            // ZIO stream with internal mutable counter that multiple Kyo streams will race on
+            val counter   = new AtomicInteger(0)
+            val zioStream = ZStream.unfoldChunkZIO(()) { _ =>
+                ZIO.succeed {
+                    val value = counter.getAndIncrement()
+                    if value < 100 then
+                        Some((zio.Chunk.single(value), ()))
+                    else
+                        None
+                    end if
+                }
+            }
+
+            val sharedKyoStream = ZStreams.get(zioStream)
+
+            // 4 Kyo streams racing to consume from the same ZIO stream
+            Async.zip(
+                sharedKyoStream.run,
+                sharedKyoStream.run,
+                sharedKyoStream.run,
+                sharedKyoStream.run
+            ).map { case (r1, r2, r3, r4) =>
+                // Combine all results
+                val allValues    = (r1.toSeq ++ r2.toSeq ++ r3.toSeq ++ r4.toSeq).toList
+                val uniqueValues = allValues.distinct.sorted
+
+                // Verify total data is maintained:
+                // 1. All values from 0 to 99 should be present exactly once
+                assert(uniqueValues == List.range(0, 100))
+                // 2. No duplicates - each value consumed by exactly one stream
+                assert(allValues.length == uniqueValues.length)
+                // 3. Total count should be 100
+                assert(allValues.length == 100)
+            }
+        }
+    }
+
+    ".run" - {
+        "finite stream" in runZIO {
+            val kyoStream = Stream.init(List(1, 2, 3, 4, 5))
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCollect.map { chunk =>
+                assert(chunk.toList == List(1, 2, 3, 4, 5))
+            }
+        }
+        "empty stream" in runZIO {
+            val kyoStream = Stream.empty[Int]
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCollect.map { chunk =>
+                assert(chunk.isEmpty)
+            }
+        }
+        "infinite stream with take" in runZIO {
+            val kyoStream = Stream.unfold(0)(n => Maybe((n, n + 1)))
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.take(1024).runCollect.map { chunk =>
+                assert(chunk.toList == List.range(0, 1024))
+            }
+        }
+        "stack safety" in runZIO {
+            val kyoStream = Stream.init(List.fill(10_000)(1))
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCount.map { count =>
+                assert(count == 10_000)
+            }
+        }
+        "failing stream" in runZIO {
+            val kyoStream: Stream[Int, Abort[RuntimeException] & Async] =
+                Stream.init(List(1, 2, 3)).map(v => Abort.get(Right(v))).concat(
+                    Stream(Abort.fail(Error).map(_ => Emit.value(Chunk.empty[Int])))
+                )
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCollect.either.map { result =>
+                assert(result == Left(Error))
+            }
+        }
+        "stream with async effects" in runZIO {
+            val kyoStream = Stream.init(List(1, 2, 3, 4, 5)).map { v =>
+                Async.sleep(1.milli).andThen(v * 2)
+            }
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCollect.map { chunk =>
+                assert(chunk.toList == List(2, 4, 6, 8, 10))
+            }
+        }
+        "round trip: get then run" in runZIO {
+            val original  = ZStream.fromIterable(List(1, 2, 3, 4, 5))
+            val kyoStream = ZStreams.get(original)
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.runCollect.map { chunk =>
+                assert(chunk.toList == List(1, 2, 3, 4, 5))
+            }
+        }
+        "round trip: run then get" in runKyo {
+            val original  = Stream.init(List(1, 2, 3, 4, 5))
+            val zioStream = ZStreams.run(original)
+            val kyoStream = ZStreams.get(zioStream)
+            kyoStream.run.map { chunk =>
+                assert(chunk == Chunk(1, 2, 3, 4, 5))
+            }
+        }
+        "parallel processing" in runZIO {
+            val kyoStream = Stream.init(List.range(0, 20)).map { v =>
+                Async.sleep(1.milli).andThen(v)
+            }
+            val zioStream = ZStreams.run(kyoStream)
+            zioStream.mapZIOParUnordered(4) { v =>
+                zio.Random.nextIntBounded(10)
+                    .flatMap(t => ZIO.sleep(t.millis.toJava)) *> ZIO.succeed(v * 2)
+            }.runCollect.map { chunk =>
+                assert(chunk.toList.sorted == List.range(0, 20).map(_ * 2))
+            }
+        }
+        "interruption propagates to kyo stream" in runZIO {
+            // A barrier rather than a flag to poll: the finalizer trips it, and the ZIO side awaits it. An interrupt
+            // spawns the kyo scope's drain without waiting for it, so the finalizer runs strictly after
+            // `fiber.interrupt` has returned and a read taken there is reading too early.
+            val streamFinalized = scala.concurrent.Promise[Unit]()
+
+            val kyoStream: Stream[Int, Abort[Nothing] & Async] = Stream {
+                Scope.run {
+                    Scope.ensure {
+                        discard(streamFinalized.trySuccess(()))
+                    }.andThen {
+                        Stream.unfold(0, chunkSize = 1) { n =>
+                            // Emit one element (its own chunk) then park until interrupted, so the stream is in flight when the
+                            // interrupt arrives. chunkSize = 1 stops the parking second pull from swallowing the first.
+                            if n == 0 then Maybe((n, n + 1))
+                            else Async.never[Unit].andThen(Maybe((n, n + 1)))
+                        }.emit
+                    }
+                }
+            }
+
+            val zioStream = ZStreams.run(kyoStream)
+
+            for
+                started <- zio.Promise.make[Nothing, Unit]
+                // `started` completes when the first element flows through, i.e. after the kyo stream registered its Scope
+                // finalizer, so the interrupt cannot land before the finalizer is in place.
+                fiber <- zioStream.tap(_ => started.succeed(())).take(5).runCollect.fork
+                // Verify initial state is false
+                _ = assert(!streamFinalized.isCompleted)
+                _      <- started.await
+                result <- fiber.interrupt
+                _      <- ZIO.fromFuture(_ => streamFinalized.future)
+            yield
+                // Verify ZIO interruption was received
+                assert(result.isInterrupted)
+                // Verify Kyo stream received the interruption signal and finalized
+                assert(streamFinalized.isCompleted)
+            end for
+        }
+        "concurrent stream consumption" in runZIO {
+            val kyoStream = Stream.init(List.range(0, 100))
+            val zioStream = ZStreams.run(kyoStream)
+            for
+                fiber1 <- zioStream.runCollect.fork
+                fiber2 <- zioStream.runCollect.fork
+                fiber3 <- zioStream.runCollect.fork
+                r1     <- fiber1.join
+                r2     <- fiber2.join
+                r3     <- fiber3.join
+            yield
+                // Each fiber should get the full stream
+                assert(r1.toList == List.range(0, 100))
+                assert(r2.toList == List.range(0, 100))
+                assert(r3.toList == List.range(0, 100))
+            end for
+        }
+        "concurrent zio streams racing on shared kyo stream with mutable state" in runZIO {
+            import java.util.concurrent.atomic.AtomicInteger
+            import scala.collection.concurrent.TrieMap
+
+            // Kyo stream with internal mutable counter that multiple ZIO streams will race on
+            val counter   = new AtomicInteger(0)
+            val kyoStream = Stream.unfold((), chunkSize = 1) { _ =>
+                val value = counter.getAndIncrement()
+                if value < 100 then
+                    // Small delay to encourage interleaving
+                    Async.sleep(1.milli).andThen(Maybe((value, ())))
+                else
+                    Maybe.empty
+                end if
+            }
+
+            val sharedZioStream = ZStreams.run(kyoStream)
+
+            // 4 ZIO streams racing to consume from the same Kyo stream
+            for
+                fiber1 <- sharedZioStream.runCollect.fork
+                fiber2 <- sharedZioStream.runCollect.fork
+                fiber3 <- sharedZioStream.runCollect.fork
+                fiber4 <- sharedZioStream.runCollect.fork
+                r1     <- fiber1.join
+                r2     <- fiber2.join
+                r3     <- fiber3.join
+                r4     <- fiber4.join
+            yield
+                // Combine all results
+                val allValues    = (r1 ++ r2 ++ r3 ++ r4).toList
+                val uniqueValues = allValues.distinct.sorted
+
+                // Verify total data is maintained:
+                // 1. All values from 0 to 99 should be present exactly once
+                assert(uniqueValues == List.range(0, 100))
+                // 2. No duplicates - each value consumed by exactly one stream
+                assert(allValues.length == uniqueValues.length)
+                // 3. Total count should be 100
+                assert(allValues.length == 100)
+            end for
         }
     }
 

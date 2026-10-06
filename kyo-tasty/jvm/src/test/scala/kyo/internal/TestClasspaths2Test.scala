@@ -1,0 +1,68 @@
+package kyo.internal
+
+import kyo.*
+
+/** Verifies the TestClasspaths2 helper: warning-sink wiring and standard classpath fixture. */
+class TestClasspaths2Test extends kyo.test.Test[Any]:
+
+    import AllowUnsafe.embrace.danger
+
+    // The cold-vs-warm leaf cold-loads the full standard classpath, writes a snapshot, and reads it back
+    // (warm), holding two full classpaths plus serialization buffers at once. Run the suite sequentially so
+    // this heavy leaf does not contend with the other full-classpath leaves here: concurrent loads exhaust
+    // the forked test JVM heap, the leaf goes STUCK and times out, and the runaway load can take the runner
+    // down with a shutdown signal. Mirrors TastyGlobalFallbackTest's sequential config; the 3-minute timeout
+    // matches SnapshotFidelity2Test's headroom for the 20-30s-per-load work on a loaded CI machine.
+    override def config  = super.config.sequential
+    override def timeout = Duration.fromJava(java.time.Duration.ofMinutes(3))
+
+    "warning-sink-captures-tag-warnings" in {
+        TestClasspaths2.loadStandardWithSink.map { (classpath, sink) =>
+            val tagWarningCount = sink.unknownTagCount
+            assert(
+                tagWarningCount == 0,
+                s"Expected 0 unknown-tag warnings after term-tag routing fix, found $tagWarningCount. " +
+                    s"First warnings: ${sink.messages.filter(_.contains("TASTy")).take(3).mkString("; ")}"
+            )
+            succeed
+        }
+    }
+
+    "cold-vs-warm-loader-determinism" in {
+        TestClasspaths2.standardWithSnapshot().map { (cold, warm) =>
+            assert(
+                cold.symbols.size == warm.symbols.size,
+                s"cold.symbols.size (${cold.symbols.size}) != warm.symbols.size (${warm.symbols.size})"
+            )
+            assert(
+                cold.indices.byFullName.size == warm.indices.byFullName.size,
+                s"cold.fullNameIndex.size (${cold.indices.byFullName.size}) != warm.fullNameIndex.size (${warm.indices.byFullName.size})"
+            )
+            succeed
+        }
+    }
+
+    "standard-classpath-includes-stdlib-kyodata-kyotasty" in {
+        TestClasspaths.withClasspath(TestClasspaths2.standardRoots)(Tasty.classpath).map { classpath =>
+            assert(
+                // ~80,321 after finalizeMerge's package dedup removes per-file duplicate Package partials (was 81,569);
+                // real classes/members are unaffected (unioned into the canonical package), only duplicate Package headers collapse.
+                classpath.symbols.size >= 80000,
+                s"Expected >= 80,000 symbols (measured 80321 post-dedup), found ${classpath.symbols.size}"
+            )
+            val fileErrors = classpath.errors.filter {
+                case _: TastyError.CorruptedFile    => true
+                case _: TastyError.MalformedSection => true
+                case _: TastyError.FileNotFound     => true
+                case _                              => false
+            }
+            assert(
+                fileErrors.isEmpty,
+                s"Expected no file-level errors, found ${fileErrors.size}: " +
+                    fileErrors.take(3).map(_.toString).mkString(", ")
+            )
+            succeed
+        }
+    }
+
+end TestClasspaths2Test

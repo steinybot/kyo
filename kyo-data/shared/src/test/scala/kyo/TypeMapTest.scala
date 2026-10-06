@@ -1,9 +1,6 @@
 package kyo
 
-import kyo.Tag
-import kyo.TypeMap
-
-class TypeMapTest extends Test:
+class TypeMapTest extends kyo.test.Test[Any]:
     "empty" - {
         "TypeMap.empty" in {
             assert(TypeMap.empty.isEmpty)
@@ -63,15 +60,20 @@ class TypeMapTest extends Test:
             assert(e.get[Char] == 'c')
             assert(e.size == 4)
         }
-        "distinct" in pendingUntilFixed {
-            typeCheckFailure("TypeMap(0, 0)")("should fail")
+        "get rejects intersection types" in {
+            typeCheckFailure("TypeMap(42, \"foo\").get[Int & String]")(
+                "Intersection types are not supported here"
+            )
+        }
+        "distinct".pendingUntilFixed("TypeMap does not yet reject duplicate-type entries at compile time") in {
+            discard(typeCheckFailure("TypeMap(0, 0)")("should fail"))
         }
     }
     "fatal" - {
         import scala.util.Try
         import scala.util.Failure
 
-        def test[A: Tag](e: TypeMap[A], contents: String, tpe: String) =
+        def test[A: Tag](e: TypeMap[A], contents: String, tpe: String)(using kyo.test.AssertScope) =
             Try(e.get[A]) match
                 case Failure(error) => assert(
                         error.getMessage == s"fatal: kyo.TypeMap of contents [$contents] missing value of type: [$tpe]."
@@ -97,8 +99,24 @@ class TypeMapTest extends Test:
             val e: TypeMap[A & B] = TypeMap(b)
 
             assert(e.get[A] eq b)
-            assert(e.get[A & B] eq b)
             assert(e.get[A | B] eq b)
+        }
+        "class extending two traits" in {
+            given [A, B]: CanEqual[A, B] = CanEqual.derived
+            trait X
+            trait Y
+            class Z extends X with Y
+            val z = new Z
+
+            val e = TypeMap(z)
+            assert(e.get[Z] eq z)
+            assert(e.get[X] eq z)
+            assert(e.get[Y] eq z)
+        }
+        "opaque type" in {
+            val d = Duration.fromNanos(42L)
+            val e = TypeMap(d)
+            assert(e.get[Duration] == d)
         }
         "deterministic" in {
             trait A
@@ -201,7 +219,6 @@ class TypeMapTest extends Test:
             assert(e2.get[Int] == 42)
             assert(e2.get[A] == c)
             assert(e2.get[B] == c)
-            assert(e2.get[A & B] == c)
             assert(e2.get[A | B] == c)
             assert(e2.get[A | Thread] == c)
         }
@@ -225,11 +242,7 @@ class TypeMapTest extends Test:
             val e1: TypeMap[A] = TypeMap(a)
             val e2             = e1.add[A](b1)
             assert(e2.get[A] eq b1)
-            typeCheckFailure(
-                """
-                  | e2.get[B]
-                  |""".stripMargin
-            )(
+            typeCheckFailure("e2.get[B]")(
                 "Type argument B does not conform to lower bound A"
             )
         }
@@ -263,10 +276,12 @@ class TypeMapTest extends Test:
             assert(p.size == 1)
         }
         "Env[Super] -> Env[Sub]" in {
-            typeCheckFailure("""
-                  | val e = TypeMap(new Throwable)
-                  | val p = e.prune[Exception]
-                  |""".stripMargin)(
+            typeCheckFailure(
+                """
+val e = TypeMap(new Throwable)
+val p = e.prune[Exception]
+"""
+            )(
                 "Type argument Exception does not conform to lower bound Throwable"
             )
         }
@@ -291,7 +306,7 @@ class TypeMapTest extends Test:
 
     ".show" - {
         "many" in {
-            val t = TypeMap("str", true, 42, 'c').add(None).add(List[Any]()).add(Map('k' -> 'v'))
+            val t        = TypeMap("str", true, 42, 'c').add(None).add(List[Any]()).add(Map('k' -> 'v'))
             val expected =
                 "TypeMap(" +
                     "java.lang.String -> str, " +
@@ -305,4 +320,86 @@ class TypeMapTest extends Test:
             assert(t.show == expected)
         }
     }
+    "opaque types over intersections" - {
+        import TypeMapTestOpaques.*
+        given [A, B]: CanEqual[A, B] = CanEqual.derived
+        val f                        = new FileImpl
+
+        "opaque type = A & B" in {
+            val o = OpaqueIntersection(f)
+            val e = TypeMap(o)
+            assert(e.get[OpaqueIntersection] == o)
+        }
+        "opaque type >: Sub = A & B" in {
+            val o = OpaqueWithLowerBound(f)
+            val e = TypeMap(o)
+            assert(e.get[OpaqueWithLowerBound] == o)
+        }
+        "opaque type <: Super = A & B" in {
+            val o = OpaqueWithUpperBound(f)
+            val e = TypeMap(o)
+            assert(e.get[OpaqueWithUpperBound] == o)
+        }
+        "type alias over intersection is rejected" in {
+            typeCheckFailure("TypeMap(new TypeMapTestOpaques.FileImpl).get[TypeMapTestOpaques.RW]")(
+                "Intersection types are not supported here"
+            )
+        }
+    }
+
+    "across an opaque type's scope boundary" - {
+        import TypeMapTestScoped.*
+
+        "a map built inside is read outside" in {
+            val map = Meters.buildInside(Meters(5L))
+            assert(Meters.unwrap(map.get[Meters]) == 5L)
+        }
+
+        "a map built outside is read inside" in {
+            assert(Meters.unwrap(Meters.readInside(TypeMap(Meters(7L)))) == 7L)
+        }
+
+        "the key a scope derives is not the underlying type's key" in {
+            val map: TypeMap[Long & Meters] = TypeMap(9L).add(Meters.buildInside(Meters(5L)).get[Meters])
+            assert(map.get[Long] == 9L)
+            assert(Meters.unwrap(map.get[Meters]) == 5L)
+            assert(map.size == 2)
+        }
+    }
 end TypeMapTest
+
+object TypeMapTestScoped:
+    // A TypeMap built inside an opaque type's own scope is keyed on the tag derived there, and read
+    // outside with the tag derived there. The compiler substitutes the underlying type inside the
+    // scope before any macro runs, so the two tags once disagreed and the lookup missed (#1367).
+    // A summoned tag is refused there; the one derived by name is passed explicitly.
+    opaque type Meters = Long
+    object Meters:
+        def apply(value: Long): Meters  = value
+        def unwrap(value: Meters): Long = value
+        val tag: Tag[Meters]            = Tag.derive[Meters]
+
+        def buildInside(value: Meters): TypeMap[Meters] = TypeMap[Meters](value)(using tag)
+        def readInside(map: TypeMap[Meters]): Meters    =
+            map.get[Meters](using tag, summon[kyo.internal.NotIntersection[Meters]])
+    end Meters
+end TypeMapTestScoped
+
+object TypeMapTestOpaques:
+    trait Readable
+    trait Writable
+    class FileImpl extends Readable with Writable
+
+    type RW = Readable & Writable
+
+    opaque type OpaqueIntersection               = RW
+    opaque type OpaqueWithLowerBound >: FileImpl = RW
+    opaque type OpaqueWithUpperBound <: RW       = RW
+
+    object OpaqueIntersection:
+        def apply(v: Readable & Writable): OpaqueIntersection = v
+    object OpaqueWithLowerBound:
+        def apply(v: Readable & Writable): OpaqueWithLowerBound = v
+    object OpaqueWithUpperBound:
+        def apply(v: Readable & Writable): OpaqueWithUpperBound = v
+end TypeMapTestOpaques

@@ -1,0 +1,384 @@
+package kyo.internal.http1
+
+import kyo.*
+import kyo.internal.codec.*
+import kyo.internal.server.*
+import kyo.internal.util.*
+import kyo.net.internal.util.GrowableByteBuffer
+import scala.annotation.tailrec
+
+/** HTTP/1.1 implementation of StreamContext — one instance per connection, reused across requests.
+  *
+  * Lifecycle per request:
+  *   1. Parser calls setRequest(req, bodySpan) when headers are complete.
+  *   2. UnsafeServerDispatch routes the request and invokes the handler via IOTask.
+  *   3. Handler calls readBody() or streams bodyChannel for the request body.
+  *   4. Handler calls respond(status, headers) to get a ResponseWriter, then writes the body.
+  *   5. For keep-alive: takeLeftover() recovers any bytes beyond the body, which are injected back into the parser before the next request
+  *      cycle.
+  *
+  * All response writes go to the outbound Channel.Unsafe via offerOrLog. The headerBuf is shared (connection-scoped) and reset on each
+  * respond() call.
+  */
+final private[kyo] class Http1StreamContext(
+    val inbound: Channel.Unsafe[Span[Byte]],
+    val outbound: Channel.Unsafe[Span[Byte]],
+    headerBuf: GrowableByteBuffer
+)(using allow: AllowUnsafe, frame: Frame) extends StreamContext:
+
+    private var _request: ParsedRequest       = ParsedRequest.empty
+    private var _bodySpan: Span[Byte]         = Span.empty[Byte]
+    private var _mustCloseConnection: Boolean = false
+    // The request asked for the connection to end with its response (Connection: close, or HTTP/1.0 without keep-alive).
+    private var _announceClose: Boolean = false
+    // Written by the fiber reading the body and read by the idle timer on its own carrier.
+    @volatile private var _phase: Http1StreamContext.ReadPhase = Http1StreamContext.ReadPhase.HeadPending
+    @volatile private var _bodyProgress: Long                  = 0L
+    @volatile private var _awaitingPeer: Boolean               = false
+    // Written by a chunked decode fiber on its own carrier and read on the handler's completion; the dispatch restarts the parser only
+    // once the decode has reached the terminal chunk, and the atomic carries the write across the carriers.
+    private val _leftover: AtomicRef.Unsafe[Span[Byte]] = AtomicRef.Unsafe.init(Span.empty[Byte])
+    // The last write the outbound channel could not take at once, while it is still pending. Writes complete in order, so once it
+    // completes every earlier one has too.
+    private var pendingWrite: Maybe[Fiber.Unsafe[Unit, Abort[Closed]]] = Absent
+
+    /** Called by parser when request is ready. */
+    def setRequest(req: ParsedRequest, body: Span[Byte]): Unit =
+        _request = req
+        _bodySpan = body
+        _leftover.set(Span.empty[Byte])
+        _mustCloseConnection = false
+        _announceClose = !req.isKeepAlive
+        _phase =
+            if req.bodyBeyond(body.size) then Http1StreamContext.ReadPhase.BodyPending
+            else Http1StreamContext.ReadPhase.Handling
+    end setRequest
+
+    def request: ParsedRequest = _request
+
+    /** Marks the connection to end after the current request, read by the dispatch's fiber onComplete in place of the keep-alive restart,
+      * and announced by the next response's head. A path that ends the connection marks it before it writes its answer, since the head is
+      * the only place the peer learns of the close (RFC 9112 section 9.6).
+      */
+    def requestConnectionClose(): Unit =
+        _mustCloseConnection = true
+
+    def mustCloseConnection: Boolean = _mustCloseConnection
+
+    /** What the connection waits for from its peer, read by the idle timer when it fires: a request head, the rest of a request body, or
+      * nothing while a handler works on a body already read.
+      */
+    def phase: Http1StreamContext.ReadPhase = _phase
+
+    def awaitHead(): Unit = _phase = Http1StreamContext.ReadPhase.HeadPending
+
+    def bodyComplete(): Unit = _phase = Http1StreamContext.ReadPhase.Handling
+
+    def startDraining(): Unit = _phase = Http1StreamContext.ReadPhase.Draining
+
+    /** Counts the reads that brought body bytes off the connection; the idle timer compares it with the count at its arming. */
+    def noteBodyProgress(): Unit =
+        _awaitingPeer = false
+        _bodyProgress += 1
+
+    def bodyProgress: Long = _bodyProgress
+
+    /** Marks the body reader as about to suspend on the connection; the next read that returns clears it. A reader parked elsewhere (on
+      * its own output, on the handler) is not waiting for the peer, and the idle timer must not read its silence as the peer's.
+      */
+    def awaitPeer(): Unit = _awaitingPeer = true
+
+    def awaitingPeer: Boolean = _awaitingPeer
+
+    /** Returns the initial body bytes passed by the parser (e.g., chunk framing data for chunked requests, or partial body for
+      * Content-Length requests). Consumes the span — subsequent calls return empty.
+      */
+    def takeBodySpan(): Span[Byte] =
+        val result = _bodySpan
+        _bodySpan = Span.empty[Byte]
+        result
+    end takeBodySpan
+
+    /** Records the bytes a chunked decoder read past the body's end, which belong to the next request. A chunked request has no
+      * Content-Length, so `readBody` never records a leftover for the same request.
+      */
+    def setLeftover(bytes: Span[Byte]): Unit =
+        if bytes.nonEmpty then _leftover.set(bytes)
+
+    /** Returns any leftover bytes after the body that belong to the next request. Called by UnsafeServerDispatch before restarting the
+      * parser for keep-alive.
+      */
+    def takeLeftover(): Span[Byte] =
+        _leftover.getAndSet(Span.empty[Byte])
+
+    /** Runs `f` once the outbound channel has taken every write so far: now when none is waiting, otherwise when the waiting one completes.
+      * The dispatch restarts the parser through this, so the answers to requests a peer pipelines without reading stop the parse at the
+      * channel's capacity plus one answer instead of queuing one write per request (CWE-400).
+      */
+    def whenWritable(f: () => Unit)(using AllowUnsafe): Unit =
+        pendingWrite match
+            case Present(fiber) if !fiber.done() => fiber.onComplete(_ => f())
+            case _                               =>
+                pendingWrite = Absent
+                f()
+
+    /** Reads the full request body, accumulating from the inbound channel if needed.
+      *
+      * Fast path: if all body bytes arrived with the headers (contentLength <= bodySpan.size), returns immediately without touching the
+      * channel. Slow path: drains the inbound channel until contentLength bytes are accumulated. Any bytes beyond contentLength are
+      * preserved as leftover for the next request.
+      */
+    def readBody()(using Frame): Span[Byte] < (Async & Abort[Closed]) =
+        val contentLength = _request.contentLength
+        if contentLength <= 0 then
+            bodyComplete()
+            Span.empty[Byte]
+        else if _bodySpan.size >= contentLength then
+            // Fast path: all body bytes already available
+            val body = _bodySpan.slice(0, contentLength)
+            if _bodySpan.size > contentLength then
+                _leftover.set(_bodySpan.slice(contentLength, _bodySpan.size))
+            bodyComplete()
+            body
+        else
+            // Slow path: need more bytes from inbound channel
+            val bodyBuf = new GrowableByteBuffer
+            // Copy initial body bytes
+            if !_bodySpan.isEmpty then
+                val arr = _bodySpan.toArray
+                bodyBuf.writeBytes(arr, 0, arr.length)
+            accumulate(bodyBuf, contentLength).map { body =>
+                bodyComplete()
+                body
+            }
+        end if
+    end readBody
+
+    /** Accumulates bytes from the inbound channel until contentLength is reached. Uses channel.safe.take to suspend the Kyo fiber without
+      * blocking OS threads.
+      */
+    private def accumulate(bodyBuf: GrowableByteBuffer, contentLength: Int)(using Frame): Span[Byte] < (Async & Abort[Closed]) =
+        if bodyBuf.size >= contentLength then
+            // We have enough bytes — extract body and preserve leftover
+            val allBytes = bodyBuf.toByteArray
+            val body     = Span.fromUnsafe(java.util.Arrays.copyOf(allBytes, contentLength))
+            if allBytes.length > contentLength then
+                val leftoverArr = new Array[Byte](allBytes.length - contentLength)
+                java.lang.System.arraycopy(allBytes, contentLength, leftoverArr, 0, leftoverArr.length)
+                _leftover.set(Span.fromUnsafe(leftoverArr))
+            end if
+            body
+        else
+            // Bytes already in hand are taken without announcing a wait: the announcement is read by the idle timer on its own carrier,
+            // and a wait announced for a take that returns at once would read as the peer's silence.
+            def feed(span: Span[Byte]): Span[Byte] < (Async & Abort[Closed]) =
+                noteBodyProgress()
+                val arr = span.toArray
+                bodyBuf.writeBytes(arr, 0, arr.length)
+                accumulate(bodyBuf, contentLength)
+            end feed
+            inbound.safe.poll.map {
+                case Present(span) => feed(span)
+                case Absent        =>
+                    awaitPeer()
+                    inbound.safe.take.map(feed)
+            }
+
+    def bodyChannel: Channel.Unsafe[Span[Byte]] = inbound
+
+    /** Serializes the status line, the Date header and `headers` into headerBuf, then offers the block to the outbound channel. */
+    private def writeHead(status: HttpStatus, headers: HttpHeaders)(using AllowUnsafe): Unit =
+        headerBuf.reset()
+        val code   = status.code
+        val cached = if HttpStatus.isValid(code) then Http1StreamContext.statusLineCache(code) else null
+        if cached != null then
+            headerBuf.writeBytes(cached, 0, cached.length)
+        else
+            headerBuf.writeBytes(Http1StreamContext.HttpVersionPrefix, 0, Http1StreamContext.HttpVersionPrefix.length)
+            headerBuf.writeIntAscii(code)
+            headerBuf.writeByte(' ')
+            headerBuf.writeAscii(Http1StreamContext.reasonPhrase(status))
+            headerBuf.writeBytes(Http1StreamContext.CRLF, 0, Http1StreamContext.CRLF.length)
+        end if
+        // Inject Date header automatically on every response (RFC 9110 section 6.6.1)
+        headerBuf.writeBytes(Http1StreamContext.DatePrefix, 0, Http1StreamContext.DatePrefix.length)
+        headerBuf.writeAscii(UnsafeServerDispatch.currentDate())
+        headerBuf.writeBytes(Http1StreamContext.CRLF, 0, Http1StreamContext.CRLF.length)
+        headers.writeToBuffer(headerBuf)
+        headerBuf.writeBytes(Http1StreamContext.CRLF, 0, Http1StreamContext.CRLF.length)
+        offerOrLog(Span.fromUnsafe(headerBuf.toByteArray), "Http1StreamContext respond")
+    end writeHead
+
+    /** Serializes a response and returns the writer for its body.
+      *
+      * Every response header of every route converges here, so this is where a header that cannot go on the wire is caught: a name that is
+      * not a token, or a value carrying a control character, would let a recipient read one header line as two and see a header the handler
+      * never set (response splitting, RFC 9112 section 11.1). A handler reaches this with peer data whenever it echoes one, a trace id or a
+      * CORS origin being the usual shapes.
+      *
+      * `respond` has no error channel, so an invalid field fails closed: the handler's headers are dropped and a bare 500 goes out in their
+      * place. The returned writer discards the body that was meant for the original response, which would otherwise run past the 500's
+      * declared length and desynchronize the connection.
+      */
+    def respond(status: HttpStatus, headers: HttpHeaders)(using AllowUnsafe): ResponseWriter =
+        headers.invalidField match
+            case Absent =>
+                // The final response on a connection that is about to end, because the request asked or because the server marked it,
+                // announces it (RFC 9112 section 9.6), whatever the handler set: a `keep-alive` on a connection about to close would have
+                // the peer send its next request into a socket nothing reads.
+                val announced = if _announceClose || _mustCloseConnection then headers.set("Connection", "close") else headers
+                writeHead(status, announced)
+                http1ResponseWriter
+            case Present(field) =>
+                Log.live.unsafe.error(s"Http1StreamContext respond: cannot write $field, responding 500")
+                writeHead(HttpStatus.InternalServerError, Http1StreamContext.EmptyBodyHeaders)
+                Http1StreamContext.discardingResponseWriter
+    end respond
+
+    /** Writes an interim response (a `100 Continue`), which precedes the final one on the same request (RFC 9110 section 15.2). */
+    def writeInterim(bytes: Span[Byte])(using AllowUnsafe): Unit =
+        offerOrLog(bytes, "Http1StreamContext interim response")
+
+    /** Puts data to outbound channel with backpressure. Uses offer() first for the fast path, falls back to putFiber() when the channel is
+      * full to avoid silently dropping data; that write is the one `whenWritable` waits for.
+      */
+    private def offerOrLog(data: Span[Byte], context: String)(using AllowUnsafe): Unit =
+        outbound.offer(data) match
+            case Result.Success(true)      => () // fast path: channel had space
+            case Result.Success(false)     => pendingWrite = Present(outbound.putFiber(data))
+            case Result.Failure(_: Closed) => () // channel closed, connection shutting down
+            case Result.Panic(t)           =>
+                Log.live.unsafe.error(s"$context: panic", t)
+
+    private val http1ResponseWriter: ResponseWriter = new ResponseWriter:
+        def writeBody(data: Span[Byte])(using AllowUnsafe): Unit =
+            offerOrLog(data, "Http1StreamContext writeBody")
+
+        def writeChunk(data: Span[Byte])(using AllowUnsafe): Unit =
+            // Combine chunk header + data + CRLF into a single offer to reduce channel contention.
+            // This avoids 3 separate offers (hex size, data, CRLF) per chunk.
+            val hexHeader = Http1StreamContext.formatChunkSize(data.size)
+            val combined  = new Array[Byte](hexHeader.length + data.size + 2)
+            java.lang.System.arraycopy(hexHeader, 0, combined, 0, hexHeader.length)
+            discard(data.copyToArray(combined, hexHeader.length))
+            combined(combined.length - 2) = '\r'.toByte
+            combined(combined.length - 1) = '\n'.toByte
+            offerOrLog(Span.fromUnsafe(combined), "Http1StreamContext writeChunk")
+        end writeChunk
+
+        def finish()(using AllowUnsafe): Unit =
+            offerOrLog(Span.fromUnsafe(Http1StreamContext.LAST_CHUNK), "Http1StreamContext finish")
+    end http1ResponseWriter
+
+end Http1StreamContext
+
+private[kyo] object Http1StreamContext:
+    val CRLF: Array[Byte]                      = "\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+    val LAST_CHUNK: Array[Byte]                = "0\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+    private val HttpVersionPrefix: Array[Byte] = "HTTP/1.1 ".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+    private val DatePrefix: Array[Byte]        = "Date: ".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+
+    /** The only headers of the 500 that replaces a response carrying a field the serializer must refuse. Declaring an empty body is what
+      * lets the connection stay framed once the original response's body is discarded.
+      */
+    private val EmptyBodyHeaders: HttpHeaders = HttpHeaders.empty.add("Content-Length", 0)
+
+    /** What a connection waits for from its peer: a request head; the rest of a request body a reader wants; nothing, while a handler works
+      * on a body already read; or the rest of a request it has answered and will not use, read and discarded before the close.
+      */
+    enum ReadPhase derives CanEqual:
+        case HeadPending, BodyPending, Handling, Draining
+
+    /** Drops everything written to it, for a response whose head was replaced by a 500. The 500 declares `Content-Length: 0`, so a body
+      * write would run past the declared length and `finish()` would append the chunked last-chunk marker; either desynchronizes the
+      * connection for the next request on it.
+      */
+    private val discardingResponseWriter: ResponseWriter = new ResponseWriter:
+        def writeBody(data: Span[Byte])(using AllowUnsafe): Unit  = ()
+        def writeChunk(data: Span[Byte])(using AllowUnsafe): Unit = ()
+        def finish()(using AllowUnsafe): Unit                     = ()
+    end discardingResponseWriter
+
+    /** Returns the standard HTTP reason phrase for common status codes. HttpStatus owns the canonical name but reason phrases are HTTP/1.1
+      * wire-format specific, so they live here.
+      */
+    def reasonPhrase(status: HttpStatus): String =
+        status.code match
+            case 100 => "Continue"
+            case 101 => "Switching Protocols"
+            case 200 => "OK"
+            case 201 => "Created"
+            case 202 => "Accepted"
+            case 204 => "No Content"
+            case 301 => "Moved Permanently"
+            case 302 => "Found"
+            case 303 => "See Other"
+            case 304 => "Not Modified"
+            case 307 => "Temporary Redirect"
+            case 308 => "Permanent Redirect"
+            case 400 => "Bad Request"
+            case 401 => "Unauthorized"
+            case 403 => "Forbidden"
+            case 404 => "Not Found"
+            case 405 => "Method Not Allowed"
+            case 408 => "Request Timeout"
+            case 409 => "Conflict"
+            case 410 => "Gone"
+            case 411 => "Length Required"
+            case 413 => "Payload Too Large"
+            case 414 => "URI Too Long"
+            case 415 => "Unsupported Media Type"
+            case 417 => "Expectation Failed"
+            case 418 => "I'm a Teapot"
+            case 422 => "Unprocessable Entity"
+            case 429 => "Too Many Requests"
+            case 500 => "Internal Server Error"
+            case 501 => "Not Implemented"
+            case 502 => "Bad Gateway"
+            case 503 => "Service Unavailable"
+            case 504 => "Gateway Timeout"
+            case _   => status.name
+    end reasonPhrase
+
+    /** Pre-cached status line bytes for common HTTP status codes. Avoids Int.toString and string concat allocations on every response. */
+    val statusLineCache: Array[Array[Byte]] =
+        val arr = new Array[Array[Byte]](600)
+        for code <- Seq(100, 101, 200, 201, 202, 204, 301, 302, 303, 304, 307, 308,
+                400, 401, 403, 404, 405, 408, 409, 410, 411, 413, 414, 415,
+                417, 418, 422, 429, 500, 501, 502, 503, 504)
+        do
+            val line = s"HTTP/1.1 $code ${reasonPhrase(HttpStatus(code))}\r\n"
+            arr(code) = line.getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+        end for
+        arr
+    end statusLineCache
+
+    private val hexDigits: Array[Byte] = "0123456789abcdef".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+
+    /** Formats an integer as a hex chunk-size header ("abc\r\n") without String allocation. */
+    def formatChunkSize(size: Int): Array[Byte] =
+        // Count hex digits needed
+        @tailrec def countDigits(n: Int, acc: Int): Int = if n == 0 then acc else countDigits(n >>> 4, acc + 1)
+        val digits                                      = countDigits(size >>> 4, 1)
+        val result                                      = new Array[Byte](digits + 2)
+        @tailrec def fillDigits(n: Int, i: Int): Unit   =
+            if i >= 0 then
+                result(i) = hexDigits(n & 0xf)
+                fillDigits(n >>> 4, i - 1)
+        fillDigits(size, digits - 1)
+        result(digits) = '\r'.toByte
+        result(digits + 1) = '\n'.toByte
+        result
+    end formatChunkSize
+
+    /** Formats a chunk as a single Span: hex-size CRLF data CRLF */
+    def formatChunkSpan(data: Span[Byte]): Span[Byte] =
+        val hexHeader = formatChunkSize(data.size)
+        val combined  = new Array[Byte](hexHeader.length + data.size + 2)
+        java.lang.System.arraycopy(hexHeader, 0, combined, 0, hexHeader.length)
+        discard(data.copyToArray(combined, hexHeader.length))
+        combined(combined.length - 2) = '\r'.toByte
+        combined(combined.length - 1) = '\n'.toByte
+        Span.fromUnsafe(combined)
+    end formatChunkSpan
+end Http1StreamContext

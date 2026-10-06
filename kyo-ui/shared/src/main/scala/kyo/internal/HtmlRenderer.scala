@@ -1,0 +1,2260 @@
+package kyo.internal
+
+import kyo.*
+import kyo.Svg
+import kyo.UI.*
+import kyo.UI.Ast.*
+
+private[kyo] object HtmlRenderer:
+
+    // className -> rule CSS text, accumulated during a renderWithCss traversal. Threaded through
+    // renderTo/renderCommonAttrs/renderDropdown* the same way `sb` carries the HTML, so collection
+    // costs nothing on the render(...) path (cssRules stays Absent there).
+    private type CssCollector = scala.collection.mutable.LinkedHashMap[String, String]
+
+    /** Render a UI tree to HTML with data-kyo-path attributes. */
+    def render(ui: UI, path: Seq[String])(using Frame): String < Sync =
+        val sb = new StringBuilder
+        renderTo(
+            sb,
+            ui,
+            path,
+            ReactiveRegion.RegionIdentity.root(path),
+            ReactiveRegion.Namespace.Html,
+            parentContext = ReactiveRegion.ParentContext.Other,
+            boundaryMode = ReactiveRegion.BoundaryMode.Emit
+        ).andThen(sb.toString)
+    end render
+
+    private[kyo] def renderRegion(ui: UI, path: Seq[String])(using Frame): String < Sync =
+        renderRegion(ui, path, ReactiveRegion.RegionIdentity.root(path))
+
+    private[kyo] def renderRegion(ui: UI, path: Seq[String], context: ReactiveRegion.RegionIdentity)(using Frame): String < Sync =
+        renderRegion(
+            ui,
+            path,
+            context,
+            ReactiveRegion.from(context, svgContext = false),
+            ReactiveRegion.ParentContext.Other,
+            ReactiveRegion.BoundaryMode.Suppress
+        )
+
+    private[kyo] def renderRegion(
+        ui: UI,
+        path: Seq[String],
+        context: ReactiveRegion.RegionIdentity,
+        region: ReactiveRegion,
+        parentContext: ReactiveRegion.ParentContext,
+        boundaryMode: ReactiveRegion.BoundaryMode
+    )(using Frame): String < Sync =
+        val sb   = new StringBuilder
+        val host = ReactiveRegion.renderHost(region, parentContext, ReactiveRegion.tableContent(ui))
+        renderHostedContent(sb, ui, path, context, host, boundaryMode).andThen(sb.toString)
+    end renderRegion
+
+    /** Render a UI tree to HTML, additionally collecting the CSS rule(s) for every pseudo-state
+      * (hover/focus/active/disabled) [[kyo.Style]] encountered along the way.
+      *
+      * Used by the server-push runtime (`kyo.internal.UIServer`), which has no inline-style channel
+      * for pseudo-states: an inline `style="..."` attribute cannot express `:hover` etc., so the
+      * collected rules must be carried in a real stylesheet alongside the HTML instead. Each entry is
+      * `(stableClass, ruleCss)`; an element whose pseudo-state style produces the SAME rule text as one
+      * already collected shares its class rather than generating a new one (see
+      * [[kyo.internal.CssStyleRenderer.pseudoStateClass]]), so the result has one entry per distinct
+      * rule, in first-encountered order.
+      */
+    private[kyo] def renderWithCss(ui: UI, path: Seq[String])(using Frame): (String, Chunk[(String, String)]) < Sync =
+        val sb  = new StringBuilder
+        val css = new CssCollector
+        renderTo(
+            sb,
+            ui,
+            path,
+            ReactiveRegion.RegionIdentity.root(path),
+            ReactiveRegion.Namespace.Html,
+            cssRules = Present(css),
+            parentContext = ReactiveRegion.ParentContext.Other,
+            boundaryMode = ReactiveRegion.BoundaryMode.Emit
+        )
+            .andThen((sb.toString, Chunk.from(css)))
+    end renderWithCss
+
+    private[kyo] def renderRegionWithCss(ui: UI, path: Seq[String])(using
+        Frame
+    ): (String, Chunk[(String, String)]) < Sync =
+        renderRegionWithCss(ui, path, ReactiveRegion.RegionIdentity.root(path))
+
+    private[kyo] def renderRegionWithCss(
+        ui: UI,
+        path: Seq[String],
+        context: ReactiveRegion.RegionIdentity
+    )(using Frame): (String, Chunk[(String, String)]) < Sync =
+        renderRegionWithCss(
+            ui,
+            path,
+            context,
+            ReactiveRegion.from(context, svgContext = false),
+            ReactiveRegion.ParentContext.Other,
+            ReactiveRegion.BoundaryMode.Suppress
+        )
+
+    private[kyo] def renderRegionWithCss(
+        ui: UI,
+        path: Seq[String],
+        context: ReactiveRegion.RegionIdentity,
+        region: ReactiveRegion,
+        parentContext: ReactiveRegion.ParentContext,
+        boundaryMode: ReactiveRegion.BoundaryMode
+    )(using Frame): (String, Chunk[(String, String)]) < Sync =
+        val sb       = new StringBuilder
+        val css      = new CssCollector
+        val host     = ReactiveRegion.renderHost(region, parentContext, ReactiveRegion.tableContent(ui))
+        val rendered = renderHostedContent(sb, ui, path, context, host, boundaryMode, Present(css))
+        rendered.andThen((sb.toString, Chunk.from(css)))
+    end renderRegionWithCss
+
+    private def renderHostedContent(
+        sb: StringBuilder,
+        ui: UI,
+        path: Seq[String],
+        context: ReactiveRegion.RegionIdentity,
+        host: ReactiveRegion.RenderHost,
+        boundaryMode: ReactiveRegion.BoundaryMode,
+        cssRules: Maybe[CssCollector] = Absent
+    )(using Frame): Unit < Sync =
+        host match
+            case ReactiveRegion.RenderHost.HtmlTableBody(id) =>
+                w(sb, s"<tbody data-kyo-range-host=\"$id\">")
+                renderTo(
+                    sb,
+                    ui,
+                    path,
+                    context,
+                    ReactiveRegion.Namespace.Html,
+                    cssRules,
+                    ReactiveRegion.ParentContext.Other,
+                    boundaryMode
+                ).andThen(w(sb, "</tbody>"))
+            case host =>
+                renderTo(
+                    sb,
+                    ui,
+                    path,
+                    context,
+                    ReactiveRegion.namespace(host),
+                    cssRules,
+                    ReactiveRegion.contentParent(host),
+                    boundaryMode
+                )
+    end renderHostedContent
+
+    private[kyo] def wrapReactiveRegion(region: ReactiveRegion, innerHtml: String): String =
+        region match
+            case ReactiveRegion.HtmlRange(id)    => s"<!--kyo-rs:$id-->$innerHtml<!--kyo-re:$id-->"
+            case ReactiveRegion.SvgElement(path) =>
+                s"""<g data-kyo-path="${pathAttr(path)}" data-kyo-reactive>$innerHtml</g>"""
+
+    private def openSvgRegion(path: Seq[String]): String =
+        s"""<g data-kyo-path="${pathAttr(path)}" data-kyo-reactive>"""
+
+    /** Wrap body HTML in a full page with inline JS client. */
+    def renderPage(title: String, body: String, css: String, basePath: String): String =
+        s"""<!DOCTYPE html>
+           |<html>
+           |<head>
+           |<meta charset="UTF-8">
+           |<title>${esc(title)}</title>
+           |<style>$baseCss$css</style>
+           |</head>
+           |<body>$body
+           |<script>${clientJs(jsStr(basePath))}</script>
+           |</body>
+           |</html>""".stripMargin
+
+    /** Wrap body HTML in a complete static HTML document with a configurable head (for SSG/SSR).
+      *
+      * Unlike `renderPage` (which injects the SSE client JS for server-push), this helper emits a
+      * clean static document with an optional module script: the caller's bundle or nothing. The
+      * `baseCss` reset is always emitted before `head.css` so framework defaults can be overridden.
+      * Called by `UI.runRenderPage`.
+      */
+    private[kyo] def page(head: UI.PageHead, body: String): String =
+        document(head, "", body, "")
+
+    /** A server-push page: the document [[page]] builds for `head`, with the page's pseudo-state rules after `head.css` and the
+      * WebSocket client for `basePath` at the end of the body.
+      */
+    private[kyo] def serverPage(head: UI.PageHead, body: String, css: String, basePath: String): String =
+        document(head, css, body, s"<script>${clientJs(jsStr(basePath))}</script>")
+
+    private def document(head: UI.PageHead, css: String, body: String, client: String): String =
+        val metaTags = head.meta.map((n, c) => s"""<meta name="${esc(n)}" content="${esc(c)}">""").mkString
+        val linkTags = head.links.map((r, h) => s"""<link rel="${esc(r)}" href="${esc(h)}">""").mkString
+        val script   = head.moduleScript match
+            case Present(src) => s"""<script type="module" src="${esc(src)}"></script>"""
+            case Absent       => ""
+        val ldBlock = head.jsonLd match
+            case Present(di) => renderDataIsland(di)
+            case Absent      => ""
+        val islands = head.dataIslands.map(renderDataIsland).mkString
+        s"""<!DOCTYPE html>
+           |<html lang="en">
+           |<head>
+           |<meta charset="utf-8">
+           |<meta name="viewport" content="width=device-width, initial-scale=1">
+           |<title>${esc(head.title)}</title>
+           |$metaTags$linkTags
+           |<style>$baseCss${head.css}$css</style>
+           |$ldBlock</head>
+           |<body>$body$islands$client</body>
+           |$script
+           |</html>""".stripMargin
+    end document
+
+    // Render a data island as `<script type="..."[ id="..."]>ESCAPED-JSON</script>`. The type
+    // and id attributes use the HTML-entity escape (`esc`); the JSON body uses the JS-unicode
+    // escape (`escScript`) so a `</script>` substring renders as `</script>`, inert
+    // text the consumer's JSON.parse still reads, rather than the HTML-entity form `&lt;` that
+    // would change the bytes and break JSON.parse on read-back.
+    private def renderDataIsland(di: UI.DataIsland): String =
+        val idAttr = di.id match
+            case Present(v) => s""" id="${esc(v)}""""
+            case Absent     => ""
+        s"""<script type="${esc(di.scriptType)}"$idAttr>${escScript(di.json)}</script>"""
+    end renderDataIsland
+
+    // The single owner of the data-island body escape: a literal "</script>" in the JSON body
+    // would close the element early, so "<"/">" become their JSON unicode escapes. This is the
+    // JS-unicode form ("<"/">"), NOT the HTML-entity esc(...) form, because the body
+    // is JSON read back by JSON.parse, not HTML re-parsed.
+    private def escScript(json: String): String =
+        json.replace("<", "\\u003c").replace(">", "\\u003e")
+
+    // ---- Core rendering ----
+
+    private def renderTo(
+        sb: StringBuilder,
+        ui: UI,
+        path: Seq[String],
+        context: ReactiveRegion.RegionIdentity,
+        namespace: ReactiveRegion.Namespace,
+        cssRules: Maybe[CssCollector] = Absent,
+        parentContext: ReactiveRegion.ParentContext,
+        boundaryMode: ReactiveRegion.BoundaryMode
+    )(using
+        Frame
+    ): Unit < Sync =
+        ui match
+            case dd: Dropdown =>
+                renderBoundElementBoundary(sb, dd, context, namespace, parentContext, boundaryMode) {
+                    renderDropdown(sb, dd, path, cssRules)
+                }
+            case elem: Element =>
+                val tag  = tagName(elem)
+                val void = elem.isInstanceOf[Void]
+                renderBoundElementBoundary(sb, elem, context, namespace, parentContext, boundaryMode) {
+                    w(sb, s"""<$tag data-kyo-path="${pathAttr(path)}"""")
+                    renderCommonAttrs(sb, elem, cssRules)
+                    renderEventAttr(sb, elem)
+                    for _ <- renderElementAttrs(sb, elem)
+                    yield
+                        if void then
+                            w(sb, " />")
+                            elem match
+                                case ta: Textarea =>
+                                    sb.delete(sb.length - 3, sb.length)
+                                    w(sb, ">")
+                                    renderTextareaValue(sb, ta).andThen(w(sb, "</textarea>"))
+                                case _: Iframe =>
+                                    // iframe is not a void element: it needs an explicit closing tag.
+                                    sb.delete(sb.length - 3, sb.length)
+                                    w(sb, "></iframe>")
+                                case _ => ()
+                            end match
+                        else
+                            w(sb, ">")
+                            // ForeignObject bridges back to HTML, so reset svg context to false. It MUST be
+                            // matched before SvgElement (ForeignObject IS an SvgElement).
+                            val childNamespace = elem match
+                                case _: Svg.ForeignObject => ReactiveRegion.Namespace.Html
+                                case _: Svg.SvgElement    => ReactiveRegion.Namespace.Svg
+                                case _                    => namespace
+                            val childParentContext = elem match
+                                case _: Table => ReactiveRegion.ParentContext.HtmlTable
+                                case _        => ReactiveRegion.ParentContext.Other
+                            val textChild: Unit < Sync = elem match
+                                case t: Svg.Title => w(sb, esc(t.text)); Kyo.unit
+                                case d: Svg.Desc  => w(sb, esc(d.text)); Kyo.unit
+                                case _            => Kyo.unit
+                            textChild.andThen(
+                                Kyo.foreachDiscard(elem.children.toSeq.zipWithIndex) { (child, i) =>
+                                    renderTo(
+                                        sb,
+                                        child,
+                                        path :+ i.toString,
+                                        context.child(i.toString),
+                                        childNamespace,
+                                        cssRules,
+                                        childParentContext,
+                                        ReactiveRegion.BoundaryMode.Emit
+                                    )
+                                }.andThen(w(sb, s"</$tag>"))
+                            )
+                        end if
+                    end for
+                }
+
+            case UI.Ast.RawHtml(value) =>
+                w(sb, value)
+
+            case UI.Ast.Text(value) =>
+                w(sb, esc(value))
+
+            case Fragment(children) =>
+                // Use key for KeyedChild, index for everything else. This matches the path scheme
+                // walkStatic uses, so server-side event routing aligns with rendered data-kyo-path.
+                Kyo.foreachDiscard(children.toSeq.zipWithIndex) { (child, i) =>
+                    val childPath = child match
+                        case kc: KeyedChild[?] => path :+ kc.key
+                        case _                 => path :+ i.toString
+                    val childContext = child match
+                        case kc: KeyedChild[?] => context.child(kc.key)
+                        case _                 => context.child(i.toString)
+                    renderTo(sb, child, childPath, childContext, namespace, cssRules, parentContext, ReactiveRegion.BoundaryMode.Emit)
+                }
+
+            case KeyedChild(_, child) =>
+                renderTo(sb, child, path, context, namespace, cssRules, parentContext, boundaryMode)
+
+            case r: Reactive[?] =>
+                val region = ReactiveRegion.from(context, namespace)
+                for current <- r.signal.current(using r.frame)
+                yield
+                    val host = ReactiveRegion.renderHost(region, parentContext, ReactiveRegion.tableContent(current))
+                    openInitialHost(sb, host)
+                    renderTo(
+                        sb,
+                        current,
+                        path,
+                        context.transparent,
+                        ReactiveRegion.namespace(host),
+                        cssRules,
+                        ReactiveRegion.contentParent(host),
+                        ReactiveRegion.BoundaryMode.Emit
+                    ).andThen(closeInitialHost(sb, host))
+                end for
+
+            case fe: Foreach[?, ?] @unchecked =>
+                val region = ReactiveRegion.from(context, namespace)
+                fe.applyTyped {
+                    [T] => (signal, keyFn, renderFn) =>
+                        for items <- signal.current(using fe.frame)
+                        yield
+                            val rendered = items.toSeq.zipWithIndex.map { (item, i) =>
+                                val key = keyFn match
+                                    case Present(f) => f(item)
+                                    case Absent     => i.toString
+                                (key, renderFn(i, item))
+                            }
+                            val content = ReactiveRegion.tableContent(rendered.iterator.map(_._2))
+                            val host    = ReactiveRegion.renderHost(region, parentContext, content)
+                            openInitialHost(sb, host)
+                            Kyo.foreachDiscard(rendered) { (key, child) =>
+                                renderTo(
+                                    sb,
+                                    child,
+                                    path :+ key,
+                                    context.child(key),
+                                    ReactiveRegion.namespace(host),
+                                    cssRules,
+                                    ReactiveRegion.contentParent(host),
+                                    ReactiveRegion.BoundaryMode.Emit
+                                )
+                            }.andThen(closeInitialHost(sb, host))
+                        end for
+                }
+    end renderTo
+
+    private def renderBoundElementBoundary(
+        sb: StringBuilder,
+        elem: Element,
+        context: ReactiveRegion.RegionIdentity,
+        namespace: ReactiveRegion.Namespace,
+        parentContext: ReactiveRegion.ParentContext,
+        boundaryMode: ReactiveRegion.BoundaryMode
+    )(render: => Unit < Sync)(using Frame): Unit < Sync =
+        val host = (namespace, boundaryMode, ReactiveUI.collectSignalRef(elem)) match
+            case (ReactiveRegion.Namespace.Html, ReactiveRegion.BoundaryMode.Emit, Present(_)) =>
+                Present(
+                    ReactiveRegion.renderHost(
+                        ReactiveRegion.HtmlRange(ReactiveRegion.htmlId(context)),
+                        parentContext,
+                        ReactiveRegion.tableContent(elem)
+                    )
+                )
+            case _ => Absent
+        host.foreach(openInitialHost(sb, _))
+        render.andThen(host.foreach(closeInitialHost(sb, _)))
+    end renderBoundElementBoundary
+
+    private def openInitialHost(sb: StringBuilder, host: ReactiveRegion.RenderHost): Unit =
+        host match
+            case ReactiveRegion.RenderHost.HtmlComments(id, _) => w(sb, s"<!--kyo-rs:$id-->")
+            case ReactiveRegion.RenderHost.HtmlTableBody(id)   =>
+                w(sb, s"<tbody data-kyo-range-host=\"$id\"><!--kyo-rs:$id-->")
+            case ReactiveRegion.RenderHost.SvgGroup(path) => w(sb, openSvgRegion(path))
+
+    private def closeInitialHost(sb: StringBuilder, host: ReactiveRegion.RenderHost): Unit =
+        host match
+            case ReactiveRegion.RenderHost.HtmlComments(id, _) => w(sb, s"<!--kyo-re:$id-->")
+            case ReactiveRegion.RenderHost.HtmlTableBody(id)   => w(sb, s"<!--kyo-re:$id--></tbody>")
+            case _: ReactiveRegion.RenderHost.SvgGroup         => w(sb, "</g>")
+
+    private def renderTextareaValue(sb: StringBuilder, ta: Textarea)(using Frame): Unit < Sync =
+        ta.value match
+            case Present(Bound.Const(s)) => w(sb, esc(masked(ta.inputMask, s)))
+            case Present(Bound.Ref(ref)) =>
+                for str <- ref.get
+                yield w(sb, esc(masked(ta.inputMask, str)))
+            case _ => ()
+
+    // ---- Dropdown (custom div-based overlay) ----
+
+    private def renderDropdown(sb: StringBuilder, dd: Dropdown, path: Seq[String], cssRules: Maybe[CssCollector])(using
+        Frame
+    ): Unit < Sync =
+        val baseId = dd.attrs.identifier.getOrElse("")
+        // Read current selected value for initial highlight
+        val currentValueEffect: Unit < Sync = dd.value match
+            case Present(Bound.Ref(ref)) =>
+                ref.get.map { currentVal =>
+                    renderDropdownWithValue(sb, dd, path, baseId, currentVal, cssRules)
+                }
+            case Present(Bound.Const(s)) =>
+                renderDropdownWithValue(sb, dd, path, baseId, s, cssRules)
+            case _ =>
+                renderDropdownWithValue(sb, dd, path, baseId, "", cssRules)
+        currentValueEffect
+    end renderDropdown
+
+    private def renderDropdownWithValue(
+        sb: StringBuilder,
+        dd: Dropdown,
+        path: Seq[String],
+        baseId: String,
+        currentVal: String,
+        cssRules: Maybe[CssCollector]
+    )(using
+        Frame
+    ): Unit =
+        val pathStr     = pathAttr(path)
+        val idAttr      = if baseId.nonEmpty then s""" id="${esc(baseId)}"""" else ""
+        val ddAttr      = if baseId.nonEmpty then s""" data-kyo-dropdown="${esc(baseId)}"""" else " data-kyo-dropdown"
+        val disAttr     = if dd.disabled.getOrElse(false) then " data-kyo-disabled" else ""
+        val hidAttr     = if dd.attrs.hidden.getOrElse(false) then " hidden" else ""
+        val tabAttr     = dd.attrs.tabIndex.map(n => s""" tabindex="$n"""").getOrElse("")
+        val pseudoClass = registerPseudoClass(cssRules, dd.attrs.uiStyle)
+        // A generated pseudoClass already carries the base props in its own rule (see
+        // registerPseudoClass); rendering them inline too would shadow the pseudo-state override.
+        val styleStr = if pseudoClass.nonEmpty then ""
+        else
+            val styleAttr = CssStyleRenderer.render(dd.attrs.uiStyle)
+            if styleAttr.nonEmpty then s""" style="${esc(styleAttr)}"""" else ""
+        // The dropdown wrapper carries its cssClasses (the same `.cssClass(...)` hook every other
+        // element honors), plus the generated pseudoClass when present, so callers can style the
+        // trigger container via a class selector.
+        val classes = pseudoClass match
+            case Present(cls) => dd.attrs.cssClasses :+ cls
+            case Absent       => dd.attrs.cssClasses
+        val clsStr = if classes.nonEmpty then s""" class="${esc(classes.mkString(" "))}"""" else ""
+        // Determine initial trigger label
+        val firstLabel    = dd.options.headMaybe.map(_._1).getOrElse("")
+        val currentLabel  = Maybe.fromOption(dd.options.toSeq.find(_._2 == currentVal)).map(_._1).getOrElse(firstLabel)
+        val triggerLabel  = esc(if currentLabel.nonEmpty then s"$currentLabel ▾" else "▾")
+        val triggerId     = if baseId.nonEmpty then s""" id="${esc(baseId + "-trigger")}"""" else ""
+        val optionsId     = if baseId.nonEmpty then s""" id="${esc(baseId + "-options")}"""" else ""
+        val triggerDdAttr = if baseId.nonEmpty then s""" data-kyo-dropdown-trigger="${esc(baseId)}"""" else ""
+        val optionsDdAttr = if baseId.nonEmpty then s""" data-kyo-dropdown-options="${esc(baseId)}"""" else ""
+        // Wrapper div
+        w(
+            sb,
+            s"""<div data-kyo-path="$pathStr"$idAttr$clsStr$ddAttr data-kyo-ev="click,keydown,change"$hidAttr$disAttr$tabAttr$styleStr>"""
+        )
+        // Trigger button
+        w(sb, s"""<button$triggerId type="button"$triggerDdAttr tabindex="0">$triggerLabel</button>""")
+        // Options container (hidden by default)
+        w(sb, s"""<div$optionsId$optionsDdAttr hidden>""")
+        dd.options.toSeq.zipWithIndex.foreach { case ((label, value), idx) =>
+            val hlAttr = if value == currentVal && currentVal.nonEmpty then """ data-kyo-dropdown-hl="true"""" else ""
+            w(sb, s"""<div data-kyo-dropdown-opt="$idx" data-kyo-dropdown-val="${esc(value)}"$hlAttr>${esc(label)}</div>""")
+        }
+        w(sb, "</div>")
+        w(sb, "</div>")
+    end renderDropdownWithValue
+
+    // ---- Tag names ----
+
+    private def tagName(elem: Element): String = elem match
+        case _: Div            => "div"
+        case _: P              => "p"
+        case _: Section        => "section"
+        case _: Main           => "main"
+        case _: Header         => "header"
+        case _: Footer         => "footer"
+        case _: Pre            => "pre"
+        case _: Blockquote     => "blockquote"
+        case _: Code           => "code"
+        case _: Ul             => "ul"
+        case _: Ol             => "ol"
+        case _: Table          => "table"
+        case _: Colgroup       => "colgroup"
+        case _: Col            => "col"
+        case _: Thead          => "thead"
+        case _: Tbody          => "tbody"
+        case _: Tfoot          => "tfoot"
+        case _: H1             => "h1"
+        case _: H2             => "h2"
+        case _: H3             => "h3"
+        case _: H4             => "h4"
+        case _: H5             => "h5"
+        case _: H6             => "h6"
+        case _: Hr             => "hr"
+        case _: Br             => "br"
+        case _: SpanElement    => "span"
+        case _: Nav            => "nav"
+        case _: Li             => "li"
+        case _: Tr             => "tr"
+        case _: Td             => "td"
+        case _: Th             => "th"
+        case _: Label          => "label"
+        case _: Form           => "form"
+        case _: Fieldset       => "fieldset"
+        case _: Legend         => "legend"
+        case _: Textarea       => "textarea"
+        case _: Select         => "select"
+        case _: Opt            => "option"
+        case _: Button         => "button"
+        case _: Anchor         => "a"
+        case _: Img            => "img"
+        case _: Iframe         => "iframe"
+        case _: Input          => "input"
+        case _: PasswordInput  => "input"
+        case _: EmailInput     => "input"
+        case _: TelInput       => "input"
+        case _: UrlInput       => "input"
+        case _: SearchInput    => "input"
+        case _: NumberInput    => "input"
+        case _: Checkbox       => "input"
+        case _: Radio          => "input"
+        case _: DateInput      => "input"
+        case _: TimeInput      => "input"
+        case _: ColorInput     => "input"
+        case _: RangeInput     => "input"
+        case _: FileInput      => "input"
+        case _: HiddenInput    => "input"
+        case _: Dropdown       => "div"
+        case e: Svg.SvgElement => svgTagName(e)
+        // SvgNode/SvgRootNode are the sanctioned non-sealed cross-file bridge for the SVG AST
+        // (see UI.Ast.SvgNode); every in-tree SVG node extends Svg.SvgElement, matched above, so
+        // this arm only covers the abstract bridge type. It is unreachable for any node the
+        // framework produces; an instance here means an out-of-tree extension of the bridge.
+        case e: SvgNode =>
+            throw new IllegalStateException(s"SvgNode must extend Svg.SvgElement: ${e.getClass.getName}")
+
+    // ---- Common attributes ----
+
+    /** Registers `style`'s pseudo-state rule (if any) into `cssRules` and returns its generated class,
+      * for an element whose render call is collecting CSS (the server-push path). Returns `Absent`
+      * when `cssRules` is `Absent` (the plain `render(...)` path, which keeps today's inline-style
+      * behavior unchanged) or `style` carries no pseudo-state prop. Deduped by class: an identical
+      * pseudo-state style anywhere else in the tree reuses the same entry rather than appending a
+      * duplicate rule.
+      *
+      * When this returns `Present`, the rule already carries the element's BASE props too (see
+      * [[kyo.internal.CssStyleRenderer.pseudoStateClass]]), so the caller must render NO inline style
+      * for `style` in that case, or the inline declaration would out-specificity the class rule and
+      * the pseudo-state would never visibly apply.
+      */
+    private def registerPseudoClass(cssRules: Maybe[CssCollector], style: Style): Maybe[String] =
+        cssRules.flatMap { rules =>
+            CssStyleRenderer.pseudoStateClass(style).map { case (cls, rule) =>
+                if !rules.contains(cls) then rules(cls) = rule
+                cls
+            }
+        }
+
+    private def renderCommonAttrs(sb: StringBuilder, elem: Element, cssRules: Maybe[CssCollector] = Absent)(using Frame): Unit =
+        val attrs = elem.attrs
+        attrs.identifier.foreach(id => w(sb, s""" id="${esc(id)}""""))
+        val pseudoClass = registerPseudoClass(cssRules, attrs.uiStyle)
+        val classes     = pseudoClass match
+            case Present(cls) => attrs.cssClasses :+ cls
+            case Absent       => attrs.cssClasses
+        if classes.nonEmpty then w(sb, s""" class="${esc(classes.mkString(" "))}"""")
+        attrs.hidden.foreach(v => if v then w(sb, " hidden"))
+        attrs.tabIndex.foreach(n => w(sb, s""" tabindex="$n""""))
+        attrs.focusTrap.foreach(v => if v then w(sb, """ data-kyo-focus-trap="1""""))
+        attrs.focusGroup.foreach(id => w(sb, s""" data-kyo-focus-group="${esc(id)}""""))
+        attrs.focusAuto.foreach(v => if v then w(sb, """ data-kyo-focus-auto="1""""))
+        attrs.focusRestore.foreach(v => if v then w(sb, """ data-kyo-focus-restore="1""""))
+        attrs.dragSource.foreach { source =>
+            w(sb, s""" data-kyo-drag-source="${esc(encodedDragSource(source))}"""")
+            w(sb, s""" data-kyo-drag-source-key="${esc(source.key)}"""")
+            val nativeActivation = source.activation == Drag.Activation.Native || source.activation == Drag.Activation.Both
+            if nativeActivation && !elem.isInstanceOf[Svg.SvgElement] then w(sb, """ draggable="true"""")
+        }
+        attrs.dropTarget.foreach { target =>
+            w(sb, s""" data-kyo-drop-target="${esc(encodedDropTarget(target))}"""")
+            w(sb, s""" data-kyo-drop-target-key="${esc(target.key)}"""")
+        }
+        // A source and target can coexist on one sortable element. The source owns the single DOM
+        // routing key in that case, while the complete target key remains present in its JSON metadata.
+        attrs.dragSource match
+            case Present(source) => w(sb, s""" data-kyo-drag-key="${esc(source.key)}"""")
+            case Absent          => attrs.dropTarget.foreach(target => w(sb, s""" data-kyo-drag-key="${esc(target.key)}""""))
+        // Marker only: stop-propagation is decided server-side in ReactiveUI.dispatchToElement; the client never reads this.
+        attrs.stopPropagation.foreach(v => if v then w(sb, """ data-kyo-stop="1""""))
+        // enter/leave transition class lists (read client-side by the patch-application code).
+        attrs.enterTransition.foreach(c => w(sb, s""" data-kyo-enter="${esc(c)}""""))
+        attrs.leaveTransition.foreach(c => w(sb, s""" data-kyo-leave="${esc(c)}""""))
+        // A generated pseudoClass already carries the base props in its own rule (see
+        // registerPseudoClass); rendering them inline too would shadow the pseudo-state override.
+        if pseudoClass.isEmpty then
+            val css = CssStyleRenderer.render(attrs.uiStyle)
+            if css.nonEmpty then w(sb, s""" style="${esc(css)}"""")
+        attrs.ariaAttrs.toSeq.sortBy(_._1).foreach { case (name, value) =>
+            w(sb, s""" aria-$name="${esc(value)}"""")
+        }
+        attrs.role.foreach(r => w(sb, s""" role="${esc(r)}""""))
+        attrs.dataAttrs.toSeq.sortBy(_._1).foreach { case (name, value) =>
+            w(sb, s""" data-$name="${esc(value)}"""")
+        }
+        attrs.jsProps.toSeq.sortBy(_._1).foreach { case (name, value) =>
+            w(sb, s""" data-kyo-prop-$name="${esc(value)}"""")
+        }
+    end renderCommonAttrs
+
+    private def encodedDragSource(source: Drag.Source)(using Frame): String =
+        DragProtocol.encodedSourceConfig(source, DragProtocol.Limits.default) match
+            case Result.Success(encoded) => encoded
+            case failure                 => throw new IllegalArgumentException(s"Invalid drag source metadata: $failure")
+
+    private def encodedDropTarget(target: Drag.Target)(using Frame): String =
+        DragProtocol.encodedTargetConfig(target, DragProtocol.Limits.default) match
+            case Result.Success(encoded) => encoded
+            case failure                 => throw new IllegalArgumentException(s"Invalid drop target metadata: $failure")
+
+    // ---- Element-specific attributes ----
+
+    /** The typing constraints, read client-side by the `beforeinput` capture listener.
+      *
+      * Only [[kyo.UI.Ast.ConstrainedInput]] carries these, so they are emitted here rather than with the universal
+      * attributes: a `div` or a chart datum has no use for them.
+      */
+    private def renderInputConstraints(sb: StringBuilder, ci: ConstrainedInput): Unit =
+        ci.inputFilter.foreach(f => w(sb, s""" data-kyo-filter="${esc(InputMasking.filterWire(f))}""""))
+        ci.inputMask.foreach(m => w(sb, s""" data-kyo-mask="${esc(m)}""""))
+    end renderInputConstraints
+
+    private def renderElementAttrs(sb: StringBuilder, elem: Element)(using Frame): Unit < Sync =
+        elem match
+            case ci: ConstrainedInput => renderInputConstraints(sb, ci)
+            case _                    => ()
+        elem match
+            case b: Button =>
+                w(sb, " type=\"submit\"")
+                boolAttr(sb, "disabled", b.disabled)
+            case fs: Fieldset =>
+                boolAttr(sb, "disabled", fs.disabled)
+            case cb: Checkbox =>
+                w(sb, " type=\"checkbox\"")
+                boolAttr(sb, "disabled", cb.disabled)
+                renderCheckedAttr(sb, cb.checked)
+            case r: Radio =>
+                w(sb, " type=\"radio\"")
+                boolAttr(sb, "disabled", r.disabled)
+                renderCheckedAttr(sb, r.checked).andThen {
+                    r.name.foreach(n => w(sb, s""" name="${esc(n)}""""))
+                }
+            case i: Input =>
+                w(sb, " type=\"text\"");
+                renderValueAttr(sb, i.value, i.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", i.disabled); boolAttr(sb, "readonly", i.readOnly);
+                        i.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    }
+            case p: PasswordInput =>
+                w(sb, " type=\"password\"");
+                renderValueAttr(sb, p.value, p.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", p.disabled); boolAttr(sb, "readonly", p.readOnly);
+                        p.placeholder.foreach(p2 => w(sb, s""" placeholder="${esc(p2)}""""))
+                    }
+            case e: EmailInput =>
+                w(sb, " type=\"email\"");
+                renderValueAttr(sb, e.value, e.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", e.disabled); boolAttr(sb, "readonly", e.readOnly);
+                        e.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    }
+            case t: TelInput =>
+                w(sb, " type=\"tel\"");
+                renderValueAttr(sb, t.value, t.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", t.disabled); boolAttr(sb, "readonly", t.readOnly);
+                        t.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    }
+            case u: UrlInput =>
+                w(sb, " type=\"url\"");
+                renderValueAttr(sb, u.value, u.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", u.disabled); boolAttr(sb, "readonly", u.readOnly);
+                        u.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    }
+            case s: SearchInput =>
+                w(sb, " type=\"search\"");
+                renderValueAttr(sb, s.value, s.inputMask)
+                    .andThen {
+                        boolAttr(sb, "disabled", s.disabled); boolAttr(sb, "readonly", s.readOnly);
+                        s.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    }
+            case n: NumberInput =>
+                w(sb, " type=\"number\"")
+                renderValueAttr(sb, n.value).andThen {
+                    boolAttr(sb, "disabled", n.disabled); boolAttr(sb, "readonly", n.readOnly)
+                    n.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+                    n.min.foreach(v => w(sb, s""" min="${fmtD(v)}""""))
+                    n.max.foreach(v => w(sb, s""" max="${fmtD(v)}""""))
+                    n.step.foreach(v => w(sb, s""" step="${fmtD(v)}""""))
+                }
+            case d: DateInput  => w(sb, " type=\"date\""); renderPickerAttrs(sb, d)
+            case t: TimeInput  => w(sb, " type=\"time\""); renderPickerAttrs(sb, t)
+            case c: ColorInput => w(sb, " type=\"color\""); renderPickerAttrs(sb, c)
+            case r: RangeInput =>
+                w(sb, " type=\"range\"")
+                boolAttr(sb, "disabled", r.disabled)
+                val rv: Unit < Sync = r.value match
+                    case Present(Bound.Const(d)) => w(sb, s""" value="${fmtD(d)}"""")
+                    case Present(Bound.Ref(ref)) =>
+                        for d <- ref.get
+                        yield w(sb, s""" value="${fmtD(d)}"""")
+                    case _ => ()
+                rv.andThen {
+                    r.min.foreach(v => w(sb, s""" min="${fmtD(v)}""""))
+                    r.max.foreach(v => w(sb, s""" max="${fmtD(v)}""""))
+                    r.step.foreach(v => w(sb, s""" step="${fmtD(v)}""""))
+                }
+            case f: FileInput =>
+                w(sb, " type=\"file\"")
+                boolAttr(sb, "disabled", f.disabled)
+                f.accept.foreach { accepts =>
+                    val value = accepts.map {
+                        case FileAccept.AnyImage             => "image/*"
+                        case FileAccept.AnyVideo             => "video/*"
+                        case FileAccept.AnyAudio             => "audio/*"
+                        case FileAccept.Pdf                  => "application/pdf"
+                        case FileAccept.Image(ImageExt.Png)  => ".png"
+                        case FileAccept.Image(ImageExt.Jpeg) => ".jpg"
+                        case FileAccept.Image(ImageExt.Webp) => ".webp"
+                        case FileAccept.Image(ImageExt.Gif)  => ".gif"
+                        case FileAccept.Image(ImageExt.Svg)  => ".svg"
+                        case FileAccept.Image(ImageExt.Avif) => ".avif"
+                        case FileAccept.Extension(ext)       => ext
+                        case FileAccept.MediaType(mime)      => mime
+                    }.mkString(",")
+                    w(sb, s""" accept="${esc(value)}"""")
+                }
+            case h: HiddenInput =>
+                w(sb, " type=\"hidden\"")
+                renderValueAttr(sb, h.value)
+            case ta: Textarea =>
+                boolAttr(sb, "disabled", ta.disabled)
+                boolAttr(sb, "readonly", ta.readOnly)
+                ta.placeholder.foreach(p => w(sb, s""" placeholder="${esc(p)}""""))
+            case sel: Select =>
+                boolAttr(sb, "disabled", sel.disabled)
+                val selValue: Unit < Sync = sel.value match
+                    case Present(Bound.Const(s)) => w(sb, s""" value="${esc(s)}"""")
+                    case Present(Bound.Ref(ref)) =>
+                        for s <- ref.get
+                        yield w(sb, s""" value="${esc(s)}"""")
+                    case _ =>
+                        // Fall back to first Opt child with selected(true)
+                        val selected = Maybe.fromOption(sel.children.toSeq.collectFirst {
+                            case opt: Opt if opt.selected == Present(true) =>
+                                opt.value.getOrElse("")
+                        })
+                        selected match
+                            case Present(v) if v.nonEmpty => w(sb, s""" value="${esc(v)}"""")
+                            case _                        => ()
+                selValue
+            case opt: Opt =>
+                opt.value.foreach(v => w(sb, s""" value="${esc(v)}""""))
+                boolAttr(sb, "selected", opt.selected)
+            case a: Anchor =>
+                a.href.foreach { href =>
+                    val value = href match
+                        case Href.Absolute(url)       => url.full
+                        case Href.Path(p)             => p
+                        case Href.Fragment(id)        => s"#$id"
+                        case Href.External(scheme, v) => s"$scheme:$v"
+                    w(sb, s""" href="${esc(value)}"""")
+                }
+                a.download.foreach(name => w(sb, s""" download="${esc(name)}""""))
+                a.target.foreach { t =>
+                    val tv = t match
+                        case Target.Self   => "_self"
+                        case Target.Blank  => "_blank"
+                        case Target.Parent => "_parent"
+                        case Target.Top    => "_top"
+                    w(sb, s""" target="$tv"""")
+                }
+            case img: Img =>
+                img.src.foreach { src =>
+                    val value = src match
+                        case ImgSrc.Absolute(url)       => url.full
+                        case ImgSrc.Path(p)             => p
+                        case ImgSrc.Data(mime, payload) => s"data:$mime;base64,$payload"
+                    w(sb, s""" src="${esc(value)}"""")
+                }
+                img.alt.foreach(a => w(sb, s""" alt="${esc(a)}""""))
+            case f: Iframe =>
+                f.src.foreach(s => w(sb, s""" src="${esc(s)}""""))
+                f.frameTitle.foreach(t => w(sb, s""" title="${esc(t)}""""))
+            case td: Td =>
+                td.colspan.foreach(n => w(sb, s""" colspan="$n""""))
+                td.rowspan.foreach(n => w(sb, s""" rowspan="$n""""))
+            case th: Th =>
+                th.colspan.foreach(n => w(sb, s""" colspan="$n""""))
+                th.rowspan.foreach(n => w(sb, s""" rowspan="$n""""))
+            case lbl: Label =>
+                lbl.forId.foreach(f => w(sb, s""" for="${esc(f)}""""))
+            case e: Svg.SvgElement => renderSvgAttrs(sb, e)
+            case _                 => ()
+        end match
+    end renderElementAttrs
+
+    private def boolAttr(sb: StringBuilder, name: String, value: Maybe[Boolean]): Unit =
+        value.foreach(v => if v then w(sb, s" $name"))
+
+    private def renderCheckedAttr(sb: StringBuilder, value: Maybe[Bound[Boolean]])(using Frame): Unit < Sync =
+        value match
+            case Present(Bound.Const(b)) => if b then w(sb, " checked")
+            case Present(Bound.Ref(ref)) =>
+                for b <- ref.get
+                yield if b then w(sb, " checked")
+            case _ => ()
+
+    /** Render a value attribute, reading SignalRef if needed. */
+    /** Formats a value about to be displayed through the element's mask, if it carries one.
+      *
+      * A mask is a display format, so a masked field has to show a masked value whoever set it. Client-side
+      * enforcement only ever sees typing: a value bound to a [[SignalRef]], a server-side transform of what was
+      * typed, and the initial render all reach the field without a `beforeinput` event. Formatting here covers
+      * every one of them at once, in both transports and on initial and reactive-range renders, which no amount
+      * of client-side patching would.
+      *
+      * A value the mask already formatted comes back unchanged, so the keystroke echo of a two-way binding still
+      * compares equal and leaves the caret where it is.
+      */
+    private def masked(mask: Maybe[String], value: String): String =
+        mask.fold(value)(InputMasking.maskNormalize(_, value))
+
+    private def renderValueAttr(sb: StringBuilder, value: Maybe[Bound[String]], mask: Maybe[String] = Absent)(using
+        Frame
+    ): Unit < Sync =
+        value match
+            case Present(Bound.Const(s)) => w(sb, s""" value="${esc(masked(mask, s))}"""")
+            case Present(Bound.Ref(ref)) =>
+                for s <- ref.get
+                yield w(sb, s""" value="${esc(masked(mask, s))}"""")
+            case _ => ()
+
+    private def renderPickerAttrs(sb: StringBuilder, pi: PickerInput)(using Frame): Unit < Sync =
+        boolAttr(sb, "disabled", pi.disabled)
+        renderValueAttr(sb, pi.value)
+
+    // ---- Event attributes ----
+
+    private def hasSignalRefValue(value: Maybe[Bound[?]]): Boolean = value match
+        case Present(_: Bound.Ref[?]) => true
+        case _                        => false
+
+    private def renderEventAttr(sb: StringBuilder, elem: Element): Unit =
+        val events = Seq.newBuilder[String]
+        val attrs  = elem.attrs
+        if attrs.onClick.nonEmpty || attrs.onClickEvt.nonEmpty ||
+            attrs.onClickSelf.nonEmpty || attrs.onClickSelfEvt.nonEmpty
+        then events += "click"
+        if attrs.onFocus.nonEmpty || attrs.onFocusEvt.nonEmpty then events += "focus"
+        if attrs.onBlur.nonEmpty || attrs.onBlurEvt.nonEmpty then events += "blur"
+        if attrs.onKeyDown.nonEmpty then events += "keydown"
+        if attrs.onKeyUp.nonEmpty then events += "keyup"
+        if attrs.onHover.nonEmpty || attrs.onHoverEvt.nonEmpty then events += "mouseover"
+        if attrs.onUnhover.nonEmpty || attrs.onUnhoverEvt.nonEmpty then events += "mouseout"
+        if attrs.onScroll.nonEmpty || attrs.onScrollEvt.nonEmpty then events += "wheel"
+        if attrs.onDragStart.nonEmpty || attrs.onDragStartEvt.nonEmpty then events += "dragstart"
+        if attrs.onDragEnd.nonEmpty || attrs.onDragEndEvt.nonEmpty then events += "dragend"
+        if attrs.onDragEnter.nonEmpty || attrs.onDragEnterEvt.nonEmpty then events += "dragenter"
+        if attrs.onDragLeave.nonEmpty || attrs.onDragLeaveEvt.nonEmpty then events += "dragleave"
+        if attrs.onDragOver.nonEmpty || attrs.onDragOverEvt.nonEmpty then events += "dragover"
+        if attrs.onDrop.nonEmpty || attrs.onDropEvt.nonEmpty then events += "drop"
+        if attrs.onSortMove.nonEmpty || attrs.onSortMoveEvt.nonEmpty then events += "sortmove"
+        // "input" event: when handler is set OR when .value(SignalRef) auto-binding is in use
+        elem match
+            case ti: TextInput if ti.onInput.nonEmpty || hasSignalRefValue(ti.value) => events += "input"
+            case _                                                                   =>
+        // "change" event: when handler is set OR when .value/.checked(SignalRef) auto-binding is in use
+        elem match
+            case ti: TextInput if ti.onChange.nonEmpty || hasSignalRefValue(ti.value)          => events += "change"
+            case pi: PickerInput if pi.onChange.nonEmpty || hasSignalRefValue(pi.value)        => events += "change"
+            case bi: BooleanInput if bi.onChange.nonEmpty || hasSignalRefValue(bi.checked)     => events += "change"
+            case ni: NumberInput if ni.onChangeNumeric.nonEmpty || hasSignalRefValue(ni.value) => events += "change"
+            case ri: RangeInput if ri.onChange.nonEmpty || hasSignalRefValue(ri.value)         => events += "change"
+            case fi: FileInput if fi.onChange.nonEmpty                                         => events += "change"
+            case sel: Select if hasSignalRefValue(sel.value)                                   => events += "change"
+            case _                                                                             =>
+        end match
+        elem match
+            case f: Form if f.onSubmit.nonEmpty || f.onSubmitEvt.nonEmpty => events += "submit"
+            case _                                                        =>
+        val ev = events.result()
+        if ev.nonEmpty then w(sb, s""" data-kyo-ev="${ev.mkString(",")}"""")
+    end renderEventAttr
+
+    // ---- Helpers ----
+
+    private[kyo] val baseCss =
+        """*, *::before, *::after { box-sizing: border-box; }
+          |body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 0; }
+          |div, section, main, header, footer, form, article, aside, p, ul, ol, pre, code, h1, h2, h3, h4, h5, h6, label { display: flex; flex-direction: column; }
+          |nav, li, span, button, a { display: flex; flex-direction: row; align-items: center; }
+          |[data-kyo-reactive] { display: contents; }
+          |ul, ol { list-style: none; padding: 0; margin: 0; }
+          |h1, h2, h3, h4, h5, h6, p { margin: 0; }
+          |a { color: inherit; text-decoration: none; }
+          |table { border-collapse: collapse; width: 100%; }
+          |[hidden] { display: none !important; }
+          |""".stripMargin
+
+    private def pathAttr(path: Seq[String]): String = path.mkString(".")
+
+    private def fmtD(v: Double): String = NumberFormat.double(v)
+
+    private inline def w(sb: StringBuilder, s: String): Unit =
+        sb.append(s); ()
+
+    private def esc(s: String): String =
+        val sb = new StringBuilder(s.length)
+        s.foreach {
+            case '&'  => sb.append("&amp;")
+            case '<'  => sb.append("&lt;")
+            case '>'  => sb.append("&gt;")
+            case '"'  => sb.append("&quot;")
+            case '\'' => sb.append("&#39;")
+            case c    => sb.append(c)
+        }
+        sb.toString
+    end esc
+
+    // Escape a string for safe embedding inside a JS double-quoted string literal within a
+    // <script> element. Must handle both JS parse hazards and the HTML parser's raw-text
+    // model: </script> (or </Script> etc.) ends the script element regardless of JS context.
+    //
+    // Rules applied, in order:
+    //   \  -> \\   (backslash first, before any escape that produces \)
+    //   "  -> \"   (closing double-quote)
+    //   '  -> \'   (single-quote, safe-by-default)
+    //  \r  -> \r   (CR, JS line terminator)
+    //  \n  -> \n   (LF, JS line terminator)
+    // U+2028 -> U+2028  (LINE SEPARATOR, JS line terminator)
+    // U+2029 -> U+2029  (PARAGRAPH SEPARATOR, JS line terminator)
+    //  </  -> <\/  (prevents </script> from closing the element; < alone is harmless in JS)
+    private[kyo] def jsStr(s: String): String =
+        val sb = new StringBuilder(s.length)
+        @scala.annotation.tailrec
+        def loop(i: Int): Unit =
+            if i < s.length then
+                s.charAt(i) match
+                    case '\\' =>
+                        sb.append("\\\\")
+                        loop(i + 1)
+                    case '"' =>
+                        sb.append("\\\"")
+                        loop(i + 1)
+                    case '\'' =>
+                        sb.append("\\'")
+                        loop(i + 1)
+                    case '\r' =>
+                        sb.append("\\r")
+                        loop(i + 1)
+                    case '\n' =>
+                        sb.append("\\n")
+                        loop(i + 1)
+                    case ' ' =>
+                        sb.append("\\u2028")
+                        loop(i + 1)
+                    case ' ' =>
+                        sb.append("\\u2029")
+                        loop(i + 1)
+                    case '<' if i + 1 < s.length && s.charAt(i + 1) == '/' =>
+                        sb.append("<\\/")
+                        loop(i + 2)
+                    case c =>
+                        sb.append(c)
+                        loop(i + 1)
+        loop(0)
+        sb.toString
+    end jsStr
+
+    // ---- Client JS ----
+
+    /** The pure half of the client-side input filter and mask: the JavaScript mirror of [[InputMasking]].
+      *
+      * Kept out of [[clientJs]] as a named fragment for two reasons. It is the part that has an exact Scala
+      * counterpart, so having it standalone lets `InputMaskingJsParityTest` load it into a page and drive the same
+      * case table through both implementations, which is what keeps the two from drifting. And unlike [[clientJs]]
+      * this is not an interpolated string, so a backslash written here is the backslash the browser sees; inlined,
+      * the mask parser's escape had to be doubled, and getting that wrong produced an unterminated JavaScript
+      * literal that took down the whole client script.
+      *
+      * Only DOM-free functions belong here. Everything that touches an element stays in [[clientJs]].
+      */
+    private[kyo] val inputMaskJs: String =
+        """// Mirrors kyo.internal.InputMasking.filterStr: keep the two in step.
+          |// An unrecognized wire value admits everything, so a page cached from an older build stays usable.
+          |function kyoFilterStr(pat,str,cur){
+          |  var isChars=pat.indexOf("chars:")===0;var allowed=isChars?pat.slice(6):"";
+          |  if(!isChars&&pat!=="digits"&&pat!=="decimal")return str;
+          |  var out="";var hasSep=(pat==="decimal")&&(cur.indexOf(".")>=0||cur.indexOf(",")>=0);
+          |  for(var i=0;i<str.length;i++){var ch=str.charAt(i);
+          |    if(isChars){if(allowed.indexOf(ch)>=0)out+=ch;}
+          |    else if(pat==="digits"){if(ch>="0"&&ch<="9")out+=ch;}
+          |    else if(ch>="0"&&ch<="9")out+=ch;
+          |    else if((ch==="."||ch===",")&&!hasSep){out+=ch;hasSep=true;}}
+          |  return out;
+          |}
+          |// Mirrors kyo.internal.InputMasking.parseMask: the mask is parsed once into positions, {k:class} or
+          |// {l:literal}, so the backslash escape is handled in one place rather than in every function.
+          |function kyoMaskParse(mask){var ts=[];for(var i=0;i<mask.length;){var c=mask.charAt(i);
+          |  if(c==="\\"&&i+1<mask.length){ts.push({l:mask.charAt(i+1)});i+=2;}
+          |  else{if(c==="9"||c==="a"||c==="*")ts.push({k:c});else ts.push({l:c});i++;}}
+          |  return ts;}
+          |function kyoMaskClassAt(ts,idx){var c=0;for(var i=0;i<ts.length;i++){if(ts[i].k!==undefined){if(c===idx)return ts[i].k;c++;}}return null;}
+          |function kyoMaskOk(cls,ch){if(cls==="9")return ch>="0"&&ch<="9";if(cls==="a")return (ch>="a"&&ch<="z")||(ch>="A"&&ch<="Z");return (ch>="0"&&ch<="9")||(ch>="a"&&ch<="z")||(ch>="A"&&ch<="Z");}
+          |function kyoMaskFormat(ts,raw){var out="";var ri=0;for(var i=0;i<ts.length;i++){
+          |  if(ts[i].k!==undefined){if(ri<raw.length){out+=raw.charAt(ri);ri++;}else break;}
+          |  else{if(ri<raw.length)out+=ts[i].l;else break;}}
+          |  return out;}
+          |function kyoMaskRaw(ts,val){var raw="";var vi=0;for(var i=0;i<ts.length&&vi<val.length;i++){
+          |  if(ts[i].k!==undefined){raw+=val.charAt(vi);vi++;}
+          |  else{if(val.charAt(vi)===ts[i].l)vi++;else{raw+=val.charAt(vi);vi++;}}}
+          |  return raw;}
+          |// Mirrors kyo.internal.InputMasking.maskNormalize.
+          |function kyoMaskNormalize(mask,val){var ts=kyoMaskParse(mask);return kyoMaskFormat(ts,kyoMaskRaw(ts,val));}""".stripMargin
+
+    private[kyo] val reactiveRangesJs: String =
+        """function kyoRangeId(id){
+          |  if(typeof id!=="string"||!/^r[0-9a-f]*(?:n[0-9a-f]{8})?$/.test(id))return false;
+          |  var suffix=id.indexOf("n",1),end=suffix<0?id.length:suffix;
+          |  if(suffix>=0&&id.slice(suffix+1)==="00000000")return false;
+          |  var i=1;while(i<end){if(i+8>end)return false;var n=parseInt(id.slice(i,i+8),16);i+=8;
+          |    if(!isFinite(n)||i+n*4>end)return false;i+=n*4;}
+          |  return i===end;
+          |}
+          |function kyoRangeFail(message){throw new Error("kyo-ui reactive range: "+message);}
+          |function kyoRangeMarker(comment,prefix){
+          |  var value=comment.data;if(value.indexOf(prefix)!==0)return null;
+          |  var id=value.slice(prefix.length);if(!kyoRangeId(id))kyoRangeFail("malformed id: "+id);return id;
+          |}
+          |function kyoRangeScan(root){
+          |  var found=new Map(),seen=new Map(),open=[];
+          |  var walker=document.createTreeWalker(root,128,null,false),comment;
+          |  while((comment=walker.nextNode())){
+          |    var start=kyoRangeMarker(comment,"kyo-rs:");
+          |    if(start!==null){if(seen.has(start))kyoRangeFail("duplicate id: "+start);seen.set(start,true);open.push({id:start,node:comment});continue;}
+          |    var end=kyoRangeMarker(comment,"kyo-re:");
+          |    if(end!==null){if(open.length===0)kyoRangeFail("end marker has no start: "+end);
+          |      var top=open[open.length-1];if(top.id!==end)kyoRangeFail("crossed ranges: expected "+top.id+", found "+end);
+          |      open.pop();if(top.node.parentNode!==comment.parentNode)kyoRangeFail("anchors are not siblings: "+end);
+          |      found.set(end,{start:top.node,end:comment});}
+          |  }
+          |  if(open.length)kyoRangeFail("start marker has no end: "+open[open.length-1].id);
+          |  return found;
+          |}
+          |function kyoRangeRoots(start,end){
+          |  var roots=[],node=start.nextSibling;while(node&&node!==end){if(node.nodeType===1)roots.push(node);node=node.nextSibling;}return roots;
+          |}
+          |function kyoRangeFragmentRoots(fragment){
+          |  var roots=[],node=fragment.firstChild;while(node){if(node.nodeType===1)roots.push(node);node=node.nextSibling;}return roots;
+          |}
+          |function kyoRangeSemanticRoots(roots,id){
+          |  if(roots.length!==1||roots[0].tagName!=="TBODY"||roots[0].getAttribute("data-kyo-range-host")!==id)return roots;
+          |  var semantic=[],node=roots[0].firstChild;while(node){if(node.nodeType===1)semantic.push(node);node=node.nextSibling;}return semantic;
+          |}
+          |function kyoRangeSyncHost(host,incoming,id){for(var i=host.attributes.length-1;i>=0;i--){var name=host.attributes[i].name;if(name!=="data-kyo-range-host")host.removeAttribute(name);}
+          |  for(var i=0;i<incoming.attributes.length;i++){var a=incoming.attributes[i];if(a.name!=="data-kyo-range-host")host.setAttribute(a.name,a.value);}
+          |  host.setAttribute("data-kyo-range-host",id);
+          |}
+          |function kyoRangeContains(roots,node){for(var i=0;i<roots.length;i++)if(roots[i]===node||roots[i].contains(node))return true;return false;}
+          |function kyoRangeFocusLocator(roots,active){for(var r=0;r<roots.length;r++){if(roots[r]===active||roots[r].contains(active)){
+          |    var route=[],node=active;while(node!==roots[r]){var parent=node.parentElement,index=0;
+          |      while(index<parent.children.length&&parent.children[index]!==node)index++;route.unshift(index);node=parent;}
+          |    return {path:active.getAttribute("data-kyo-path"),root:r,route:route};}}return null;
+          |}
+          |function kyoRangeResolveFocus(roots,locator){if(!locator)return null;if(locator.path!==null){for(var r=0;r<roots.length;r++){
+          |    if(roots[r].getAttribute("data-kyo-path")===locator.path)return roots[r];var all=roots[r].querySelectorAll("[data-kyo-path]");
+          |    for(var i=0;i<all.length;i++)if(all[i].getAttribute("data-kyo-path")===locator.path)return all[i];}}
+          |  var node=roots[locator.root];if(!node)return null;for(var i=0;i<locator.route.length;i++){
+          |    node=node.children[locator.route[i]];if(!node)return null;}return node;
+          |}
+          |function kyoMergeSets(into,from){for(var key in from)if(Object.prototype.hasOwnProperty.call(from,key))into[key]=true;return into;}
+          |function kyoEnterPathsRoots(roots){var set={};for(var i=0;i<roots.length;i++)kyoMergeSets(set,faEnterPaths(roots[i]));return set;}
+          |function kyoFocusPathsRoots(roots){var set={};for(var i=0;i<roots.length;i++)kyoMergeSets(set,focusAutoPaths(roots[i]));return set;}
+          |function kyoLeavePathsRoots(roots){var set={};for(var i=0;i<roots.length;i++){var root=roots[i],els=[];
+          |  if(root.hasAttribute("data-kyo-leave"))els.push(root);var ds=root.querySelectorAll("[data-kyo-leave]");
+          |  for(var j=0;j<ds.length;j++)els.push(ds[j]);for(var j=0;j<els.length;j++){var p=els[j].getAttribute("data-kyo-path");if(p!==null)set[p]=true;}}
+          |  return set;
+          |}
+          |function kyoLeavePrepareRoots(roots,surv){var ghosts=[];for(var i=0;i<roots.length;i++)ghosts=ghosts.concat(kyoLeavePrepare(roots[i],surv));return ghosts;}
+          |function kyoSeedEnterRoots(roots,oldSet){for(var i=0;i<roots.length;i++)kyoEnterSeed(roots[i],oldSet);}
+          |function kyoSeedFocusRoots(roots,oldSet){
+          |  var cand=[];for(var i=0;i<roots.length;i++){var root=roots[i];if(root.hasAttribute("data-kyo-focus-auto"))cand.push(root);
+          |    var ds=root.querySelectorAll("[data-kyo-focus-auto]");for(var j=0;j<ds.length;j++)cand.push(ds[j]);}
+          |  for(var i=0;i<cand.length;i++){var fa=cand[i].getAttribute("data-kyo-path");if(fa!==null&&!oldSet[fa]){
+          |    var ae=document.activeElement,ret=(ae&&ae!==document.body&&ae.getAttribute)?ae.getAttribute("data-kyo-path"):null;
+          |    __focusReturnStack.push({fa:fa,ret:ret,restore:cand[i].hasAttribute("data-kyo-focus-restore")});
+          |    if(typeof cand[i].focus==="function")cand[i].focus();return;}}
+          |}
+          |function kyoRangeMorph(active,oldRoots,newRoots,incoming){
+          |  if(!active||oldRoots.length!==1||newRoots.length!==1||active!==oldRoots[0]||incoming.size!==0)return false;
+          |  if((active.tagName!=="INPUT"&&active.tagName!=="TEXTAREA")||active.tagName!==newRoots[0].tagName)return false;
+          |  var fresh=newRoots[0];for(var i=0;i<fresh.attributes.length;i++){var a=fresh.attributes[i];if(active.getAttribute(a.name)!==a.value)active.setAttribute(a.name,a.value);}
+          |  for(var i=active.attributes.length-1;i>=0;i--){var name=active.attributes[i].name;if(!fresh.hasAttribute(name))active.removeAttribute(name);}
+          |  var value=active.tagName==="TEXTAREA"?fresh.textContent:(fresh.getAttribute("value")||"");if(value!==active.value)active.value=value;
+          |  applyJsProps(active);return true;
+          |}
+          |function kyoRangeReplace(id,html){
+          |  if(!kyoRangeId(id))kyoRangeFail("malformed replacement id: "+id);
+          |  if(!__kyoRanges)kyoRangeFail("registry is closed");var endpoints=__kyoRanges.get(id);
+          |  if(!endpoints)kyoRangeFail("unknown id: "+id);
+          |  if(endpoints.start.data!=="kyo-rs:"+id||endpoints.end.data!=="kyo-re:"+id)kyoRangeFail("markers are corrupted: "+id);
+          |  if(!endpoints.start.parentNode||endpoints.start.parentNode!==endpoints.end.parentNode)kyoRangeFail("anchors are no longer siblings: "+id);
+          |  var ordered=endpoints.start.nextSibling;while(ordered&&ordered!==endpoints.end)ordered=ordered.nextSibling;
+          |  if(!ordered)kyoRangeFail("end is not after start: "+id);
+          |  var range=document.createRange();range.setStartAfter(endpoints.start);range.setEndBefore(endpoints.end);
+          |  var parent=endpoints.start.parentNode,synthetic=parent.tagName==="TBODY"&&parent.getAttribute("data-kyo-range-host")===id;
+          |  var parser=range;if(synthetic){parser=document.createRange();parser.selectNode(parent);}
+          |  var fragment=parser.createContextualFragment(html),incoming=kyoRangeScan(fragment),removed=[];
+          |  __kyoRanges.forEach(function(pair,key){if(key!==id&&range.intersectsNode(pair.start))removed.push(key);});
+          |  incoming.forEach(function(pair,key){if(__kyoRanges.has(key)&&removed.indexOf(key)<0)kyoRangeFail("duplicate id: "+key);});
+          |  var oldRoots=kyoRangeRoots(endpoints.start,endpoints.end),newRoots=kyoRangeFragmentRoots(fragment),newSemanticRoots=kyoRangeSemanticRoots(newRoots,id),active=document.activeElement;
+          |  if(kyoRangeMorph(active,oldRoots,newSemanticRoots,incoming))return;
+          |  var inside=active&&active!==document.body&&kyoRangeContains(oldRoots,active);
+          |  var activeLocator=inside?kyoRangeFocusLocator(oldRoots,active):null;
+          |  var ss=inside&&typeof active.selectionStart==="number"?active.selectionStart:null;
+          |  var se=inside&&typeof active.selectionEnd==="number"?active.selectionEnd:null;
+          |  var oldEnter=kyoEnterPathsRoots(oldRoots),ghosts=kyoLeavePrepareRoots(oldRoots,kyoLeavePathsRoots(newSemanticRoots));
+          |  var oldFocus=kyoFocusPathsRoots(oldRoots);
+          |  range.deleteContents();for(var i=0;i<removed.length;i++)__kyoRanges.delete(removed[i]);
+          |  var finalRoots=newSemanticRoots;if(synthetic&&newRoots.length===1&&newRoots[0].tagName==="TBODY"&&newRoots[0].getAttribute("data-kyo-range-host")===id){
+          |    var incomingHost=newRoots[0];kyoRangeSyncHost(parent,incomingHost,id);while(incomingHost.firstChild)parent.insertBefore(incomingHost.firstChild,endpoints.end);finalRoots=kyoRangeRoots(endpoints.start,endpoints.end);
+          |  }else if(synthetic){var table=parent.parentNode;if(!table)kyoRangeFail("table range host is detached: "+id);
+          |    table.insertBefore(endpoints.start,parent);table.insertBefore(fragment,parent);table.insertBefore(endpoints.end,parent);table.removeChild(parent);
+          |  }else{endpoints.end.parentNode.insertBefore(fragment,endpoints.end);if(newRoots.length&&newRoots[0].tagName==="TBODY"&&newRoots[0].getAttribute("data-kyo-range-host")===id){
+          |    newRoots[0].insertBefore(endpoints.start,newRoots[0].firstChild);newRoots[0].appendChild(endpoints.end);finalRoots=kyoRangeRoots(endpoints.start,endpoints.end);}}
+          |  incoming.forEach(function(pair,key){__kyoRanges.set(key,pair);});
+          |  for(var i=0;i<finalRoots.length;i++){applyJsProps(finalRoots[i]);ba(finalRoots[i]);}
+          |  var restored=kyoRangeResolveFocus(finalRoots,activeLocator);if(restored){restored.focus();if(ss!==null)kyoSetCaret(restored,ss,se);}
+          |  kyoSeedEnterRoots(finalRoots,oldEnter);kyoSeedFocusRoots(finalRoots,oldFocus);kyoSpawnGhosts(ghosts);sweepFocusAuto();
+          |}
+          |var __kyoRanges=kyoRangeScan(document.body);
+          |window.addEventListener("pagehide",function(){if(__kyoRanges){__kyoRanges.clear();__kyoRanges=null;}});
+          |function kyoClientError(error){if(window.console&&console.error)console.error(error);}""".stripMargin
+
+    private def clientJs(basePath: String): String =
+        s"""(function(){
+           |var base="$basePath";
+           |var __q=[];
+           |// Mirrors DomBackend.setSelection: the one place that knows the two ways a caret move can be a no-op.
+           |// Elements outside input and textarea (select, contenteditable) have no setSelectionRange at all, and
+           |// on input types without a text selection (email, number) it throws InvalidStateError; in both cases
+           |// the value is set and only the caret stays put. Every other exception is a real failure and propagates.
+           |function kyoSetCaret(t,s,e){if(typeof t.setSelectionRange!=="function")return;
+           |  try{t.setSelectionRange(s,e);}catch(er){if(er.name!=="InvalidStateError")throw er;}}
+           |$reactiveRangesJs
+           |${DragClientJs.script(basePath)}
+           |var ws=null,__wsRetries=0,__wsGone=false,__live=false;
+           |// Read-only test hook on the current socket; it follows each reconnect.
+           |Object.defineProperty(window,"__kyoWs",{get:function(){return ws;},configurable:true});
+           |var __dragRt=null,__dragCleanup=null;
+           |// One call site on purpose. The runtime wires document-level capture listeners and a pagehide listener that only its cleanup
+           |// removes, so it must be installed once per session and never over a live one; the guard at the open handler is what keeps
+           |// that true across reconnects, and its own cleanup is idempotent.
+           |function kyoInstallDrag(){
+           |  __dragRt=installDragRuntime(function(m){post(m);},{onClose:function(c){__dragCleanup=c;}});
+           |  __dragCleanup=__dragRt.cleanup;
+           |}
+           |kyoInstallDrag();
+           |// A session is one socket, and reconnecting is not optional bookkeeping. post() buffers into __q whenever the session is not
+           |// live, and __q has exactly one drain point, so a page that never reconnects silently stops delivering every later
+           |// interaction while still looking healthy: the click reaches the document, nothing reaches the server, and the failure only
+           |// surfaces much later as an assertion against state that never arrived. The refusal that forced this is a connect denied for
+           |// want of buffer space (Windows WSAENOBUFS), which is transient, so backing off and retrying is what rides it out.
+           |//
+           |// LIVE means a frame has ARRIVED, not that the socket opened. Completing the upgrade proves the transport is up and nothing
+           |// more: a server can accept and then end the session at once, during a restart window, and draining on open would empty the
+           |// buffer into a connection nobody reads, losing exactly the events this exists to preserve. Every session announces itself
+           |// with SessionReady before it renders, so this resolves even for a tree that is entirely const and never renders. It is also
+           |// what makes the backoff real: resetting the counter on open would let an accept-then-close loop redial forever at the
+           |// shortest interval, which is the opposite of backing off.
+           |function kyoConnect(){
+           |  if(__wsGone)return;
+           |  // Never dial while one is already dialing or open. Two paths can call in at once: a page becomes eligible for the
+           |  // back/forward cache precisely when its socket is down, which is precisely when a retry is pending, so a restore
+           |  // races the resumed timer. The loser of that race would be superseded immediately and never closed, leaving a live
+           |  // connection with a session attached whose frames are all dropped.
+           |  if(ws&&ws.readyState<2)return;
+           |  __live=false;
+           |  // The page's own path and query ride the upgrade, so a request-aware session evaluates the UI for the same page the GET served.
+           |  var sock=new WebSocket((location.protocol===\"https:\"?\"wss:\":\"ws:\")+"//"+location.host+base+"/_kyo/ws?${UIServer.pageParam}="+encodeURIComponent(location.pathname+location.search));
+           |  ws=sock;
+           |  // Each handler serves ONE socket and stands down once a newer one has replaced it, closing itself on the way out so
+           |  // a superseded connection is torn down instead of lingering with a server session attached.
+           |  sock.onopen=function(){
+           |    if(sock!==ws){sock.close();return;}
+           |    if(!__dragCleanup)kyoInstallDrag();
+           |  };
+           |  sock.onmessage=function(e){
+           |    if(sock!==ws){sock.close();return;}
+           |    if(!__live){__live=true;__wsRetries=0;var pending=__q;__q=[];for(var i=0;i<pending.length;i++)sock.send(pending[i]);}
+           |    kyoOnMessage(e);
+           |  };
+           |  // A connect that never completes reports here and then closes, so recovery is driven from onclose alone;
+           |  // this handler exists so the failure does not surface as an unhandled error.
+           |  sock.onerror=function(){};
+           |  sock.onclose=function(){
+           |    if(sock!==ws)return;
+           |    __live=false;
+           |    if(__dragCleanup){__dragCleanup();__dragCleanup=null;}
+           |    if(__wsGone)return;
+           |    // Capped exponential backoff: quick enough that a transient refusal recovers within a page's useful
+           |    // lifetime, slow enough not to hammer a server that is genuinely down. Jittered to 50-100% of each step
+           |    // so pages dropped together by a server restart do not all redial at the same instant.
+           |    var wait=Math.min(250*Math.pow(2,__wsRetries),5000);
+           |    __wsRetries++;
+           |    setTimeout(kyoConnect,wait*(0.5+Math.random()*0.5));
+           |  };
+           |}
+           |// A page being torn down is not a lost connection: stop redialing so an unloading page does not keep calling the server it is
+           |// leaving. A page becomes eligible for the back/forward cache precisely when its socket is DOWN, since an open one usually
+           |// blocks it, so a restored page has to redial and rebuild the range map the hide path cleared, or it returns permanently
+           |// inert, which is the exact failure this reconnect exists to prevent.
+           |window.addEventListener("pagehide",function(){__wsGone=true;});
+           |window.addEventListener("pageshow",function(e){
+           |  if(!e.persisted)return;
+           |  if(!__kyoRanges)__kyoRanges=kyoRangeScan(document.body);
+           |  __wsGone=false;__wsRetries=0;kyoConnect();
+           |});
+           |kyoConnect();
+           |function kyoOnMessage(e){
+           |  var op=JSON.parse(e.data);
+           |  if(op.ResolveDrag){
+           |    try{__dragRt.resolve(op.ResolveDrag.sessionId,op.ResolveDrag.decision);}catch(error){kyoClientError(error);}
+           |  }else if(op.ReadDropFile||op.ReadDropDirectory||op.CancelDropRead){
+           |    try{__dragRt.serveDropRead(op);}catch(error){kyoClientError(error);}
+           |  }else if(op.ReplaceRange){
+           |    try{kyoRangeReplace(op.ReplaceRange.regionId,op.ReplaceRange.html);}catch(error){kyoClientError(error);}
+           |  }else if(op.Replace){
+           |    var p=op.Replace.path.join(".");
+           |    var el=document.querySelector('[data-kyo-path="'+p+'"]');
+           |    // Replace is the SVG-only, path-addressed operation. HTML boundaries use ReplaceRange above.
+           |    if(el&&el.outerHTML!==op.Replace.html){
+           |      var ae=document.activeElement;
+           |      var ap=ae&&ae!==document.body&&ae.getAttribute?ae.getAttribute("data-kyo-path"):null;
+           |      var ss=(ae&&typeof ae.selectionStart==='number')?ae.selectionStart:null;
+           |      var se=(ae&&typeof ae.selectionEnd==='number')?ae.selectionEnd:null;
+           |      var __en=faEnterPaths(el);
+           |      var __gh=kyoLeavePrepare(el,kyoLeaveSurv(op.Replace.html));
+           |      var __fa=focusAutoPaths(el);
+           |      el.outerHTML=op.Replace.html;
+           |      var nel=document.querySelector('[data-kyo-path="'+p+'"]');if(nel){applyJsProps(nel);ba(nel);}
+           |      if(ap){var rf=document.querySelector('[data-kyo-path="'+ap+'"]');if(rf){rf.focus();if(ss!==null)kyoSetCaret(rf,ss,se);}}
+           |      // Seed after focus/caret restore so a newly appeared focus-auto element wins restore-to-trigger.
+           |      if(nel){kyoEnterSeed(nel,__en);seedFocusAuto(nel,__fa);}
+           |      kyoSpawnGhosts(__gh);
+           |    }
+           |    sweepFocusAuto();
+           |  }else if(op.Remove){
+           |    var p=op.Remove.path.join(".");
+           |    var el=document.querySelector('[data-kyo-path="'+p+'"]');
+           |    var __rgh=el?kyoLeavePrepare(el,{}):[];
+           |    if(el)el.remove();
+           |    kyoSpawnGhosts(__rgh);
+           |    sweepFocusAuto();
+           |  }else if(op.InjectCss){
+           |    var s=document.createElement("style");
+           |    s.textContent=op.InjectCss.css;
+           |    document.head.appendChild(s);
+           |  }else if(op.ScrollIntoView){
+           |    // The scroll may arrive in the same batch as the Replace that introduces its target, so
+           |    // resolve the id after this frame's DOM writes have applied.
+           |    requestAnimationFrame(function(){
+           |      var el=document.getElementById(op.ScrollIntoView.id);
+           |      if(el)el.scrollIntoView({behavior:"smooth",block:"start"});
+           |    });
+           |  }
+           |};
+           |function fp(el){
+           |  while(el&&el!==document.body){
+           |    if(el.hasAttribute("data-kyo-path"))return el;
+           |    el=el.parentElement;
+           |  }
+           |  return null;
+           |}
+           |function he(el,t){
+           |  // Walk up from `el` checking each ancestor for the event marker.
+           |  // Bubbling events (keydown/keyup/click) are forwarded if ANY ancestor declared the handler.
+           |  var n=el;
+           |  while(n&&n!==document.body){
+           |    var ev=n.getAttribute&&n.getAttribute("data-kyo-ev");
+           |    if(ev&&ev.split(",").indexOf(t)>=0)return true;
+           |    n=n.parentElement;
+           |  }
+           |  return false;
+           |}
+           |// Send each event over the session's WebSocket. ws.send preserves send order on one socket, so the
+           |// explicit fetch-queue serialization is no longer needed. Events raised before the session is live are
+           |// buffered in __q and flushed when its first frame arrives, which every reconnect reaches. Both an absent
+           |// socket and an open-but-unanswered one take the buffer, so nothing is handed to a connection that has
+           |// not proven a session is reading it.
+           |function post(b){
+           |  var m=JSON.stringify(b);
+           |  if(ws&&__live&&ws.readyState===1)ws.send(m);
+           |  else __q.push(m);
+           |}
+           |function pa(el){
+           |  var p=el.getAttribute("data-kyo-path");
+           |  return p===""?[]:p.split(".");
+           |}
+           |// Apply data-kyo-prop-* HTML attributes as JS DOM properties then remove the attr.
+           |// Mirrors DomBackend.applyJsPropsSync for the HTTP/JVM rendering path.
+           |function applyJsPropsElement(el,pfx){for(var i=el.attributes.length-1;i>=0;i--){var n=el.attributes[i].name;
+           |  if(n.indexOf(pfx)===0){el[n.slice(pfx.length)]=el.getAttribute(n);el.removeAttribute(n);}}
+           |}
+           |function applyJsProps(root){
+           |  var pfx="data-kyo-prop-";applyJsPropsElement(root,pfx);var els=root.querySelectorAll("*");
+           |  for(var i=0;i<els.length;i++)applyJsPropsElement(els[i],pfx);
+           |}
+           |// Start freshly-inserted SMIL animations. Chart transition <animate> elements use
+           |// begin="indefinite" so they do not auto-play against the shared document timeline (which would
+           |// snap a post-load update to its frozen end value); beginElement() starts them relative to the
+           |// insertion. Deferred one frame so the SMIL engine has registered the new nodes.
+           |function ba(root){
+           |  if(!root||!root.querySelectorAll)return;
+           |  var an=root.querySelectorAll("animate,animateTransform,animateMotion");
+           |  if(!an.length)return;
+           |  requestAnimationFrame(function(){for(var i=0;i<an.length;i++){try{an[i].beginElement();}catch(e){}}});
+           |}
+           |// ---- enter/leave transition helpers (client-local; nothing crosses the wire) ----
+           |// Set of data-kyo-enter paths under root (root included): the enter elements present BEFORE a patch.
+           |function faEnterPaths(root){
+           |  var s={};if(!root)return s;
+           |  if(root.hasAttribute&&root.hasAttribute("data-kyo-enter")){var rp=root.getAttribute("data-kyo-path");if(rp!==null)s[rp]=true;}
+           |  var els=root.querySelectorAll?root.querySelectorAll("[data-kyo-enter]"):[];
+           |  for(var i=0;i<els.length;i++){var ep=els[i].getAttribute("data-kyo-path");if(ep!==null)s[ep]=true;}
+           |  return s;
+           |}
+           |// For each data-kyo-enter element under newRoot (root included) whose path is NOT in oldSet (newly appeared):
+           |// add its enter classes, force a reflow (offsetWidth), then remove them next frame so the CSS transition runs.
+           |function kyoEnterSeed(newRoot,oldSet){
+           |  if(!newRoot)return;
+           |  var cand=[];
+           |  if(newRoot.hasAttribute&&newRoot.hasAttribute("data-kyo-enter"))cand.push(newRoot);
+           |  var els=newRoot.querySelectorAll?newRoot.querySelectorAll("[data-kyo-enter]"):[];
+           |  for(var i=0;i<els.length;i++)cand.push(els[i]);
+           |  for(var j=0;j<cand.length;j++){
+           |    var el=cand[j];var pth=el.getAttribute("data-kyo-path");
+           |    if(pth===null||oldSet[pth])continue;
+           |    var cls=el.getAttribute("data-kyo-enter").split(/\\s+/);
+           |    for(var k=0;k<cls.length;k++){if(cls[k])el.classList.add(cls[k]);}
+           |    void el.offsetWidth;
+           |    (function(e2,cs){requestAnimationFrame(function(){for(var m=0;m<cs.length;m++){if(cs[m])e2.classList.remove(cs[m]);}});})(el,cls);
+           |  }
+           |}
+           |// Set of paths of data-kyo-LEAVE elements in an HTML fragment (which leave-elements SURVIVE a Replace).
+           |// Keyed on leave-carrying elements, NOT every data-kyo-path.
+           |function kyoLeaveSurv(html){
+           |  var s={};var t=document.createElement("template");t.innerHTML=html;
+           |  var els=t.content.querySelectorAll("[data-kyo-leave]");
+           |  for(var i=0;i<els.length;i++){var pp=els[i].getAttribute("data-kyo-path");if(pp!==null)s[pp]=true;}
+           |  return s;
+           |}
+           |// Strip data-kyo-* and id from a subtree so a ghost clone is inert (no data-kyo-path/focus-auto selector collisions).
+           |function kyoStrip(el){
+           |  var all=[el];if(el.querySelectorAll){var ds=el.querySelectorAll("*");for(var i=0;i<ds.length;i++)all.push(ds[i]);}
+           |  for(var j=0;j<all.length;j++){var e2=all[j];if(!e2.getAttributeNames)continue;var ns=e2.getAttributeNames();
+           |    for(var k=0;k<ns.length;k++){if(ns[k].indexOf("data-kyo-")===0||ns[k]==="id")e2.removeAttribute(ns[k]);}}
+           |}
+           |// Prepare leave ghosts for the OUTERMOST data-kyo-leave elements under root being removed (path not in survSet).
+           |// Captures rect+clone WHILE the node is still in the DOM (getBoundingClientRect on a detached node is zero).
+           |function kyoLeavePrepare(root,survSet){
+           |  if(!root)return [];
+           |  var cand=[];
+           |  if(root.getAttribute&&root.getAttribute("data-kyo-leave")!==null)cand.push(root);
+           |  var els=root.querySelectorAll?root.querySelectorAll("[data-kyo-leave]"):[];
+           |  for(var i=0;i<els.length;i++)cand.push(els[i]);
+           |  var removed=[];
+           |  for(var j=0;j<cand.length;j++){var pp=cand[j].getAttribute("data-kyo-path");if(pp===null||!survSet[pp])removed.push(cand[j]);}
+           |  var out=[];
+           |  for(var k=0;k<removed.length;k++){var inside=false;
+           |    for(var m=0;m<removed.length;m++){if(m!==k&&removed[m].contains(removed[k])){inside=true;break;}}
+           |    if(!inside)out.push(removed[k]);}
+           |  var ghosts=[];
+           |  for(var n=0;n<out.length;n++){
+           |    var node=out[n];var rect=node.getBoundingClientRect();var leave=node.getAttribute("data-kyo-leave");
+           |    var g=node.cloneNode(true);kyoStrip(g);
+           |    g.style.position="fixed";g.style.left=rect.left+"px";g.style.top=rect.top+"px";
+           |    g.style.width=rect.width+"px";g.style.height=rect.height+"px";g.style.margin="0";g.style.pointerEvents="none";
+           |    g.setAttribute("data-kyo-ghost","1");
+           |    ghosts.push({node:g,leave:leave});
+           |  }
+           |  return ghosts;
+           |}
+           |// Append prepared ghosts to <body>, add their leave classes next frame, remove on transitionend/animationend or a 1s safety.
+           |function kyoSpawnGhosts(ghosts){
+           |  if(!ghosts)return;
+           |  for(var i=0;i<ghosts.length;i++){(function(gh){
+           |    var g=gh.node;document.body.appendChild(g);
+           |    var cls=(gh.leave||"").split(/\\s+/);
+           |    requestAnimationFrame(function(){for(var c=0;c<cls.length;c++){if(cls[c])g.classList.add(cls[c]);}});
+           |    var done=false;
+           |    function cleanup(){if(done)return;done=true;if(g.parentNode)g.parentNode.removeChild(g);}
+           |    g.addEventListener("transitionend",cleanup);g.addEventListener("animationend",cleanup);
+           |    setTimeout(cleanup,1000);
+           |  })(ghosts[i]);}
+           |}
+           |// Focus seeding/restore for [data-kyo-focus-auto]/[data-kyo-focus-restore]; __focusReturnStack stacks {fa, ret|null, restore}.
+           |// Mirrors DomBackend.focusReturnStack for the SPA transport.
+           |var __focusReturnStack=[];
+           |// Object-set (keyed by path) of every [data-kyo-focus-auto] path inside root, root included.
+           |function focusAutoPaths(root){
+           |  var s={};
+           |  if(!root||!root.querySelectorAll)return s;
+           |  if(root.hasAttribute&&root.hasAttribute("data-kyo-focus-auto")){var rp=root.getAttribute("data-kyo-path");if(rp!==null)s[rp]=true;}
+           |  var els=root.querySelectorAll("[data-kyo-focus-auto]");
+           |  for(var i=0;i<els.length;i++){var ep=els[i].getAttribute("data-kyo-path");if(ep!==null)s[ep]=true;}
+           |  return s;
+           |}
+           |// Seed the FIRST newly-appeared focus-auto element under newRoot (path not in oldSet); record prior focus for the sweep.
+           |function seedFocusAuto(newRoot,oldSet){
+           |  if(!newRoot||!newRoot.querySelectorAll)return;
+           |  var cand=[];
+           |  if(newRoot.hasAttribute&&newRoot.hasAttribute("data-kyo-focus-auto"))cand.push(newRoot);
+           |  var els=newRoot.querySelectorAll("[data-kyo-focus-auto]");
+           |  for(var i=0;i<els.length;i++)cand.push(els[i]);
+           |  for(var j=0;j<cand.length;j++){
+           |    var fa=cand[j].getAttribute("data-kyo-path");
+           |    if(fa!==null&&!oldSet[fa]){
+           |      var ae=document.activeElement;
+           |      var ret=(ae&&ae!==document.body&&ae.getAttribute)?ae.getAttribute("data-kyo-path"):null;
+           |      __focusReturnStack.push({fa:fa,ret:ret,restore:cand[j].hasAttribute("data-kyo-focus-restore")});
+           |      if(typeof cand[j].focus==='function')cand[j].focus();
+           |      return;
+           |    }
+           |  }
+           |}
+           |// Unwind entries whose seeded element left the document, returning focus at most once. Mirrors DomBackend.sweepFocusAuto.
+           |function sweepFocusAuto(){
+           |  var restored=false;
+           |  while(__focusReturnStack.length>0){
+           |    var top=__focusReturnStack[__focusReturnStack.length-1];
+           |    // Stop at the first seed still on screen: restoring an entry below it would move focus out of it.
+           |    if(document.querySelector('[data-kyo-path="'+top.fa+'"][data-kyo-focus-auto]'))return;
+           |    __focusReturnStack.pop();
+           |    // At most one restore per unwind: a deeper entry belongs to a seed that closed while a newer one stayed
+           |    // open, so its return target is stale and must not override the one just restored.
+           |    if(!restored&&top.restore&&top.ret){var re=document.querySelector('[data-kyo-path="'+top.ret+'"]');if(re&&typeof re.focus==='function'){re.focus();restored=true;}}
+           |  }
+           |}
+           |applyJsProps(document.body);ba(document.body);
+           |kyoEnterSeed(document.body,{});
+           |// Initial mount: everything server-rendered is new (empty old set), like native autofocus.
+           |seedFocusAuto(document.body,{});
+           |// Dropdown helpers: close all dropdowns except the given id
+           |function kyoCloseDropdown(exceptId){
+           |  var all=document.querySelectorAll('[data-kyo-dropdown-options]');
+           |  Array.prototype.forEach.call(all,function(el){
+           |    var id=el.getAttribute('data-kyo-dropdown-options');
+           |    if(id!==exceptId)el.hidden=true;
+           |  });
+           |}
+           |// Build a mouse payload, omitting targetId when absent (null JSON would break Maybe[String] decode).
+           |function mkMouse(mods,tid){var m={modifiers:mods};if(tid)m.targetId=tid;return m;}
+           |// Build a keyboard payload, omitting targetId when absent.
+           |function mkKbd(key,mods,tid){var k={key:key,modifiers:mods};if(tid)k.targetId=tid;return k;}
+           |function handle(e){
+           |  var el=fp(e.target);
+           |  if(!el)return;
+           |  var p=pa(el),t=e.type;
+           |  if(t==="click"){
+           |    // Dropdown trigger click: open/close the option list.
+           |    // Skip isTrusted=false synthetic clicks (e.g. from runSpaceClickSynthesis after Space keydown).
+           |    if(e.isTrusted!==false&&e.target&&e.target.getAttribute('data-kyo-dropdown-trigger')){
+           |      var did=e.target.getAttribute('data-kyo-dropdown-trigger');
+           |      var opts=document.querySelector('[data-kyo-dropdown-options="'+did+'"]');
+           |      if(opts){
+           |        var opening=opts.hidden;
+           |        kyoCloseDropdown(opening?did:null);
+           |        opts.hidden=!opening;
+           |        if(!opts.hidden){
+           |          var hlEl=opts.querySelector('[data-kyo-dropdown-hl]');
+           |          if(!hlEl){var first=opts.querySelector('[data-kyo-dropdown-opt]');if(first)first.setAttribute('data-kyo-dropdown-hl','true');}
+           |        }
+           |      }
+           |      return;
+           |    }
+           |    // Dropdown option click: confirm selection
+           |    if(e.target&&e.target.getAttribute('data-kyo-dropdown-val')!==null){
+           |      var val=e.target.getAttribute('data-kyo-dropdown-val');
+           |      var wrap=e.target.closest('[data-kyo-dropdown]');
+           |      if(wrap){
+           |        var dOpts=document.querySelector('[data-kyo-dropdown-options="'+wrap.getAttribute('data-kyo-dropdown')+'"]');
+           |        if(dOpts)dOpts.hidden=true;
+           |        var wp=pa(wrap);
+           |        post({Change:{path:wp,value:val}});
+           |      }
+           |      return;
+           |    }
+           |    // An anchor the UI handles stays on the page; one it does not handle is a link, and the browser follows it.
+           |    // A modified click (a new tab or window) and a download anchor keep their default; the handler runs either way.
+           |    var kmod=e.ctrlKey||e.metaKey||e.shiftKey||e.altKey||e.button!==0;
+           |    var mid=e.target&&e.target.id?e.target.id:null;if(!kmod&&el.tagName&&el.tagName.toLowerCase()==='a'&&!el.hasAttribute("download")&&he(el,"click"))e.preventDefault();post({Click:{path:p,mouse:mkMouse({ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey},mid)}});window._kyoClickSubmit=true;setTimeout(function(){window._kyoClickSubmit=false},0);
+           |  }
+           |  else if(t==="input"&&he(el,"input"))post({Input:{path:p,value:e.target.value}});
+           |  else if(t==="change"&&he(el,"change")){
+           |    var tgt=e.target,typ=tgt.type;
+           |    if(typ==="checkbox"||typ==="radio")post({ChangeChecked:{path:p,checked:tgt.checked}});
+           |    else if(typ==="number"||typ==="range")post({ChangeNumeric:{path:p,value:parseFloat(tgt.value)}});
+           |    else post({Change:{path:p,value:tgt.value}});
+           |  }else if(t==="submit"){e.preventDefault();if(!window._kyoClickSubmit&&he(el,"submit")){var smid=e.target&&e.target.id?e.target.id:null;post({Submit:{path:p,mouse:mkMouse({ctrl:false,alt:false,shift:false,meta:false},smid)}});}}
+           |  else if(t==="keydown"){
+           |    // preventScrollKeys: suppress native page-scroll for nav keys in a data-kyo-scroll-keys region; keydown still posts below.
+           |    if(e.target&&e.target.closest&&e.target.closest('[data-kyo-scroll-keys]')){
+           |      var __sk=e.target,__ed=(/^(INPUT|TEXTAREA|SELECT)$$/.test(__sk.tagName)||__sk.isContentEditable);
+           |      var __vc=(/^(TEXTAREA|SELECT)$$/.test(__sk.tagName)||__sk.isContentEditable);
+           |      var __vk=(e.key==="ArrowUp"||e.key==="ArrowDown"||e.key==="PageUp"||e.key==="PageDown");
+           |      var __hk=(e.key==="ArrowLeft"||e.key==="ArrowRight"||e.key==="Home"||e.key==="End");
+           |      if((__vk&&!__vc)||(__hk&&!__ed))e.preventDefault();
+           |    }
+           |    // Focus-trap: when Tab is pressed inside a [data-kyo-focus-trap="1"] container,
+           |    // wrap focus within the trap's focusable children instead of escaping to the page.
+           |    // Escape falls through so the element's onKeyDown handler can close the modal.
+           |    if(e.key==="Tab"&&e.target){
+           |      var trap=e.target.closest('[data-kyo-focus-trap="1"]');
+           |      if(trap){
+           |        var focusables=Array.prototype.filter.call(
+           |          trap.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'),
+           |          function(fe){return !fe.hidden&&fe.offsetParent!==null;}
+           |        );
+           |        if(focusables.length>0){
+           |          var ci=focusables.indexOf(document.activeElement);
+           |          var dir=e.shiftKey?-1:1;
+           |          var ni=((ci<0?0:ci)+dir+focusables.length)%focusables.length;
+           |          var next=focusables[ni];
+           |          if(next){
+           |            // Reposition data-kyo-tab-prev so runTabFocusAdvance (Browser.press post-shim)
+           |            // also lands on next rather than escaping the trap.
+           |            var allF=Array.prototype.filter.call(
+           |              document.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'),
+           |              function(fe){return !fe.hidden&&fe.offsetParent!==null;}
+           |            );
+           |            var allPos=allF.filter(function(fe){return fe.tabIndex>0;}).sort(function(a,b){return a.tabIndex-b.tabIndex;});
+           |            var allNat=allF.filter(function(fe){return fe.tabIndex<=0;});
+           |            var allOrd=allPos.concat(allNat);
+           |            var nextIdx=allOrd.indexOf(next);
+           |            var oldMark=document.querySelector('[data-kyo-tab-prev="1"]');
+           |            if(oldMark)oldMark.removeAttribute('data-kyo-tab-prev');
+           |            if(nextIdx>=0){
+           |              var preNext=allOrd[((nextIdx-dir+allOrd.length)%allOrd.length)];
+           |              if(preNext)preNext.setAttribute('data-kyo-tab-prev','1');
+           |            }
+           |            next.focus();
+           |            e.preventDefault();
+           |            e.stopPropagation();
+           |            return;
+           |          }
+           |        }
+           |      }
+           |    }
+           |    // ArrowUp/Down on a focused <input type=number>: call stepUp()/stepDown() (respects step/min/max
+           |    // natively), dispatch input + change events so kyo-ui's ChangeNumeric path fires, then
+           |    // preventDefault to suppress the browser's native increment (which would otherwise double-step).
+           |    // No return; the keydown post below still fires so onKeyDown handlers see ArrowUp/Down.
+           |    if((e.key==="ArrowUp"||e.key==="ArrowDown")&&e.target&&e.target.tagName==="INPUT"&&e.target.type==="number"){
+           |      if(!e.target.disabled&&!e.target.readOnly){
+           |        if(e.key==="ArrowUp")e.target.stepUp();else e.target.stepDown();
+           |        e.target.dispatchEvent(new Event("input",{bubbles:true}));
+           |        e.target.dispatchEvent(new Event("change",{bubbles:true}));
+           |        e.preventDefault();
+           |      }
+           |    }
+           |    // Enter on a focused <select> would otherwise trigger the form's default submit;
+           |    // kyo-ui treats Enter on Select as a dropdown interaction (see ReactiveUI.dispatchToElement),
+           |    // so we suppress the browser default to keep TUI/browser parity.
+           |    if(e.key==="Enter"&&e.target&&e.target.tagName==="SELECT")e.preventDefault();
+           |    // Enter on a focused <input type=checkbox|radio>: HTML spec only activates these via Space,
+           |    // not Enter. kyo-ui synthesizes Enter activation via click() for TUI/browser parity.
+           |    // click() fires the native change event which the existing change handler picks up as
+           |    // ChangeChecked. preventDefault stops any form submission. No return; keydown post fires.
+           |    if(e.key==="Enter"&&e.target&&e.target.tagName==="INPUT"&&
+           |       (e.target.type==="checkbox"||e.target.type==="radio")){
+           |      if(!e.target.disabled){e.target.click();e.preventDefault();}
+           |    }
+           |    // Focus-group: ArrowLeft/Right cycles among siblings sharing data-kyo-focus-group.
+           |    // preventDefault stops browser's native horizontal scroll-on-arrow.
+           |    // No return; keydown post still fires so onKeyDown sees the event.
+           |    if((e.key==="ArrowLeft"||e.key==="ArrowRight")&&e.target){
+           |      var grp=e.target.getAttribute&&e.target.getAttribute("data-kyo-focus-group");
+           |      if(grp){
+           |        var peers=Array.prototype.slice.call(document.querySelectorAll('[data-kyo-focus-group="'+grp+'"]'));
+           |        peers=peers.filter(function(pe){return !pe.disabled&&!pe.hidden&&pe.offsetParent!==null;});
+           |        if(peers.length>1){
+           |          var i=peers.indexOf(e.target);
+           |          var dir=e.key==="ArrowRight"?1:-1;
+           |          var nx=peers[((i<0?0:i)+dir+peers.length)%peers.length];
+           |          if(nx&&nx!==e.target){nx.focus();e.preventDefault();}
+           |        }
+           |      }
+           |    }
+           |    // Custom dropdown (div-based): Space opens, ArrowDown/Up navigate, Enter confirms, Escape/Tab closes.
+           |    // Type-ahead: single printable char jumps to next matching option.
+           |    // Must run BEFORE the keydown post so early returns suppress server dispatch.
+           |    var ddWrap=e.target&&e.target.closest('[data-kyo-dropdown]');
+           |    if(ddWrap){
+           |      var did2=ddWrap.getAttribute('data-kyo-dropdown');
+           |      var opts2=did2?document.querySelector('[data-kyo-dropdown-options="'+did2+'"]'):null;
+           |      var isOpen=opts2&&!opts2.hidden;
+           |      var isSpaceKey=(e.key===' '||e.key==='Space'||e.keyCode===32||e.which===32);
+           |      if(isSpaceKey&&!isOpen){
+           |        kyoCloseDropdown(did2);opts2.hidden=false;
+           |        var first2=opts2.querySelector('[data-kyo-dropdown-opt]');if(first2)first2.setAttribute('data-kyo-dropdown-hl','true');
+           |        e.preventDefault();return;
+           |      }
+           |      if(isOpen){
+           |        var items=Array.prototype.slice.call(opts2.querySelectorAll('[data-kyo-dropdown-opt]'));
+           |        var hlEl2=opts2.querySelector('[data-kyo-dropdown-hl]');
+           |        var hi=hlEl2?items.indexOf(hlEl2):0;
+           |        if(e.key==='ArrowDown'){
+           |          if(hlEl2)hlEl2.removeAttribute('data-kyo-dropdown-hl');
+           |          items[(hi+1)%items.length].setAttribute('data-kyo-dropdown-hl','true');
+           |          e.preventDefault();return;
+           |        }
+           |        if(e.key==='ArrowUp'){
+           |          if(hlEl2)hlEl2.removeAttribute('data-kyo-dropdown-hl');
+           |          items[((hi-1)+items.length)%items.length].setAttribute('data-kyo-dropdown-hl','true');
+           |          e.preventDefault();return;
+           |        }
+           |        if(e.key==='Enter'){
+           |          if(hlEl2){
+           |            var val2=hlEl2.getAttribute('data-kyo-dropdown-val');
+           |            opts2.hidden=true;
+           |            post({Change:{path:pa(ddWrap),value:val2}});
+           |          }
+           |          e.preventDefault();return;
+           |        }
+           |        if(e.key==='Escape'){opts2.hidden=true;e.preventDefault();return;}
+           |        if(e.key==='Tab'){opts2.hidden=true;}
+           |        if(e.key.length===1){
+           |          var ch=e.key.toLowerCase();
+           |          var startIdx=(hi+1)%items.length;
+           |          var found=null;
+           |          for(var ii=0;ii<items.length&&!found;ii++){
+           |            var candidate=items[(startIdx+ii)%items.length];
+           |            if(candidate.textContent.trim().toLowerCase().charAt(0)===ch)found=candidate;
+           |          }
+           |          if(found){if(hlEl2)hlEl2.removeAttribute('data-kyo-dropdown-hl');found.setAttribute('data-kyo-dropdown-hl','true');}
+           |          e.preventDefault();return;
+           |        }
+           |      }
+           |      // Dropdown closed: suppress Enter (avoid form submit) and Space is handled above
+           |      if((e.key==='Enter'||isSpaceKey)&&!isOpen&&opts2){e.preventDefault();return;}
+           |    }
+           |    if(he(el,"keydown")){var ktid=e.target&&e.target.id?e.target.id:null;post({KeyDown:{path:p,keyboard:mkKbd(e.key,{ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey},ktid)}});}
+           |  }
+           |  else if(t==="keyup"&&he(el,"keyup")){var kutid=e.target&&e.target.id?e.target.id:null;post({KeyUp:{path:p,keyboard:mkKbd(e.key,{ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey},kutid)}});}
+           |  else if(t==="focus"&&he(el,"focus")){var ftid=e.target&&e.target.id?e.target.id:null;post({Focus:{path:p,mouse:mkMouse({ctrl:false,alt:false,shift:false,meta:false},ftid)}});}
+           |  else if(t==="blur"&&he(el,"blur")){var btid=e.target&&e.target.id?e.target.id:null;post({Blur:{path:p,mouse:mkMouse({ctrl:false,alt:false,shift:false,meta:false},btid)}});}
+           |  else if(t==="mouseover"&&he(el,"mouseover")){var hotid=e.target&&e.target.id?e.target.id:null;post({Hover:{path:p,mouse:mkMouse({ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey},hotid)}});}
+           |  else if(t==="mouseout"&&he(el,"mouseout")){var uhotid=e.target&&e.target.id?e.target.id:null;post({Unhover:{path:p,mouse:mkMouse({ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey},uhotid)}});}
+           |  // Do NOT auto-call preventDefault: leave native-scroll suppression to the handler, matching DomBackend. Server-side rendering cannot synchronously decline the event, so the default is to NOT prevent.
+           |  else if(t==="wheel"&&he(el,"wheel")){var whtid=e.target&&e.target.id?e.target.id:null;var sc={path:p,deltaX:e.deltaX,deltaY:e.deltaY,modifiers:{ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey}};if(whtid)sc.targetId=whtid;post({Scroll:sc});}
+           |}
+           |// ---- client-local input filter/mask (document-level beforeinput capture listener) ----
+           |$inputMaskJs
+           |function kyoSetVal(t,v){t.value=v;kyoSetCaret(t,v.length,v.length);t.dispatchEvent(new Event("input",{bubbles:true}));}
+           |function kyoSetValAt(t,txt,s,en){var v=t.value;t.value=v.slice(0,s)+txt+v.slice(en);var np=s+txt.length;kyoSetCaret(t,np,np);t.dispatchEvent(new Event("input",{bubbles:true}));}
+           |function kyoBeforeInput(e){
+           |  var t=e.target;if(!t||!t.getAttribute)return;
+           |  // Interactive.data lets any element carry data-kyo-filter, and everything below assumes a value
+           |  // property and a text selection. Throwing from a beforeinput capture listener would break typing
+           |  // for the whole page, so anything but a text field is left alone.
+           |  if(t.tagName!=="INPUT"&&t.tagName!=="TEXTAREA")return;
+           |  var filt=t.getAttribute("data-kyo-filter");var mask=t.getAttribute("data-kyo-mask");
+           |  if(!filt&&!mask)return;
+           |  var it=e.inputType||"";
+           |  // insertCompositionText is deliberately absent below: preventDefault on it does not filter the input,
+           |  // it aborts the composition, which breaks CJK input, dead keys and mobile autocorrect. Composition is
+           |  // let through and the finished text is corrected in kyoCompositionEnd instead.
+           |  if(filt){
+           |    if(it.indexOf("delete")===0)return;
+           |    if(it==="insertText"||it==="insertReplacementText"){
+           |      var data=e.data;if(data==null)return;
+           |      var f1=kyoFilterStr(filt,data,t.value);
+           |      if(f1!==data){e.preventDefault();if(f1){var s=(typeof t.selectionStart==="number")?t.selectionStart:t.value.length;var en=(typeof t.selectionEnd==="number")?t.selectionEnd:s;kyoSetValAt(t,f1,s,en);}}
+           |    }else if(it==="insertFromPaste"||it==="insertFromDrop"){
+           |      e.preventDefault();var pasted=e.dataTransfer?e.dataTransfer.getData("text"):(e.data||"");
+           |      var f2=kyoFilterStr(filt,pasted,t.value);if(f2){var s2=(typeof t.selectionStart==="number")?t.selectionStart:t.value.length;var e2=(typeof t.selectionEnd==="number")?t.selectionEnd:s2;kyoSetValAt(t,f2,s2,e2);}
+           |    }
+           |    return;
+           |  }
+           |  if(mask){
+           |    var mts=kyoMaskParse(mask);
+           |    if(it.indexOf("delete")===0){e.preventDefault();var raw=kyoMaskRaw(mts,t.value);raw=raw.slice(0,raw.length-1);kyoSetVal(t,kyoMaskFormat(mts,raw));return;}
+           |    if(it==="insertText"||it==="insertReplacementText"||it==="insertFromPaste"||it==="insertFromDrop"){
+           |      e.preventDefault();var ins=e.data;if((it==="insertFromPaste"||it==="insertFromDrop")&&e.dataTransfer)ins=e.dataTransfer.getData("text");if(ins==null)ins="";
+           |      var raw2=kyoMaskRaw(mts,t.value);
+           |      for(var ci=0;ci<ins.length;ci++){var cls=kyoMaskClassAt(mts,raw2.length);if(cls===null)break;var ch=ins.charAt(ci);if(kyoMaskOk(cls,ch))raw2+=ch;}
+           |      kyoSetVal(t,kyoMaskFormat(mts,raw2));return;
+           |    }
+           |  }
+           |}
+           |// Corrects the whole value once a composition finishes. Mirrors DomBackend's compositionend listener:
+           |// the composed text is only known when it ends, so it is filtered or formatted here rather than
+           |// per keystroke. Writing back only on a change keeps a conforming composition free of a caret jump.
+           |function kyoCompositionEnd(e){
+           |  var t=e.target;if(!t||!t.getAttribute)return;
+           |  if(t.tagName!=="INPUT"&&t.tagName!=="TEXTAREA")return;
+           |  var filt=t.getAttribute("data-kyo-filter");var mask=t.getAttribute("data-kyo-mask");
+           |  var v=t.value;var nv;
+           |  if(filt)nv=kyoFilterStr(filt,v,"");
+           |  else if(mask)nv=kyoMaskNormalize(mask,v);
+           |  else return;
+           |  if(nv!==v)kyoSetVal(t,nv);
+           |}
+           |["click","input","change","submit","keydown","keyup","focus","blur","mouseover","mouseout"].forEach(function(t){
+           |  document.body.addEventListener(t,handle,true);
+           |});
+           |document.body.addEventListener("wheel",handle,{capture:true,passive:false});
+           |document.body.addEventListener("beforeinput",kyoBeforeInput,true);
+           |document.body.addEventListener("compositionend",kyoCompositionEnd,true);
+           |})();""".stripMargin
+
+    // ---- SVG tag and attribute rendering ----
+
+    /** Exhaustive map from every SvgElement to its HTML/SVG tag string. NO case _ fallback:
+      * a missing arm is a compile error (the kyo-ui build escalates the non-exhaustive-match
+      * warning to an error for this file; see build.sbt).
+      */
+    private def svgTagName(e: Svg.SvgElement): String = e match
+        case _: Svg.Root           => "svg"
+        case _: Svg.G              => "g"
+        case _: Svg.Defs           => "defs"
+        case _: Svg.Symbol         => "symbol"
+        case _: Svg.Switch         => "switch"
+        case _: Svg.SvgAnchor      => "a"
+        case _: Svg.Use            => "use"
+        case _: Svg.Rect           => "rect"
+        case _: Svg.Circle         => "circle"
+        case _: Svg.Ellipse        => "ellipse"
+        case _: Svg.Line           => "line"
+        case _: Svg.Polyline       => "polyline"
+        case _: Svg.Polygon        => "polygon"
+        case _: Svg.Path           => "path"
+        case _: Svg.Text           => "text"
+        case _: Svg.TSpan          => "tspan"
+        case _: Svg.TextPath       => "textPath"
+        case _: Svg.LinearGradient => "linearGradient"
+        case _: Svg.RadialGradient => "radialGradient"
+        case _: Svg.Stop           => "stop"
+        case _: Svg.Pattern        => "pattern"
+        case _: Svg.ClipPath       => "clipPath"
+        case _: Svg.Mask           => "mask"
+        case _: Svg.Image          => "image"
+        case _: Svg.ForeignObject  => "foreignObject"
+        case _: Svg.Marker         => "marker"
+        case _: Svg.Title          => "title"
+        case _: Svg.Desc           => "desc"
+        case _: Svg.Metadata       => "metadata"
+        // filter family
+        case _: Svg.Filter            => "filter"
+        case _: Svg.FeGaussianBlur    => "feGaussianBlur"
+        case _: Svg.FeOffset          => "feOffset"
+        case _: Svg.FeBlend           => "feBlend"
+        case _: Svg.FeColorMatrix     => "feColorMatrix"
+        case _: Svg.FeFlood           => "feFlood"
+        case _: Svg.FeComposite       => "feComposite"
+        case _: Svg.FeMerge           => "feMerge"
+        case _: Svg.FeMergeNode       => "feMergeNode"
+        case _: Svg.FeImage           => "feImage"
+        case _: Svg.FeTile            => "feTile"
+        case _: Svg.FeMorphology      => "feMorphology"
+        case _: Svg.FeTurbulence      => "feTurbulence"
+        case _: Svg.FeDisplacementMap => "feDisplacementMap"
+        // SMIL family
+        case _: Svg.Animate          => "animate"
+        case _: Svg.AnimateTransform => "animateTransform"
+        case _: Svg.AnimateMotion    => "animateMotion"
+        case _: Svg.SetAnim          => "set"
+
+    private def renderSvgAttrs(sb: StringBuilder, e: Svg.SvgElement): Unit =
+        val s = e.svgAttrs
+        // emit the "id" attribute for definition elements. A reference-able definition element
+        // (gradient/pattern/clipPath/mask/marker/filter) emits its deterministic id even when defId is
+        // unset, so a raw element referenced via its *Ref/.paint handle is not a dangling url(#id).
+        // Other elements emit only an explicitly-set defId (e.g. symbol via id(v)).
+        e match
+            case d: Svg.DefinitionElement => svgAttr(sb, "id", d.id)
+            case _                        => s.defId.foreach(id => svgAttr(sb, "id", id))
+        // shared presentation attributes
+        renderSvgPresentation(sb, s)
+        // element-specific geometry and reference slots
+        e match
+            case _: Svg.Root =>
+                s.viewBox.foreach(v => svgAttr(sb, "viewBox", viewBox(v)))
+                s.preserveAspectRatio.foreach(p => svgAttr(sb, "preserveAspectRatio", par(p)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+            case _: Svg.G      =>
+            case _: Svg.Defs   =>
+            case _: Svg.Symbol =>
+                s.viewBox.foreach(v => svgAttr(sb, "viewBox", viewBox(v)))
+            case _: Svg.Switch    =>
+            case _: Svg.Metadata  =>
+            case _: Svg.SvgAnchor =>
+                s.href.foreach(h => svgAttr(sb, "href", h))
+            case _: Svg.Use =>
+                s.href.foreach(h => svgAttr(sb, "href", h))
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+            case _: Svg.Rect =>
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+                s.rx.foreach(c => svgAttr(sb, "rx", coord(c)))
+                s.ry.foreach(c => svgAttr(sb, "ry", coord(c)))
+            case _: Svg.Circle =>
+                s.cx.foreach(v => svgAttr(sb, "cx", fmtD(v)))
+                s.cy.foreach(v => svgAttr(sb, "cy", fmtD(v)))
+                s.r.foreach(v => svgAttr(sb, "r", fmtD(v)))
+            case _: Svg.Ellipse =>
+                s.cx.foreach(v => svgAttr(sb, "cx", fmtD(v)))
+                s.cy.foreach(v => svgAttr(sb, "cy", fmtD(v)))
+                s.rx.foreach(c => svgAttr(sb, "rx", coord(c)))
+                s.ry.foreach(c => svgAttr(sb, "ry", coord(c)))
+            case _: Svg.Line =>
+                s.x1.foreach(v => svgAttr(sb, "x1", fmtD(v)))
+                s.y1.foreach(v => svgAttr(sb, "y1", fmtD(v)))
+                s.x2.foreach(v => svgAttr(sb, "x2", fmtD(v)))
+                s.y2.foreach(v => svgAttr(sb, "y2", fmtD(v)))
+                renderMarkers(sb, s)
+            case _: Svg.Polyline =>
+                s.points.foreach(p => svgAttr(sb, "points", points(p)))
+                renderMarkers(sb, s)
+            case _: Svg.Polygon =>
+                s.points.foreach(p => svgAttr(sb, "points", points(p)))
+                renderMarkers(sb, s)
+            case _: Svg.Path =>
+                s.d.foreach(d => svgAttr(sb, "d", pathData(d)))
+                renderMarkers(sb, s)
+            case _: Svg.Text =>
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                renderTextAttrs(sb, s)
+            case _: Svg.TSpan =>
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                renderTextAttrs(sb, s)
+            case _: Svg.TextPath =>
+                s.href.foreach(h => svgAttr(sb, "href", h))
+                renderTextAttrs(sb, s)
+            case _: Svg.LinearGradient =>
+                s.x1.foreach(v => svgAttr(sb, "x1", fmtD(v)))
+                s.y1.foreach(v => svgAttr(sb, "y1", fmtD(v)))
+                s.x2.foreach(v => svgAttr(sb, "x2", fmtD(v)))
+                s.y2.foreach(v => svgAttr(sb, "y2", fmtD(v)))
+                s.gradientUnits.foreach(u => svgAttr(sb, "gradientUnits", units(u)))
+                s.spreadMethod.foreach(m => svgAttr(sb, "spreadMethod", spread(m)))
+            case _: Svg.RadialGradient =>
+                s.cx.foreach(v => svgAttr(sb, "cx", fmtD(v)))
+                s.cy.foreach(v => svgAttr(sb, "cy", fmtD(v)))
+                s.r.foreach(v => svgAttr(sb, "r", fmtD(v)))
+                s.fx.foreach(v => svgAttr(sb, "fx", fmtD(v)))
+                s.fy.foreach(v => svgAttr(sb, "fy", fmtD(v)))
+                s.gradientUnits.foreach(u => svgAttr(sb, "gradientUnits", units(u)))
+                s.spreadMethod.foreach(m => svgAttr(sb, "spreadMethod", spread(m)))
+            case _: Svg.Stop =>
+                s.offset.foreach(v => svgAttr(sb, "offset", fmtD(v)))
+                s.stopColor.foreach(c => svgAttr(sb, "stop-color", CssStyleRenderer.color(c)))
+                s.stopOpacity.foreach(v => svgAttr(sb, "stop-opacity", fmtD(v)))
+            case _: Svg.Pattern =>
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+                s.patternUnits.foreach(u => svgAttr(sb, "patternUnits", units(u)))
+                s.viewBox.foreach(v => svgAttr(sb, "viewBox", viewBox(v)))
+            case _: Svg.ClipPath =>
+                s.clipPathUnits.foreach(u => svgAttr(sb, "clipPathUnits", units(u)))
+            case _: Svg.Mask =>
+                s.maskUnits.foreach(u => svgAttr(sb, "maskUnits", units(u)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+            case _: Svg.Image =>
+                s.href.foreach(h => svgAttr(sb, "href", h))
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+                s.preserveAspectRatio.foreach(p => svgAttr(sb, "preserveAspectRatio", par(p)))
+            case _: Svg.ForeignObject =>
+                s.x.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.y.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.width.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.height.foreach(c => svgAttr(sb, "height", coord(c)))
+            case _: Svg.Marker =>
+                s.markerWidth.foreach(v => svgAttr(sb, "markerWidth", fmtD(v)))
+                s.markerHeight.foreach(v => svgAttr(sb, "markerHeight", fmtD(v)))
+                s.refX.foreach(v => svgAttr(sb, "refX", fmtD(v)))
+                s.refY.foreach(v => svgAttr(sb, "refY", fmtD(v)))
+                s.markerUnits.foreach(u => svgAttr(sb, "markerUnits", markerUnits(u)))
+                s.orient.foreach(o => svgAttr(sb, "orient", o))
+                s.viewBox.foreach(v => svgAttr(sb, "viewBox", viewBox(v)))
+            case _: Svg.Title  =>
+            case _: Svg.Desc   =>
+            case _: Svg.Filter =>
+                // The filter `id` is emitted by the shared DefinitionElement path above.
+                s.filterX.foreach(c => svgAttr(sb, "x", coord(c)))
+                s.filterY.foreach(c => svgAttr(sb, "y", coord(c)))
+                s.filterWidth.foreach(c => svgAttr(sb, "width", coord(c)))
+                s.filterHeight.foreach(c => svgAttr(sb, "height", coord(c)))
+                s.filterUnits.foreach(u => svgAttr(sb, "filterUnits", units(u)))
+            case _: Svg.FeGaussianBlur =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.stdDeviation.foreach(v => svgAttr(sb, "stdDeviation", fmtD(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeOffset =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feDx.foreach(v => svgAttr(sb, "dx", fmtD(v)))
+                s.feDy.foreach(v => svgAttr(sb, "dy", fmtD(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeBlend =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feIn2.foreach(v => svgAttr(sb, "in2", v))
+                s.feMode.foreach(v => svgAttr(sb, "mode", blendMode(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeColorMatrix =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feColorMatrixType.foreach(v => svgAttr(sb, "type", colorMatrixType(v)))
+                s.feValues.foreach(v => svgAttr(sb, "values", v))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeFlood =>
+                s.feFloodColor.foreach(c => svgAttr(sb, "flood-color", CssStyleRenderer.color(c)))
+                s.feFloodOpacity.foreach(v => svgAttr(sb, "flood-opacity", fmtD(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeComposite =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feIn2.foreach(v => svgAttr(sb, "in2", v))
+                s.feCompositeOperator.foreach(v => svgAttr(sb, "operator", compositeOperator(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeMerge =>
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeMergeNode =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+            case _: Svg.FeImage =>
+                s.href.foreach(h => svgAttr(sb, "href", h))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeTile =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeMorphology =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feMorphologyOperator.foreach(v => svgAttr(sb, "operator", morphologyOperator(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeTurbulence =>
+                s.feBaseFrequency.foreach(v => svgAttr(sb, "baseFrequency", v))
+                s.feTurbulenceType.foreach(v => svgAttr(sb, "type", turbulenceType(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.FeDisplacementMap =>
+                s.feIn.foreach(v => svgAttr(sb, "in", v))
+                s.feIn2.foreach(v => svgAttr(sb, "in2", v))
+                s.feScale.foreach(v => svgAttr(sb, "scale", fmtD(v)))
+                s.feResult.foreach(v => svgAttr(sb, "result", v))
+            case _: Svg.Animate =>
+                s.animAttributeName.foreach(v => svgAttr(sb, "attributeName", v))
+                s.animFrom.foreach(v => svgAttr(sb, "from", v))
+                s.animTo.foreach(v => svgAttr(sb, "to", v))
+                s.animValues.foreach(v => svgAttr(sb, "values", v))
+                s.animDur.foreach(v => svgAttr(sb, "dur", v))
+                s.animCalcMode.foreach(v => svgAttr(sb, "calcMode", v))
+                s.animKeyTimes.foreach(v => svgAttr(sb, "keyTimes", v))
+                s.animKeySplines.foreach(v => svgAttr(sb, "keySplines", v))
+                s.animRepeatCount.foreach(v => svgAttr(sb, "repeatCount", v))
+                s.animBegin.foreach(v => svgAttr(sb, "begin", v))
+                s.animFill.foreach(v => svgAttr(sb, "fill", animFill(v)))
+            case _: Svg.AnimateTransform =>
+                s.animAttributeName.foreach(v => svgAttr(sb, "attributeName", v))
+                s.animType.foreach(v => svgAttr(sb, "type", transformType(v)))
+                s.animFrom.foreach(v => svgAttr(sb, "from", v))
+                s.animTo.foreach(v => svgAttr(sb, "to", v))
+                s.animDur.foreach(v => svgAttr(sb, "dur", v))
+                s.animRepeatCount.foreach(v => svgAttr(sb, "repeatCount", v))
+                s.animBegin.foreach(v => svgAttr(sb, "begin", v))
+                s.animFill.foreach(v => svgAttr(sb, "fill", animFill(v)))
+            case _: Svg.AnimateMotion =>
+                s.d.foreach(d => svgAttr(sb, "path", pathData(d)))
+                s.animDur.foreach(v => svgAttr(sb, "dur", v))
+                s.animRepeatCount.foreach(v => svgAttr(sb, "repeatCount", v))
+                s.animFill.foreach(v => svgAttr(sb, "fill", animFill(v)))
+            case _: Svg.SetAnim =>
+                s.animAttributeName.foreach(v => svgAttr(sb, "attributeName", v))
+                s.animTo.foreach(v => svgAttr(sb, "to", v))
+                s.animBegin.foreach(v => svgAttr(sb, "begin", v))
+                s.animFill.foreach(v => svgAttr(sb, "fill", animFill(v)))
+        end match
+    end renderSvgAttrs
+
+    private def renderSvgPresentation(sb: StringBuilder, s: Svg.SvgAttrs): Unit =
+        s.fill.foreach(p => svgAttr(sb, "fill", paint(p)))
+        s.fillOpacity.foreach(v => svgAttr(sb, "fill-opacity", fmtD(v)))
+        s.fillRule.foreach(r => svgAttr(sb, "fill-rule", fillRule(r)))
+        s.stroke.foreach(p => svgAttr(sb, "stroke", paint(p)))
+        s.strokeWidth.foreach(l => svgAttr(sb, "stroke-width", svgLength(l)))
+        s.strokeOpacity.foreach(v => svgAttr(sb, "stroke-opacity", fmtD(v)))
+        s.strokeLinecap.foreach(c => svgAttr(sb, "stroke-linecap", linecap(c)))
+        s.strokeLinejoin.foreach(j => svgAttr(sb, "stroke-linejoin", linejoin(j)))
+        s.strokeDasharray.foreach { ds =>
+            svgAttr(sb, "stroke-dasharray", ds.map(fmtD).mkString(" "))
+        }
+        s.strokeDashoffset.foreach(l => svgAttr(sb, "stroke-dashoffset", svgLength(l)))
+        s.strokeMiterlimit.foreach(v => svgAttr(sb, "stroke-miterlimit", fmtD(v)))
+        s.pathLength.foreach(v => svgAttr(sb, "pathLength", fmtD(v)))
+        s.opacity.foreach(v => svgAttr(sb, "opacity", fmtD(v)))
+        if s.transform.nonEmpty then
+            svgAttr(sb, "transform", s.transform.map(transform).mkString(" "))
+        s.clipPathRef.foreach(id => svgAttr(sb, "clip-path", s"url(#$id)"))
+        s.maskRef.foreach(id => svgAttr(sb, "mask", s"url(#$id)"))
+        s.filterRef.foreach(id => svgAttr(sb, "filter", s"url(#$id)"))
+    end renderSvgPresentation
+
+    private def renderMarkers(sb: StringBuilder, s: Svg.SvgAttrs): Unit =
+        s.markerStart.foreach(id => svgAttr(sb, "marker-start", s"url(#$id)"))
+        s.markerMid.foreach(id => svgAttr(sb, "marker-mid", s"url(#$id)"))
+        s.markerEnd.foreach(id => svgAttr(sb, "marker-end", s"url(#$id)"))
+    end renderMarkers
+
+    private def renderTextAttrs(sb: StringBuilder, s: Svg.SvgAttrs): Unit =
+        s.textAnchor.foreach(a => svgAttr(sb, "text-anchor", textAnchor(a)))
+        s.dominantBaseline.foreach(b => svgAttr(sb, "dominant-baseline", dominantBaseline(b)))
+        s.fontSize.foreach(l => svgAttr(sb, "font-size", svgLength(l)))
+        s.fontFamily.foreach(f => svgAttr(sb, "font-family", f))
+    end renderTextAttrs
+
+    // ---- SVG value encoders ----
+
+    private def svgAttr(sb: StringBuilder, name: String, value: String): Unit =
+        w(sb, s""" $name="${esc(value)}"""")
+
+    private def coord(c: Svg.Coord): String = c match
+        case Svg.Coord.Num(v) => fmtD(v)
+        case Svg.Coord.Len(l) => svgLength(l)
+
+    private def svgLength(l: Svg.SvgLength): String = l match
+        case Svg.SvgLength.User(v) => fmtD(v)
+        case Svg.SvgLength.Px(v)   => s"${fmtD(v)}px"
+        case Svg.SvgLength.Pct(v)  => s"${fmtD(v)}%"
+        case Svg.SvgLength.Em(v)   => s"${fmtD(v)}em"
+
+    private def paint(p: Svg.Paint): String = p match
+        case Svg.Paint.None         => "none"
+        case Svg.Paint.CurrentColor => "currentColor"
+        case Svg.Paint.Color(c)     => CssStyleRenderer.color(c)
+        case Svg.Paint.Ref(server)  => s"url(#${server.id})"
+
+    private def transform(t: Svg.Transform): String = t match
+        case Svg.Transform.Translate(x, y)     => s"translate(${fmtD(x)} ${fmtD(y)})"
+        case Svg.Transform.Rotate(deg, cx, cy) =>
+            cx match
+                case Present(cx0) =>
+                    cy match
+                        case Present(cy0) => s"rotate(${fmtD(deg)} ${fmtD(cx0)} ${fmtD(cy0)})"
+                        case Absent       => s"rotate(${fmtD(deg)} ${fmtD(cx0)})"
+                case Absent => s"rotate(${fmtD(deg)})"
+        case Svg.Transform.Scale(sx, sy) =>
+            sy match
+                case Present(sy0) => s"scale(${fmtD(sx)} ${fmtD(sy0)})"
+                case Absent       => s"scale(${fmtD(sx)})"
+        case Svg.Transform.SkewX(deg)               => s"skewX(${fmtD(deg)})"
+        case Svg.Transform.SkewY(deg)               => s"skewY(${fmtD(deg)})"
+        case Svg.Transform.Matrix(a, b, c, d, e, f) => s"matrix(${fmtD(a)} ${fmtD(b)} ${fmtD(c)} ${fmtD(d)} ${fmtD(e)} ${fmtD(f)})"
+
+    private def points(p: Svg.Points): String =
+        Svg.Points.pairs(p).map { case (x, y) => s"${fmtD(x)},${fmtD(y)}" }.mkString(" ")
+
+    private def viewBox(v: Svg.ViewBox): String =
+        s"${fmtD(v.minX)} ${fmtD(v.minY)} ${fmtD(v.width)} ${fmtD(v.height)}"
+
+    private def par(p: Svg.PreserveAspectRatio): String =
+        s"${align(p.align)} ${meetOrSlice(p.meetOrSlice)}"
+
+    private def align(a: Svg.Align): String = a match
+        case Svg.Align.None     => "none"
+        case Svg.Align.XMinYMin => "xMinYMin"
+        case Svg.Align.XMidYMin => "xMidYMin"
+        case Svg.Align.XMaxYMin => "xMaxYMin"
+        case Svg.Align.XMinYMid => "xMinYMid"
+        case Svg.Align.XMidYMid => "xMidYMid"
+        case Svg.Align.XMaxYMid => "xMaxYMid"
+        case Svg.Align.XMinYMax => "xMinYMax"
+        case Svg.Align.XMidYMax => "xMidYMax"
+        case Svg.Align.XMaxYMax => "xMaxYMax"
+
+    private def meetOrSlice(m: Svg.MeetOrSlice): String = m match
+        case Svg.MeetOrSlice.Meet  => "meet"
+        case Svg.MeetOrSlice.Slice => "slice"
+
+    private def pathData(d: Svg.PathData): String =
+        Svg.PathData.commands(d).map(pathCmd).mkString(" ")
+
+    private def pathCmd(c: Svg.PathCommand): String = c match
+        case Svg.PathCommand.MoveTo(x, y)                      => s"M${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.MoveBy(dx, dy)                    => s"m${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.LineTo(x, y)                      => s"L${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.LineBy(dx, dy)                    => s"l${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.HLineTo(x)                        => s"H${fmtD(x)}"
+        case Svg.PathCommand.HLineBy(dx)                       => s"h${fmtD(dx)}"
+        case Svg.PathCommand.VLineTo(y)                        => s"V${fmtD(y)}"
+        case Svg.PathCommand.VLineBy(dy)                       => s"v${fmtD(dy)}"
+        case Svg.PathCommand.CubicTo(c1x, c1y, c2x, c2y, x, y) =>
+            s"C${fmtD(c1x)} ${fmtD(c1y)} ${fmtD(c2x)} ${fmtD(c2y)} ${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.CubicBy(c1x, c1y, c2x, c2y, dx, dy) =>
+            s"c${fmtD(c1x)} ${fmtD(c1y)} ${fmtD(c2x)} ${fmtD(c2y)} ${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.SmoothCubicTo(c2x, c2y, x, y) =>
+            s"S${fmtD(c2x)} ${fmtD(c2y)} ${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.SmoothCubicBy(c2x, c2y, dx, dy) =>
+            s"s${fmtD(c2x)} ${fmtD(c2y)} ${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.QuadTo(cx, cy, x, y)                       => s"Q${fmtD(cx)} ${fmtD(cy)} ${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.QuadBy(cx, cy, dx, dy)                     => s"q${fmtD(cx)} ${fmtD(cy)} ${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.SmoothQuadTo(x, y)                         => s"T${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.SmoothQuadBy(dx, dy)                       => s"t${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.ArcTo(rx, ry, xRot, largeArc, sweep, x, y) =>
+            val la = if largeArc then 1 else 0
+            val sw = if sweep then 1 else 0
+            s"A${fmtD(rx)} ${fmtD(ry)} ${fmtD(xRot)} $la $sw ${fmtD(x)} ${fmtD(y)}"
+        case Svg.PathCommand.ArcBy(rx, ry, xRot, largeArc, sweep, dx, dy) =>
+            val la = if largeArc then 1 else 0
+            val sw = if sweep then 1 else 0
+            s"a${fmtD(rx)} ${fmtD(ry)} ${fmtD(xRot)} $la $sw ${fmtD(dx)} ${fmtD(dy)}"
+        case Svg.PathCommand.Close  => "Z"
+        case Svg.PathCommand.Raw(d) => d
+
+    private def fillRule(r: Svg.FillRule): String = r match
+        case Svg.FillRule.NonZero => "nonzero"
+        case Svg.FillRule.EvenOdd => "evenodd"
+
+    private def linecap(c: Svg.StrokeLinecap): String = c match
+        case Svg.StrokeLinecap.Butt   => "butt"
+        case Svg.StrokeLinecap.Round  => "round"
+        case Svg.StrokeLinecap.Square => "square"
+
+    private def linejoin(j: Svg.StrokeLinejoin): String = j match
+        case Svg.StrokeLinejoin.Miter     => "miter"
+        case Svg.StrokeLinejoin.Round     => "round"
+        case Svg.StrokeLinejoin.Bevel     => "bevel"
+        case Svg.StrokeLinejoin.Arcs      => "arcs"
+        case Svg.StrokeLinejoin.MiterClip => "miter-clip"
+
+    private def textAnchor(a: Svg.TextAnchor): String = a match
+        case Svg.TextAnchor.Start  => "start"
+        case Svg.TextAnchor.Middle => "middle"
+        case Svg.TextAnchor.End    => "end"
+
+    private def dominantBaseline(b: Svg.DominantBaseline): String = b match
+        case Svg.DominantBaseline.Auto           => "auto"
+        case Svg.DominantBaseline.Middle         => "middle"
+        case Svg.DominantBaseline.Central        => "central"
+        case Svg.DominantBaseline.Hanging        => "hanging"
+        case Svg.DominantBaseline.TextBeforeEdge => "text-before-edge"
+        case Svg.DominantBaseline.TextAfterEdge  => "text-after-edge"
+        case Svg.DominantBaseline.Alphabetic     => "alphabetic"
+        case Svg.DominantBaseline.Ideographic    => "ideographic"
+        case Svg.DominantBaseline.Mathematical   => "mathematical"
+
+    private def units(u: Svg.Units): String = u match
+        case Svg.Units.UserSpaceOnUse    => "userSpaceOnUse"
+        case Svg.Units.ObjectBoundingBox => "objectBoundingBox"
+
+    private def spread(m: Svg.SpreadMethod): String = m match
+        case Svg.SpreadMethod.Pad     => "pad"
+        case Svg.SpreadMethod.Reflect => "reflect"
+        case Svg.SpreadMethod.Repeat  => "repeat"
+
+    private def markerUnits(u: Svg.MarkerUnits): String = u match
+        case Svg.MarkerUnits.StrokeWidth    => "strokeWidth"
+        case Svg.MarkerUnits.UserSpaceOnUse => "userSpaceOnUse"
+
+    private def blendMode(m: Svg.BlendMode): String = m match
+        case Svg.BlendMode.Normal     => "normal"
+        case Svg.BlendMode.Multiply   => "multiply"
+        case Svg.BlendMode.Screen     => "screen"
+        case Svg.BlendMode.Overlay    => "overlay"
+        case Svg.BlendMode.Darken     => "darken"
+        case Svg.BlendMode.Lighten    => "lighten"
+        case Svg.BlendMode.ColorDodge => "color-dodge"
+        case Svg.BlendMode.ColorBurn  => "color-burn"
+        case Svg.BlendMode.HardLight  => "hard-light"
+        case Svg.BlendMode.SoftLight  => "soft-light"
+        case Svg.BlendMode.Difference => "difference"
+        case Svg.BlendMode.Exclusion  => "exclusion"
+        case Svg.BlendMode.Hue        => "hue"
+        case Svg.BlendMode.Saturation => "saturation"
+        case Svg.BlendMode.Color      => "color"
+        case Svg.BlendMode.Luminosity => "luminosity"
+
+    private def colorMatrixType(t: Svg.ColorMatrixType): String = t match
+        case Svg.ColorMatrixType.Matrix           => "matrix"
+        case Svg.ColorMatrixType.Saturate         => "saturate"
+        case Svg.ColorMatrixType.HueRotate        => "hueRotate"
+        case Svg.ColorMatrixType.LuminanceToAlpha => "luminanceToAlpha"
+
+    private def compositeOperator(o: Svg.CompositeOperator): String = o match
+        case Svg.CompositeOperator.Over       => "over"
+        case Svg.CompositeOperator.In         => "in"
+        case Svg.CompositeOperator.Out        => "out"
+        case Svg.CompositeOperator.Atop       => "atop"
+        case Svg.CompositeOperator.Xor        => "xor"
+        case Svg.CompositeOperator.Arithmetic => "arithmetic"
+
+    private def morphologyOperator(o: Svg.MorphologyOperator): String = o match
+        case Svg.MorphologyOperator.Erode  => "erode"
+        case Svg.MorphologyOperator.Dilate => "dilate"
+
+    private def turbulenceType(t: Svg.TurbulenceType): String = t match
+        case Svg.TurbulenceType.FractalNoise => "fractalNoise"
+        case Svg.TurbulenceType.Turbulence   => "turbulence"
+
+    private def transformType(t: Svg.TransformType): String = t match
+        case Svg.TransformType.Translate => "translate"
+        case Svg.TransformType.Scale     => "scale"
+        case Svg.TransformType.Rotate    => "rotate"
+        case Svg.TransformType.SkewX     => "skewX"
+        case Svg.TransformType.SkewY     => "skewY"
+
+    private def animFill(f: Svg.AnimFill): String = f match
+        case Svg.AnimFill.Freeze => "freeze"
+        case Svg.AnimFill.Remove => "remove"
+
+end HtmlRenderer

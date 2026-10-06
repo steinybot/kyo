@@ -3,7 +3,7 @@ package kyo
 import kyo.Maybe.*
 import kyo.Maybe.internal.PresentAbsent
 
-class MaybeTest extends Test:
+class MaybeTest extends kyo.test.Test[Any]:
 
     "apply" - {
         "creates Present for non-null values" in {
@@ -42,7 +42,7 @@ class MaybeTest extends Test:
             assert(Present("hello").get == "hello")
         }
         "throws NoSuchElementException for Absent" in {
-            assertThrows[NoSuchElementException] {
+            interceptThrown[NoSuchElementException] {
                 Absent.get
             }
         }
@@ -262,6 +262,33 @@ class MaybeTest extends Test:
         "map should apply the function to the nested Maybe" in {
             assert(Present(Present(1)).map(_ => Present(2)) == Present(Present(2)))
             assert(Present(Absent).map(_ => Present(2)) == Present(Present(2)))
+        }
+
+        "map to an absent value should nest it" in {
+            val nested = Present(1).map(_ => Maybe.empty[Int])
+            assert(nested == Present(Absent))
+            assert(!nested.isEmpty)
+            assert(nested.get == Absent)
+        }
+
+        "collect to an absent value should nest it" in {
+            val nested = Present(1).collect { case _ => Maybe.empty[Int] }
+            assert(nested == Present(Absent))
+            assert(!nested.isEmpty)
+            assert(nested.get == Absent)
+        }
+
+        "when with an absent value should nest it" in {
+            val nested = Maybe.when(true)(Maybe.empty[Int])
+            assert(nested == Present(Absent))
+            assert(!nested.isEmpty)
+            assert(nested.get == Absent)
+        }
+
+        "zip should keep an absent side nested" in {
+            val zipped = Present(Maybe.empty[Int]).zip(Present(1))
+            assert(zipped == Present((Absent, 1)))
+            assert(zipped.get == ((Absent, 1)))
         }
 
         "filter should apply the predicate to the nested Maybe" in {
@@ -532,27 +559,27 @@ class MaybeTest extends Test:
     "show" - {
         "should return 'Absent' for Absent" in {
             assert(Absent.show == "Absent")
-            assert(t"$Absent".show == "Absent")
+            assert(render"$Absent" == "Absent")
         }
 
         "should return 'Present(value)' for Present" in {
             assert(Present(1).show == "Present(1)")
-            val somat: Rendered = Present(1)
-            assert(t"${Present(1): Present[Int]}".show == "Present(1)")
+            val somat: Render.Rendered = Present(1)
+            assert(render"${Present(1): Present[Int]}" == "Present(1)")
             assert(Present("hello").show == "Present(hello)")
-            assert(t"${Present("hello")}".show == "Present(hello)")
+            assert(render"${Present("hello")}" == "Present(hello)")
         }
 
         "should handle nested Present values" in {
             assert(Present(Absent).show == "Present(Absent)")
-            assert(t"${Present(Absent)}".show == "Present(Absent)")
+            assert(render"${Present(Absent)}" == "Present(Absent)")
         }
 
         "should return Present(Present(value)) for nested Present" in {
             val p: Present[Present[Int]]         = Present(Present(1))
             val r: Render[Present[Present[Int]]] = Render.apply
-            assert(r.asText(p).show == "Present(Present(1))")
-            assert(t"$p".show == "Present(Present(1))")
+            assert(r.asString(p) == "Present(Present(1))")
+            assert(render"$p" == "Present(Present(1))")
         }
     }
 

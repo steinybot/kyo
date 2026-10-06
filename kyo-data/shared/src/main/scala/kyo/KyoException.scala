@@ -9,25 +9,21 @@ import scala.util.control.NoStackTrace
 /** Kyo's base exception class that provides enhanced error reporting and context.
   *
   * The exception's behavior changes based on the environment:
+  *
   *   - In development: Provides detailed, ANSI-colored error messages with context
   *   - In production: Returns minimal error messages for cleaner logs
   *
   * @param message
   *   The primary error message
   * @param cause
-  *   Either a Text explanation or a Throwable that caused this exception
+  *   Either a String explanation or a Throwable that caused this exception
   * @param frame
   *   Implicit Frame providing context about where the exception was created
   */
 class KyoException private[kyo] (
-    message: Text = "",
-    cause: Text | Throwable = ""
-)(using val frame: Frame) extends Exception(
-        message.toString,
-        cause match
-            case cause: Throwable => cause
-            case _                => null
-    ) with NoStackTrace:
+    message: => String = "",
+    cause: String | Throwable = ""
+)(using val frame: Frame) extends Exception with NoStackTrace:
 
     /** Returns the underlying cause of this exception. Overriding this method is important for performance since the method is synchronized
       * in the super classes.
@@ -50,17 +46,17 @@ class KyoException private[kyo] (
     override def getMessage(): String =
         val detail =
             cause match
-                case _: Throwable           => Absent
-                case cause: Text @unchecked => Maybe(cause.take(maxMessageLength))
+                case t: Throwable =>
+                    Maybe(s"${t.getClass.getSimpleName}: ${Maybe(t.getMessage).getOrElse("")}".take(maxMessageLength))
+                case cause: String @unchecked => Maybe(cause.take(maxMessageLength))
 
         if Environment.isDevelopment then
             val msg = frame.render(
-                ("⚠️ KyoException".red.bold :: message :: detail.toList)
-                    .map(_.show)*
+                ("⚠️ KyoException".red.bold :: message :: detail.toList)*
             )
             s"\n$msg\n"
         else
-            (message + detail.fold("")(" " + _)).toString
+            message + detail.fold("")(" " + _)
         end if
     end getMessage
 end KyoException

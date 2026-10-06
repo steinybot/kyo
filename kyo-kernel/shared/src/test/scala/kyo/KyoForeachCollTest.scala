@@ -1,7 +1,9 @@
 package kyo
 
+import org.scalatest.freespec.AnyFreeSpec
+
 @TestVariant("Coll", "List", "Chunk")
-class KyoForeachCollTest extends Test:
+class KyoForeachCollTest extends AnyFreeSpec:
 
     import KyoForeachTest.*
 

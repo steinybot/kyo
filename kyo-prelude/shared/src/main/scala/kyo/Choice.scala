@@ -1,7 +1,5 @@
 package kyo
 
-import kyo.Tag
-import kyo.debug.Debug
 import kyo.kernel.*
 
 /** Represents non-deterministic computations with multiple possible outcomes.
@@ -13,14 +11,14 @@ import kyo.kernel.*
   * or any computation where you need to model decisions with multiple valid options. When combined with other effects like `Parse`, it
   * becomes especially powerful for expressing complex branching logic.
   *
-  * The primary operations include introducing choice points with `get`, evaluating functions across alternatives with `eval`, and pruning
-  * invalid paths with `drop`. Computations using Choice can be collected with `run`, which gathers all successful outcomes into a single
-  * sequence, or streamed with `runStream`, which produces results incrementally as a stream.
+  * The primary operations include introducing choice points with `eval`, evaluating functions across alternatives with `evalWith`, and
+  * pruning invalid paths with `drop`. Computations using Choice can be collected with `run`, which gathers all successful outcomes into a
+  * single sequence, or streamed with `runStream`, which produces results incrementally as a stream.
   *
   * @see
-  *   [[kyo.Choice.get]] for introducing choice points from sequences
+  *   [[kyo.Choice.eval]] and [[kyo.Choice.evalSeq]] for introducing choice points from values or sequences
   * @see
-  *   [[kyo.Choice.eval]] for applying functions to multiple alternatives
+  *   [[kyo.Choice.evalWith]] for applying functions to multiple alternatives
   * @see
   *   [[kyo.Choice.drop]] for terminating unsuccessful computation branches
   * @see
@@ -97,11 +95,12 @@ object Choice:
       *   A computation that produces a sequence of all possible outcomes
       */
     def run[A, S](v: A < (Choice & S))(using Frame): Chunk[A] < S =
-        ArrowEffect.handle(Tag[Choice], v.map(Chunk[A](_))) {
+        ArrowEffect.handleContRepeated(Tag[Choice], v.map(Chunk[A](_)))(
             [C] =>
                 (input, cont) =>
-                    Kyo.foreach(Chunk.from(input))(v => Choice.run(cont(v))).map(_.flattenChunk.flattenChunk)
-        }
+                    Kyo.foreach(Chunk.from(input))(v => cont(v)).map(_.flattenChunk),
+            a => a
+        )
 
     /** Handles the Choice effect by streaming all possible outcomes incrementally.
       *
@@ -123,8 +122,10 @@ object Choice:
                         if pending.isEmpty then Loop.done
                         else
                             Kyo.foreach(pending) { v =>
-                                ArrowEffect.handleFirst(Tag[Choice], v)(
-                                    handle = [C] => (input, cont) => Chunk.from(input).map(cont),
+                                // the remainder is resumed once per choice, so a resource opened before the choice
+                                // is shared across every branch and released once, after all of them
+                                ArrowEffect.handleFirstRepeated(Tag[Choice], v)(
+                                    handle = [C] => (input, cont) => Chunk.from(input).map(cont(_)),
                                     done = r => Chunk(r: A < (Choice & S))
                                 )
                             }.map(r => Loop.continue(r.flattenChunk))

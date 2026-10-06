@@ -1,0 +1,759 @@
+<!-- doctest:default scope=inherited -->
+
+# kyo-ai
+
+<!-- doctest:setup
+```scala
+import kyo.*
+```
+-->
+
+`kyo-ai` is an LLM integration where a call to a language model is a typed value you compose, not a request you orchestrate. You describe the result type and the tools the model may call; the module derives the JSON schema, runs the tool-call loop, decodes the reply, threads the conversation, retries transport failures, and parses streaming deltas. The boilerplate that a mainstream SDK leaves to you (schema authoring, the agentic while-loop, message-list threading, SSE parsing) is gone. What is left is the part that carries meaning: the type you want back and the capabilities you grant. When what you want back is a judgment rather than text (which tool next, is this state broken, how severe), [decisions](#decisions) ask for it as a typed value too, with a calibrated probability behind it when the backend has one.
+
+Here is a complete example. A typed result, a tool the model can call, one line to generate:
+
+```scala
+case class Question(text: String) derives Schema
+case class Fact(topic: String, summary: String) derives Schema
+case class Answer(text: String, confidence: Double) derives Schema
+
+val factLookup =
+    Tool.init[Question]("fact_lookup", "Look up a fact about a topic") { q =>
+        Fact(q.text, s"A concise fact about ${q.text}.")
+    }
+
+val research =
+    AI.enable(factLookup)(AI.gen[Answer]("What is a CRDT?"))
+```
+
+`AI.gen[Answer]` asks the model for an `Answer`; because `Answer derives Schema`, the module derives the result schema, forces the model to produce that exact shape, and decodes the reply into a typed `Answer`. `AI.enable(factLookup)(...)` surfaces the tool to the model. If the model calls `fact_lookup`, the runtime decodes the call arguments into a `Question`, runs your function, feeds the `Fact` back, and re-queries the model, looping until it produces the final `Answer`. You wrote the tool and the result type; the loop is the framework's. The same flow in a mainstream SDK is roughly forty lines of orchestration (covered under [What this removes](#what-this-removes)).
+
+That value, `research`, is typed `Answer < LLM`: a pure description with no network in it. `LLM.run` is where it reaches the provider.
+
+```scala
+def runResearch: Answer < (Async & Abort[AIGenException]) =
+    LLM.run(AI.enable(factLookup)(AI.gen[Answer]("What is a CRDT?")))
+```
+
+`LLM.run` discharges the `LLM` effect, and the residual gains `Async` (the call is concurrent) and `Abort[AIGenException]` (a generation can fail: transport, eval exhaustion, a malformed result). That is the one boundary where the program talks to the world.
+
+## The trio: LLM, AI, Agent
+
+Three types frame the whole module. They differ by what each adds along a single axis, statelessness to memory to persistence:
+
+- **`LLM` is the effect, the capability.** Every program built with `gen`, tools, prompts, and thoughts is typed `A < LLM`, and `LLM.run` executes it. Each `AI.gen` on the bare effect is an independent one-shot with no memory. Reach for it when a call stands alone.
+- **`AI` is a conversation that remembers.** You mint an instance with `AI.init`; every `ai.gen` on that instance accumulates into its own history, so a later turn sees the earlier ones. Memory lasts for one `LLM.run`. Reach for it when one call needs to know what an earlier call said.
+- **`Agent` is a persistent, addressable entity.** It lives behind an actor, holds its conversation across many `ask` calls, and processes one input at a time. Reach for it when the conversation must outlive a single `run` and you want a long-lived thing to send inputs to.
+
+The sections below climb in that order: one-shot `gen` first, then remembering instances, then agents, with the generation-shaping surface (tools, prompts, thoughts, modes) layered in between, and the non-generative surfaces (streaming, decisions) after.
+
+## One-shot generation
+
+The simplest call is a forgetful one-shot. `AI.gen[String](input)` (on the `AI` object, with no instance named) sends `input`, decodes the reply as a `String`, and remembers nothing.
+
+```scala
+def greeting: String < (Async & Abort[AIGenException]) =
+    LLM.run(AI.gen[String]("Say hello in one sentence."))
+```
+
+Inside the `LLM.run` block the program is still data: `AI.gen[String]("...")` is typed `String < LLM`, composable, no I/O. `LLM.run` is the boundary that talks to the model, and the only place `Async & Abort[AIGenException]` enters, riding out on the residual. Nothing inside the block sees it.
+
+`LLM.run` comes in three shapes for choosing the provider configuration. The no-argument form auto-selects a provider by probing for API keys; the function form transforms the auto-selected config; the explicit form takes a `Config` you built.
+
+```scala
+def autoProvider: String < (Async & Abort[AIGenException]) =
+    LLM.run(AI.gen[String]("Name a primary color."))
+
+def hotter: String < (Async & Abort[AIGenException]) =
+    LLM.run(_.temperature(1.2))(AI.gen[String]("Name a primary color."))
+
+def withConfig(config: AI.Config): String < (Async & Abort[AIGenException]) =
+    LLM.run(config)(AI.gen[String]("Name a primary color."))
+```
+
+## Typed results
+
+`A` does not have to be `String`. Any type with a `Schema` works, and the model is steered to fill that exact shape. This is where the running domain enters and stays: a research assistant over `Question`, `Answer`, `Fact`.
+
+```scala
+def graded =
+    AI.gen[Answer]("How tall is the Eiffel Tower? Include a confidence score.")
+```
+
+The full shape of a single typed generation is `Answer < LLM` before `run` and `Answer < (Async & Abort[AIGenException])` after it. There is no JSON schema to write by hand, no arguments string to dig out of a response, no parse-and-validate step: the module derives the schema from `Schema[Answer]`, forces the structured reply, and decodes it.
+
+`gen` also takes typed inputs. Each input is JSON-encoded into a user message before the request, so you pass structured context instead of pre-rendering it into a string. There are overloads for one through four inputs; multiple inputs fold into a tuple user message.
+
+```scala
+def fromQuestion(q: Question) =
+    AI.gen[Answer](q)
+
+def compare(a: Question, b: Question) =
+    AI.gen[Answer](a, b)
+```
+
+> **Note:** every `gen` input is JSON-encoded into a user message, so an input type needs a `Schema`. The running-domain case classes all `derives Schema`.
+
+## Instances that remember
+
+A bare `AI.gen` is forgetful: two in a row do not share memory, because each mints an ephemeral slot, runs, and discards it. To carry a conversation, name an instance. `AI.init` (or `AI.initWith`, which hands the fresh instance to a body) mints a remembering instance; every `ai.gen` on it accumulates into that instance's own history.
+
+```scala
+case class Ack(ok: Boolean) derives Schema
+
+def remembers =
+    AI.initWith { ai =>
+        for
+            _        <- ai.userMessage("My name is Ada.")
+            _        <- ai.gen[Ack]
+            recalled <- ai.gen[String] // sees the first turn; recalls "Ada"
+        yield recalled
+    }
+```
+
+The instance threads its own `Context` through the run, so the second `gen`'s request carries the first turn's message. The difference between the two `gen` forms is exactly the memory: `AI.gen[A]` (the object) is the forgetful one-shot; `ai.gen[A]` (a named instance) remembers.
+
+Two instances run independent threads with no cross-contamination. Each `gen` targets its own instance.
+
+```scala
+def researcherAndCritic =
+    AI.init.map { researcher =>
+        AI.init.map { critic =>
+            for
+                r <- researcher.gen[String]("Investigate CRDTs.")
+                c <- critic.gen[String]("Critique the approach.")
+            yield (r, c)
+        }
+    }
+```
+
+> **Caution:** an `AI` is an identity for one conversation slot, and its conversation lives in the state threaded by one `LLM.run`. An instance minted inside one `LLM.run` reads an empty context inside a different `LLM.run`, because each run threads its own fresh state. Do not cache an `AI` across run boundaries. To carry state across blocks within a run, use `snapshot` / `recover` (covered below).
+
+## Tools and the automatic loop
+
+A tool is a typed function the model may invoke mid-generation: the model decides to call it, the runtime decodes the arguments into your input type, runs your function, and feeds the result back so generation can continue. `Tool.init` builds one from an input type, a name, a description, and a run function; the output type is inferred (`factLookup` above is one).
+
+`AI.enable` (scoped) and `ai.enable` (instance) register one or more enablements (tools, prompts, thoughts, modes, in any mix) over a computation; inside that scope, a `gen` exposes them. You never write the call loop: the eval loop surfaces the tool definition, detects the call, decodes the arguments with the tool's own `Schema`, runs your function, appends the result, and re-queries until the model produces the final answer.
+
+```scala
+def withFacts(q: Question) =
+    AI.enable(factLookup) {
+        AI.gen[Answer](q)
+    }
+```
+
+`Tool.aggregate` combines several tools into one, and `Tool.empty` is the no-tool aggregate, useful as a default.
+
+```scala
+val researchTools =
+    Tool.aggregate(
+        factLookup,
+        Tool.init[Question]("define", "Define a term")(q => s"Definition of ${q.text}")
+    )
+```
+
+A tool's type is `Tool[S]`, where `S` is the capability set its run function needs. The input and output types are *existential*: they are held inside the value rather than in its type. That is exactly what lets `aggregate` combine tools of unrelated shapes into one value, and `Tool[S]` is the type to write when a signature needs an explicit annotation.
+
+```scala
+val annotated: Tool[Any] = researchTools
+```
+
+### Tools from an MCP server
+
+The tools above are written in Scala, so their shapes are known when you compile. A tool published by an [MCP](../kyo-mcp/README.md) server is not: the server sends its name, description and input schema over the wire, and a host has no Scala type to name for any of it. `Tool.fromMcp` turns every tool a connected server publishes into a tool this agent can call.
+
+```scala
+def answerWithServerTools(client: McpClient) =
+    Tool.fromMcp(client).map { serverTools =>
+        AI.enable(serverTools)(AI.gen[Answer]("Which country has the most customers?"))
+    }
+```
+
+Nothing there names an input or output type, because none exists to name, so this works against a server whose Scala types are not on your classpath. Each published tool becomes one tool carrying the server's own name, description and schema; a call is forwarded with the model's arguments, and the server's structured result (or its text content when it publishes no output schema) is fed back to the model. A result the server marks as an error becomes a tool failure the model sees and may retry, the same as a locally raised one.
+
+`Tool.initDynamic` is that construction without the client, for a schema you hold as a value rather than as a type.
+
+```scala
+val runSelect =
+    Tool.initDynamic(
+        "run_select",
+        Json.JsonSchema.Obj(
+            properties = List("sql" -> Json.JsonSchema.Str(description = Present("a read-only SELECT"))),
+            required = List("sql")
+        ),
+        "Run a read-only query"
+    ) { args =>
+        Structure.Value.Str(s"rows for $args")
+    }
+```
+
+The declared schema binds. It is advertised to the model verbatim, so a server's own constraints and property descriptions reach the model as published, and the arguments are checked against it before your body runs: a call missing a required field is refused with a message the model can repair from, rather than reaching a body that never agreed to receive it.
+
+The loop handles both failure modes for you, neither of which escapes the generation. If the model sends arguments that fail to decode, the runtime drops the bad call and injects a corrective system message asking the model to match the schema. If your run function throws, the failure is contained, turned into a tool-result message, and fed back so the model can read the error and retry.
+
+> **Note:** a tool whose run function uses effects needs an `Isolate[S, LLM, S]` in scope; a pure run (the common case) infers `S = Any` and needs no import. The instance form `ai.enable(tool)` layers a tool onto one instance only, on top of the scope's tools.
+
+## Shaping generation: prompts, thoughts, modes
+
+The previous section added a capability the model can call. This section shapes how the model generates in the first place: the standing instructions it follows, the reasoning structure it must produce, and middleware that intercepts the generation.
+
+### Prompts
+
+A `Prompt` is a composable instruction set. A primary instruction is placed at the context start; an optional reminder floats at the context end, immediately before generation, so a long context does not push the critical guidance out of attention. The simplest prompt wraps a static string.
+
+```scala
+val precise =
+    Prompt.init("You are a precise research assistant. Answer in one sentence.")
+```
+
+A prompt body is not limited to a static string. `Prompt.init` takes its instruction (and optional reminder) as a `String < (LLM & S)`, so the text can be computed from an effect, for example reading the active config to name the model it runs on.
+
+```scala
+val modelAware =
+    Prompt.init(AI.config.map(c => s"You are running on ${c.modelName}. Be concise."))
+```
+
+`AI.enable` installs a prompt over a computation (the same `enable` that registers tools). `andThen` merges two prompts, deduplicating their instructions and reminders. The `p` interpolator normalizes per-line leading whitespace, for readable multi-line prompts in source.
+
+```scala
+val cited =
+    precise.andThen(Prompt.init(p"""
+        Cite the topic you were asked about.
+        Never claim a confidence higher than the evidence supports.
+    """))
+
+def withPrompt(q: Question) =
+    AI.enable(cited) {
+        AI.gen[Answer](q)
+    }
+```
+
+### Thoughts
+
+A `Thought` makes the model reason as a structured, typed part of producing its answer, rather than as a separate free-text preamble.
+
+The problem it solves: reasoning before answering (chain of thought) improves quality, but you also want a clean typed result. Prompting "think step by step" buries the reasoning in free text and yields no typed answer; forcing a typed result on its own makes the model jump straight to the answer with no reasoning. A `Thought` gets both, by adding reasoning **fields to the required output schema**, around the result. With one opening thought, the model is no longer asked for just a `resultValue`; it must fill an envelope shaped like this (illustrative):
+
+```text
+{ "openingThoughts": { "Reasoning": { "steps": "..." } },   // generated first
+  "resultValue":     <Answer> }                              // generated second
+```
+
+A model fills the fields in order, top to bottom, so an **opening** thought's field is generated *before* the answer: the model writes its reasoning first, and that reasoning conditions the answer it then commits to. A **closing** thought's field is generated *after* the answer, acting as a self-check. You give the reasoning a shape with a plain type, and its `@doc` annotations become the instructions the model sees for that field:
+
+```scala
+import kyo.schema.doc
+
+case class Reasoning(@doc("step-by-step working") steps: String) derives Schema
+val reasonFirst = Thought.opening[Reasoning]
+
+def reasoned(q: Question) =
+    AI.enable(reasonFirst)(AI.gen[Answer](q))
+```
+
+The model must now emit a `Reasoning.steps` string before its `Answer`. The reasoning is typed and decoded like any other field (the thought registers under its type's unqualified name, `Reasoning`), and the schema enforces it, so the model cannot skip it. Opening thoughts steer the answer; closing thoughts review it.
+
+Each thought also carries an optional `process` hook that fires on the decoded reasoning after generation, so you can verify it, record a metric, or drive a follow-up generation. `Thought.aggregate` combines several into one:
+
+```scala
+val checkedAnswer =
+    Thought.aggregate(
+        Thought.opening[Reasoning],
+        // the closing hook receives the decoded Answer; verify it, record a metric, or re-generate here
+        Thought.closing[Answer](_ => ())
+    )
+```
+
+> **Note:** no reasoning is woven in by default. A built-in scaffold is available as `Thought.reflective` (a `Reflect` opening, in which the model states its understanding and commits to following the instructions, and a `Check` closing self-check); enable it with `AI.enable(Thought.reflective)(...)`, or compose it with your own via `Thought.aggregate`, when you want that nudge.
+
+### Modes
+
+A `Mode` is generation-interception middleware: it runs before, around, and after a generation, transparently to the caller. Enabled modes form a pipeline applied in registration order, and a mode can switch models, vary parameters, run parallel generations and synthesize them, or post-process.
+
+`Mode.init` builds one from a transform that receives the target instance `ai` and the wrapped generation `gen` as a value (carrying its failures typed as `Abort[AIGenException]`), and returns a transformed generation, doing work before, around, or after it. Because `gen` is a value, a mode can run it zero, one, or many times. This one prepends a guardrail instruction before each generation it wraps:
+
+```scala
+val concise =
+    Mode.init([A] => (ai, gen) => ai.systemMessage("Answer in one sentence.").andThen(gen))
+```
+
+`AI.withConfig` is the lighter sibling: it layers a transformed config for the duration of a body and restores it after, without a full mode.
+
+```scala
+def colderHere(q: Question) =
+    AI.withConfig(_.temperature(0.1)) {
+        AI.gen[Answer](q)
+    }
+```
+
+### Composing binders
+
+When two or more enablements apply to one generation, pass them to a single `AI.enable`: it takes any mix of tools, prompts, thoughts, and modes as varargs (or a `Seq`), applied in argument order, rather than nesting `enable` blocks.
+
+```scala
+def fullyShaped(q: Question) =
+    AI.enable(precise, factLookup, reasonFirst) {
+        AI.gen[Answer](q)
+    }
+```
+
+## Long-lived agents
+
+An `Agent` is the persistent layer. Where an `AI` instance lives for one `LLM.run`, an agent is an actor-backed entity that holds its conversation across many `ask` calls, processing one input at a time. Its behavior receives its own `self: AI`, and because the parked actor continuation keeps that instance's conversation alive, the thread persists between asks. Reach for it when you want an addressable, long-lived entity rather than a single threaded computation.
+
+`Agent.run[In] { (self, in) => ... }` mints the agent in its ergonomic form. The behavior generates against `self`; `ask` sends a typed input and awaits the typed reply.
+
+```scala
+def chatAgent: Answer < (Async & Abort[Closed] & Scope) =
+    Agent.run[Question] { (self: AI, q: Question) =>
+        self.gen[Answer](q.text)
+    }.map { agent =>
+        for
+            first  <- agent.ask(Question("What is the capital of France?"))
+            second <- agent.ask(Question("And its population?")) // remembers the first ask
+        yield second
+    }
+```
+
+`ask` completes a closed mailbox as `Abort[Closed]` and an aborting behavior as the agent's `Abort[Error]`, never a throw. `agent.close` stops the mailbox and returns any inputs still queued.
+
+To supply a config and any mix of enablements, pass them after the type parameter; `Agent.run` enables them in argument order, then runs `LLM`, so the behavior itself stays a plain `gen`.
+
+```scala
+def researchAgent(config: AI.Config): Answer < (Async & Abort[Closed] & Scope) =
+    Agent.run[Question](config, precise, factLookup, reasonFirst) { (self: AI, q: Question) =>
+        self.gen[Answer](q.text)
+    }.map { agent =>
+        agent.ask(Question("Summarize the Treaty of Westphalia."))
+    }
+```
+
+For control beyond receive-all, `Agent.runBehavior` runs a custom actor behavior with the same config and enablements, and `Agent.receiveLoop` continues or stops per the outcome of each message.
+
+```scala
+def boundedAgent: Result[Closed, String] < (Async & Scope) =
+    val behavior: Unit < (Agent.Context[String, String] & LLM) =
+        Agent.receiveLoop[String] { (in: String) =>
+            if in.toIntOption.exists(_ < 3) then Loop.continue(in.toUpperCase)
+            else Loop.done
+        }
+    Agent.runBehavior[String](_ => behavior).map { agent =>
+        Abort.run[Closed](agent.ask("1"))
+    }
+end boundedAgent
+```
+
+## Streaming
+
+`AI.stream[A]` (or `ai.stream[A]`) projects a generation as a `Stream`, in one of two forms inferred from `A`. The result tool rides every streaming request, so the model always has a tool to call.
+
+For a `String`, the stream is incremental text chunks whose concatenation is the final answer. This is the chat-UI, token-by-token case.
+
+```scala
+def streamedText: Chunk[String] < (Async & Abort[AIStreamException | AIGenException] & Scope) =
+    LLM.run {
+        AI.stream[String].map(_.run)
+    }
+```
+
+For any other type, the stream is object by object: the model produces a sequence of `A`, and each element is emitted once it is complete, never a half-filled value. This is the iterable case, for extracting or generating multiple records.
+
+```scala
+def streamedAnswers: Chunk[Answer] < (Async & Abort[AIStreamException | AIGenException] & Scope) =
+    LLM.run {
+        AI.stream[Answer].map(_.run)
+    }
+```
+
+A fully consumed stream joins the conversation: the turn is recorded once its elements are drained, so a later `gen` or `stream` can read what was streamed, and a stream abandoned part way records nothing. The element row carries `LLM` for that write-back, so a stream is consumed inside `LLM.run`.
+
+The stream's element row also carries `Scope` because the SSE connection is held open until the stream terminates or errors, so running it adds `Scope` to the residual. You write no SSE parsing, no fragment accumulation, no incremental-decode attempt.
+
+### Not every backend streams incrementally
+
+Whether elements arrive *as the model produces them* depends on the model and the endpoint serving it, and the difference is invisible from the stream itself. The command harnesses (Claude Code, Codex) report a turn once it is finished, so the whole answer arrives in one piece: the elements and their order are identical and nothing fails, but time-to-first-token equals time-to-last-token, which is the number a chat UI lives on. The HTTP families stream over SSE, but some endpoints still send a model's whole answer in one delta, and the same model can stream on one host and not on another.
+
+Rather than leave that to be discovered in production feel, each catalog entry declares it, measured against its endpoint. An entry nobody has measured declares `false`, which withholds the guarantee rather than promising one it may not keep:
+
+```scala
+def rendersProgressively(config: kyo.ai.Config): Boolean =
+    config.modelStreamsIncrementally
+```
+
+Read it to choose between rendering progressively and showing a pending state. A stream written against either kind is correct; only the pacing differs.
+
+## Decisions
+
+Some calls do not want text back. They want a judgment: does this state satisfy a condition, which of these handlers should take the next step, how severe is this failure. `Decider` asks such questions as typed values. Its three question kinds are TypeSafe AI's primitives (a `noul` is a yes/no probability, a `choice` picks one of a set, a `score` rates against ordered levels), so that vendor's documentation and cookbooks (https://docs.typesafe.ai) apply directly; which model answers is a config setting, covered in [Which model decides](#which-model-decides).
+
+```scala
+import kyo.schema.doc
+
+enum Handler derives Schema, CanEqual:
+    @doc("Runs a shell command on the host") case Shell
+    @doc("Queries the users database") case Database
+    case Manual
+end Handler
+
+case class Fs(manifest: Chunk[String], lastWrite: String) derives Schema
+
+def route(fs: Fs): Handler < LLM =
+    Decider.choose(fs, "Which handler takes the next step?", Handler.values.toSeq)
+
+def corrupted(fs: Fs): Boolean < LLM =
+    Decider.check(fs, "The filesystem state is corrupted")
+
+def severity(report: String): Double < LLM =
+    Decider.score(report, "How severe is the failure?", Seq("Cosmetic", "Degraded, with a workaround", "Blocking"))
+```
+
+The context (`fs`, `report`) is any value with a `Schema`, sent as JSON; so are the question, the options and the levels, and a plain `String` works in every slot. `choose` returns one of the values you passed: a choice option's wire key is inferred from how it encodes, so an enum case is keyed by its case name, a string by itself, and anything else positionally with the whole value as its description. An enum case's `@doc` is its description, and descriptions are the accuracy knob: TypeSafe reads the option names and their descriptions, and a description that separates the options from each other measurably raises the confidence of the answer. A level is described the same way (a string level is its own description). `score` returns the position on the levels, the probability-weighted index, which can fall between two levels; `math.round` on it is the index of the nearest level. `check` is a noul thresholded at 0.5, or at the threshold you give it (within `[0, 1]`). Leave the context out and the question stands alone.
+
+The full answers, with the probability distribution and the backend's confidence, come from `noul`, `query` and `batch`. `Decider.Query` builds the questions, and `Query.noul` also takes descriptions of what each side means, for a boundary the question alone does not pin down. `batch` sends several questions in one request and answers them in order: two to four questions of different kinds come back as a tuple, and any number of questions of one kind (score every line of a document, rank every candidate) come back as a `Chunk`.
+
+```scala
+import Decider.Query
+
+def triage(fs: Fs): (Double, Decider.Decision[Handler], Decider.Score[String]) < LLM =
+    Decider.batch(
+        fs,
+        Query.noul("The last write completed", "the write is on disk", "the write is missing or partial"),
+        Query.choice("Which handler takes the next step?", Handler.values.toSeq),
+        Query.score("How healthy is the state?", Seq("Healthy", "Degraded", "Corrupt"))
+    )
+
+def relevant(document: String, lines: Seq[String]): Chunk[Double] < LLM =
+    Decider.batch(document, lines.map(line => Query.noul(s"Line '$line' is relevant to the question asked")))
+```
+
+A `Decision` carries `best`, the backend's `confidence`, and every option's probability in the order you gave them, with `probabilityOf`, `ranked`, `isConfident` (against 0.70, or a threshold you pass) and `isAmbiguous` (within a 0.15 margin, or one you pass) on top. `confidence` is a concentration statistic over the distribution, not the winner's probability, so `isAmbiguous` compares the top two probabilities; TypeSafe leaves its formula unspecified, and the completion backend's is one minus the distribution's normalized entropy (a single peak scores 1, a flat distribution 0), so the 0.70 default is a convention: tune it against your own decisions and pin the model version once you have. A `Score` carries the position (`value`), the `level` nearest it, `normalized` onto `[0, 1]`, and the per-level probabilities. The position compares against a threshold or another score well; TypeSafe advises against reading the fraction between two levels as an exact quantity.
+
+On an instance, the conversation is the context, and the question and its answer join the history as two messages, so a later `gen` sees what was decided:
+
+```scala
+def plan(ai: AI): String < LLM =
+    for
+        _       <- ai.userMessage("list which rows of the users table changed in the last commit")
+        handler <- ai.choose("Which handler takes this?", Handler.values.toSeq)
+        next    <- ai.gen[String](s"Use $handler.")
+    yield next
+```
+
+A decision fails the way a generation does. `AIInvalidQuestionException` when the question itself is out of bounds (no options or more than 255, fewer than 2 or more than 10 levels, two options whose inferred keys collide, a threshold outside `[0, 1]`), raised before any request. The ordinary transport, auth, key and decode leaves otherwise. All of them ride `Abort[AIGenException]` on `LLM.run`'s residual, so you recover a decision outside the run, not inside it.
+
+### Which model decides
+
+By default, the config's own completion provider decides: one generation per decision asks the model, by structured output, for a probability on every offered key of every question (yes and no for a noul, the options of a choice, the levels of a score), so every question kind and every batch works with any provider, in one request. Those probabilities are the model's own estimate, not calibrated ones: a threshold away from 0.5 and a confidence cutoff discriminate only as well as the model guesses, and a distribution it reports as peaked can still be wrong.
+
+Setting `decider` on `AI.Config` routes decisions to a dedicated decision provider instead, one whose models are built to answer these questions with calibrated probabilities. `AI.DeciderConfig` is shaped like `AI.Config`: a provider with a catalog of entries and a `default`, and `AI.DeciderConfig.Provider.all` lists the providers. The first is TypeSafe AI's System One endpoint, whose Jev models answer every question kind in one request per call, however many questions it carries: `AI.DeciderConfig.TypeSafe.default` is `jevLatest`, `jevPreview` is the other catalog entry, and `modelName` pins a versioned id (the vendor's advice once you have tuned thresholds against one). Its key comes from `TYPESAFE_API_KEY` (a system property, then the environment) or `apiKey`, and `apiUrl` re-points it at a proxy. `decider(Absent)` returns to the config's own model. Selection by key works here as it does for completion providers: `AI.Config.default` (and so the no-argument `LLM.run`) enables the first decision provider whose key is present, so with `TYPESAFE_API_KEY` in the environment decisions go to Jev without any configuration, and without it the completion model decides.
+
+```scala
+def withTypeSafe[A](v: A < LLM): A < (Async & Abort[AIGenException]) =
+    LLM.run(_.decider(AI.DeciderConfig.TypeSafe.default))(v)
+
+def withPreview[A](v: A < LLM): A < LLM =
+    AI.withConfig(_.decider(AI.DeciderConfig.TypeSafe.jevPreview))(v)
+```
+
+A decision's `timeout`, `meter` and `retrySchedule` default to the surrounding config's and can be set apart from them on the `DeciderConfig`: a decision endpoint answers in a fraction of a second and has its own rate limits, so the knobs sized for a completion provider are rarely the right ones. A rate-limited response's `Retry-After` is waited out before the schedule's own backoff; one that cannot end before the deadline fails the call at once with `AIRateLimitException`, carrying the wait.
+
+```scala
+def quickDecisions[A](v: A < LLM): A < (Async & Abort[AIGenException]) =
+    LLM.run(_.decider(AI.DeciderConfig.TypeSafe.default.timeout(5.seconds).retrySchedule(Schedule.repeat(3))))(v)
+```
+
+What either model sees is the same conversation a generation would: the instance's messages, with the instructions and reminders of every enabled prompt around them; a one-shot's context is its single user message. Tool calls are part of it too, so a decision about an agent's conversation sees what the agent did; images are not (TypeSafe reads text only), and tool definitions reach only the config's own model, which may call them like any `gen`.
+
+Three things to know about the TypeSafe backend. An instance decision sends the whole conversation as the state, and TypeSafe charges input tokens, so a long history is resent on every decision, and each recorded decision (two JSON messages, the questions and the answers) becomes part of that history in turn; ask on a one-shot with a filtered context when the history is not the point. The state and the questions together are bounded by the model's window (64k tokens, 32k for the state plus the longest question), beyond which the request is rejected, and the vendor notes that accuracy falls as the state grows with content unrelated to the decision. And the model reads the state literally, injected instructions included, so a decision that has side effects (launching a tool, changing a system) should choose only among options fixed in code, never options derived from the state, and act on a confident answer only.
+
+## Parallel generation
+
+`AI.gen` over `< LLM` composes with the structured-concurrency combinators (`Async.foreach`, `Async.fill`, `Async.race`) through one public given. Bring it into scope and fan out.
+
+```scala
+import LLM.given
+
+def answerAll(questions: Chunk[Question]) =
+    Async.foreach(questions)(q => AI.gen[Answer](q))
+```
+
+The given is the asymmetric `isolate`: on join it merges each shared instance's conversation prefix-aware (so the shared history is never duplicated) and adds fork-born instances as-is. You do not manage threads or per-conversation state isolation across branches; the isolate does both.
+
+## Tracking usage
+
+Every completed model turn reports what it spent. `Observe.withStats` collects it over a scope, alongside the result:
+
+```scala
+def measured(question: String): (AIStats, String) < (LLM & Sync) =
+    Observe.withStats(AI.gen[String](question))
+```
+
+`AIStats` carries `inputTokens`, `outputTokens`, and `turns`, plus two subsets the wire may break out: `cachedInputTokens` (part of `inputTokens` served from the provider's cache) and `reasoningOutputTokens` (part of `outputTokens` spent reasoning). The subsets are `Maybe`, so a wire that reports zero stays distinguishable from one that reports nothing; `add` aggregates any two.
+
+The varargs form breaks the count down by named instances. Every named instance appears, `AIStats.empty` if it completed no turn; spend by any other instance stays out of the breakdown (wrap in the untargeted form for the scope total):
+
+```scala
+def perAgent(researcher: AI, writer: AI): (Dict[AI, AIStats], String) < (LLM & Sync) =
+    Observe.withStats(researcher, writer) {
+        researcher.gen[String]("Gather the facts.").map(facts => writer.gen[String](facts))
+    }
+```
+
+Counting is a side effect at the source: each turn is recorded on the fiber that ran it, at the moment the wire reply is read. So a rolled-back `AI.forget` block, a losing `Async.race` branch, an `AI.gen` one-shot, and a one-shot decision on the TypeSafe backend all count the turns they completed, and nothing can un-spend them. A turn interrupted before its reply arrives is uncounted (no number ever reached this side of the wire), and an abandoned stream records nothing. One placement rule for streams: a scope-enabled observer covers a streamed turn only when the stream is consumed inside the enabling bracket, while an instance-enabled observer covers its instance's streams wherever they are consumed.
+
+Underneath sits the fifth enablement kind: `Observe`, a wire-tier counterpart of `Mode` that cannot change control flow. Where a mode receives the generation as a value and returns what the caller sees, an observer receives each completed turn's reply (its messages and usage) and returns `Unit`. Enable one on a scope or an instance like any other enablement:
+
+```scala
+def logged[A, S](v: A < (LLM & S)): A < (LLM & S) =
+    val log = Observe.init { (ai, reply) =>
+        AI.config.map(c => Log.info(s"${c.modelName}: ${reply.usage.totalTokens} tokens"))
+    }
+    AI.enable(log)(v)
+end logged
+```
+
+`AI.config` inside the callback is the config the turn ran under, instance overrides included, and `ai.context` is the conversation up to (not including) the turn. An observer whose capability row carries `Abort[E]` is a typed guardrail: its failure fails the generation it fired in, visible in the row at the enable site.
+
+```scala
+case class BudgetExceeded(spent: Long)
+
+def capped[A, S](limit: Long)(v: A < (LLM & S)): A < (LLM & S & Abort[BudgetExceeded] & Sync) =
+    AtomicRef.init(0L).map { spent =>
+        val guard = Observe.init { (_, reply) =>
+            spent.updateAndGet(_ + reply.usage.totalTokens).map { total =>
+                Abort.when(total > limit)(BudgetExceeded(total))
+            }
+        }
+        AI.enable(guard)(v)
+    }
+```
+
+## Controlling conversation state
+
+Once a conversation has history, you sometimes need to run something against it without changing it, or run a clean turn that ignores it. `AI.forget` and `AI.fresh` isolate state for a block; each has a whole-scope form and a per-instance form.
+
+`AI.forget(v)` runs `v`, then rolls back conversations to their pre-`v` state, discarding `v`'s writes. The no-argument form rolls back every instance (a scope-wide rollback); `AI.forget(ais*)` rolls back only the named instances, so other instances' writes persist.
+
+```scala
+def speculate(ai: AI): String < LLM =
+    AI.forget(ai)(ai.gen[String]) // the speculative turn leaves ai's history untouched
+```
+
+`AI.fresh(v)` runs `v` with conversations blanked (enablements and config kept), then restores them on exit. The no-argument form blanks every instance; `AI.fresh(ais*)` blanks only the named ones. Use it for a turn that must not be biased by what the conversation said so far.
+
+```scala
+def unbiased(ai: AI): String < LLM =
+    AI.fresh(ai)(ai.gen[String]) // ai generates with no inherited history
+```
+
+To carry a conversation across blocks within a single run, `ai.snapshot` captures an instance's full in-memory state (conversation, enablements, config) as an `AISession`, and `AI.recover(session)` recreates an instance from it.
+
+```scala
+def branchAndRestore(ai: AI): String < LLM =
+    for
+        saved    <- ai.snapshot
+        _        <- ai.gen[String]    // a speculative branch
+        restored <- AI.recover(saved) // a fresh instance at the saved state
+        answer   <- restored.gen[String]
+    yield answer
+```
+
+An `AISession` holds code (tool runners, effectful prompts, modes), so it is in-memory only and not serializable across runs. The serializable slice is `session.context`, the conversation history (`AI.Context derives Schema`). To persist a conversation across runs, store `session.context` and reseed a fresh instance's history from it.
+
+## Configuration and providers
+
+`AI.Config` is an immutable, copy-on-write settings record naming the provider, model, and runtime knobs (temperature, seed, timeout, retry schedule, iteration cap, reasoning). Every builder returns a modified copy.
+
+```scala
+val openAiConfig =
+    AI.Config.OpenAI.default
+        .apiKey("sk-...")
+        .temperature(0.2)
+```
+
+Reasoning is on by default, so models reason before answering, at the cost of extra output tokens and latency on every generation. `disableReasoning` turns it off. Whether to reason and how much are stated separately, because they are different questions and the endpoints answer them in different vocabularies.
+
+```scala
+val budgetedReasoning =
+    AI.Config.Anthropic.default.reasoningBudget(20000) // a bound in tokens
+val gradedReasoning =
+    AI.Config.DeepSeek.default.reasoningLevel("high") // a word from that wire's own levels
+val noReasoning =
+    AI.Config.Anthropic.default.disableReasoning
+```
+
+### Reasoning
+
+How much reasoning a request can state is a fact declared on the catalog entry, never inferred from the model's name. An entry declares one of five encodings:
+
+- a **token budget** that bounds reasoning,
+- **self-sized** reasoning the model scales itself,
+- a **graded level** drawn from that wire's own set of words,
+- **provider-managed** reasoning, with no field to state an amount at all, or
+- **none**.
+
+It also declares how its endpoint says "do not reason", which genuinely differs across wires: one omits the activation block, one sends an explicit deactivation object, one sends a level word meaning none, and a harness exports an environment switch.
+
+Levels stay the wire's own words rather than a kyo vocabulary, because the sets do not agree: three endpoints enumerate three different sets, overlapping in the middle and differing at the ends. A level an entry does not declare is reported and still sent, leaving the endpoint the authority, so a stale list never refuses a value the wire would accept.
+
+An untouched config states no amount, so the entry's own default applies. A stated amount an entry's encoding cannot express is named in the log and the request is built as if it were absent, rather than failing, so one config stays re-aimable across providers. While reasoning is off nothing rides, and an amount stated then is held rather than dropped.
+
+Whether a request carries a reasoning activation field also decides the result tool's `tool_choice`: two endpoints refuse a forced tool call while reasoning is active, so an active request leaves the call to the model and the eval loop's repair turn covers the rare reply that skips it. A deactivated request still forces, because a deactivation is not an activation.
+
+### Output ceilings
+
+The reasoning declaration also sizes the request's output ceiling, because reasoning tokens count against it. Where a budget bounds reasoning, the ceiling clears that budget with room for the result. Everywhere else nothing bounds reasoning from this side, so the ceiling defaults to the model's own maximum; a smaller ceiling would let reasoning consume the whole allowance and stop the reply before it produced anything. A level names no token count, so nothing can be added for it: only the endpoint knows what a level costs.
+
+An unset ceiling is the model's own maximum, sent rather than withheld, so the limit in force is the one the entry declares. That holds only where the maximum is the provider's own: an entry declaring `OutputMaximum.Unverified` has no published or probed bound, so nothing is sent and an over-large ask is left for the endpoint to refuse and name the real limit. (Withholding the ceiling everywhere once left an endpoint's undeclared default in force while this module reported the declared maximum as the one applied, which on one wire measured six times larger than the limit actually governing the reply.)
+
+A reply that stops at the ceiling with nothing to act on fails with `AIOutputLimitException`, naming the ceiling the request carried. It is not retried, because an identical request spends the whole ceiling again to stop in the same place; the levers are raising `maxTokens` toward the model's maximum, asking for less output, or choosing a model whose reasoning is budget-bounded. A reply that stopped at the ceiling but still carries a usable tool call is delivered as a partial turn instead, and the next turn starts against a fresh ceiling. On the command-harness path the ceiling bounds each of the harness's internal attempts, which it retries, so a call that keeps colliding is billed for several times the ceiling before the failure surfaces.
+
+### Declaring a model
+
+To use a model the catalog does not list, declare its facts with `Config.model(provider, name, contextWindow, outputMaximum, reasoning, acceptsTemperature, acceptsImages)`. To re-point an existing entry at an equivalent id, when a snapshot, fine-tune, or proxy alias shares that entry's capabilities, use `modelName(...)`.
+
+### The providers
+
+The module ships eleven providers, Anthropic, OpenAI, DeepSeek, Gemini, Groq, xAI, Moonshot, Baseten, OpenRouter, Claude Code, and Codex, each available as `AI.Config.Anthropic`, `AI.Config.OpenAI`, and so on, and together as `AI.Config.Provider.all`. Each is a pure catalog whose `.default` you refine with builders.
+
+`AI.Config.default` selects one: it first honors the override flag `kyo.ai.provider` (environment variable `KYO_AI_PROVIDER`), then probes provider markers and keys in order, preferring `CLAUDE_CODE`, then `CODEX`, then API keys such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. Override values are `claude-code`, `codex`, `anthropic`, `openai`, `deepseek`, `gemini`, `groq`, `xai`, `moonshot`, `baseten`, and `openrouter` (`grok` and `kimi` are also accepted for those two families).
+
+`AI.Config.init` builds a config for an API-key provider, reading the key and org from system properties then the environment. It takes the model's declared facts, so a model the catalog does not list is stated rather than guessed.
+
+```scala
+def initConfig: AI.Config < Sync =
+    AI.Config.init(
+        AI.Config.Anthropic,
+        "claude-sonnet-4-5-20250929",
+        contextWindow = 200000,
+        outputMaximum = AI.Config.OutputMaximum.Verified(64000),
+        AI.Config.ReasoningEncoding.TokenBudget,
+        acceptsTemperature = true,
+        acceptsImages = true
+    )
+```
+
+The no-argument `LLM.run` resolves its config with `AI.Config.default`, which probes provider markers and API keys (system properties first, then environment variables) and selects the first present, falling back to Anthropic; it probes the decision providers' keys the same way and enables the first present as the `decider` (see [Which model decides](#which-model-decides)). Retries and timeouts are wired into the eval loop, configured here: the completion call is wrapped meter, then retry, then timeout.
+
+```scala
+def reliable(q: Question): Answer < (Async & Abort[AIGenException]) =
+    LLM.run(_.retrySchedule(Schedule.repeat(3)).timeout(30.seconds)) {
+        AI.gen[Answer](q)
+    }
+```
+
+> **Caution:** `AI.Config.default` is effectful, typed `AI.Config < Sync`, because it probes system properties and environment variables. It is not a pure `val` and must be `.map`ped. The per-provider `.default` values (such as `AI.Config.OpenAI.default`) are pure and safe to use directly.
+
+When running forked sbt demos, prefer the `KYO_AI_PROVIDER` environment variable on the command itself. A `-Dkyo.ai.provider=...` argument passed before the sbt task configures the sbt JVM, not necessarily the forked demo JVM. The `LLM` boundary emits debug logs through `kyo.Log`; enable a debug logger around your program to see the backend that actually ran:
+
+```text
+kyo-ai gen backend=Claude Code model=sonnet messages=3 tools=1 thoughts=0 forceResult=false
+```
+
+The runnable demos at the end of this README print the resolved provider and model so a forked run can be checked directly.
+
+The error model is principled and typed. A generation's failures ride `run`'s residual as `Abort[AIGenException]`, a sealed hierarchy whose leaves name the specific failure: a transport error is an `AITransportException` (wrapping the kyo-http `HttpException`), eval-loop exhaustion an `AIEvalExhaustedException`, an invalid thought name an `AIInvalidThoughtException`, an undecodable reply an `AIDecodeException`, an out-of-bounds decider question an `AIInvalidQuestionException`, a missing API key an `AIMissingApiKeyException`. Streaming failures are typed in the stream's own row as `Abort[AIStreamException]`: a malformed delta is an `AIStreamDeltaException`, a stream that ends without a decodable value an `AIStreamIncompleteException`. The super-types track operations, the leaves track failures, and a failure shared by both operations (a missing key, a transport error) belongs to both. Misuse stays off the rows: using an `AI` outside the `LLM.run` that created it panics with `AICrossRunException`.
+
+## Conversation data types
+
+`AI.Context` is the conversation history: an ordered `Chunk` of typed `Message` values, immutable, with builders that append and return a new `AI.Context`. It is what the per-instance histories are made of, and it `derives Schema`, so it can be persisted.
+
+```scala
+val transcript =
+    AI.Context.empty
+        .systemMessage("You are a helpful assistant.")
+        .userMessage("What is 2 + 2?")
+        .assistantMessage("4")
+```
+
+`AI.Context.merge` is prefix-aware: it appends only the non-common suffix of the argument, never duplicating shared history. The message subtypes are `SystemMessage`, `UserMessage`, `AssistantMessage`, and `ToolMessage`, each tagged with a `Role` carrying the exact provider wire-string. `AI.Image` carries a base64 payload for a vision-capable user message, built via `AI.Image.fromBase64` or `AI.Image.fromBytes`.
+
+```scala
+val withImage =
+    AI.Context.empty.userMessage("What is in this picture?", Present(AI.Image.fromBase64("...")))
+```
+
+## What this removes
+
+The selling point is the code delta. Two of the comparisons made concrete, against the manual path a mainstream SDK leaves to you.
+
+The agentic tool-call loop, by hand, is roughly thirty lines you write and maintain: a `while` loop, per-call dispatch by name, argument parse, the run, error-to-message feedback, and message-list threading.
+
+```python
+messages = [{"role": "user", "content": question}]
+while True:
+    resp = client.chat.completions.create(model="gpt-5.4", messages=messages, tools=tool_defs)
+    msg = resp.choices[0].message
+    messages.append(msg)
+    if not msg.tool_calls:
+        break
+    for call in msg.tool_calls:
+        fn = registry[call.function.name]
+        try:
+            args = json.loads(call.function.arguments)
+            content = json.dumps(fn(**args))
+        except Exception as e:
+            content = f"error: {e}"
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+final = messages[-1].content
+```
+
+In kyo-ai that whole loop is the framework's; you supply the tool and the result type (`factLookup` and `Answer` from the top):
+
+```scala
+AI.enable(factLookup)(AI.gen[Answer]("What is a CRDT?"))
+```
+
+Streaming, by hand, is SSE plumbing: open the connection, parse each `data:` line, skip `[DONE]`, accumulate the tool-call argument fragments across deltas, and attempt to decode the growing buffer.
+
+```python
+stream = client.chat.completions.create(model="gpt-5.4", messages=msgs, stream=True, tools=tool_defs)
+buf = ""
+for event in stream:
+    delta = event.choices[0].delta
+    if delta.tool_calls:
+        buf += delta.tool_calls[0].function.arguments or ""
+        try:
+            yield json.loads(buf)
+        except json.JSONDecodeError:
+            pass
+```
+
+In kyo-ai that is a `Stream` of decoded values:
+
+```scala
+val answerStream =
+    AI.stream[Answer]
+```
+
+The categories removed wholesale: JSON-schema authoring and the parse-and-validate of model output; the agentic tool-call loop, dispatch, and error feedback; manual message-list threading for memory; SSE parsing and incremental decode; hand-rolled retry/backoff and transport-versus-domain triage; parallel-sampling and synthesis orchestration; bespoke stateful-conversation services; thread management and per-conversation isolation for parallel work.
+
+## How it works
+
+`LLM` is a custom `ArrowEffect` whose operations carry data: a program typed `A < LLM` is a tree of virtual operations with no `Async` in its row, reading and appending to per-instance conversation histories held in one threaded `State`. The operations that reach the world are `Gen`, whose handler runs the eval loop, and `Decide`, whose handler runs the decision glue; that is where `Async` and `Abort[AIGenException]` enter, riding out on `run`'s residual. The completion call is wrapped meter, then retry, then timeout, and four backend adapters sit behind `AI.Config.Provider`: an OpenAI-compatible HTTP adapter shared by six providers, an Anthropic HTTP adapter, plus Claude Code and Codex command harness adapters. The eval boundary emits debug logs through `kyo.Log` naming the selected backend, model, message count, tool count, and streaming mode. For the operation GADT, the state-threading handler, and the asymmetric `Isolate` that backs parallel branches, see `kyo-ai/shared/src/main/scala/kyo/LLM.scala` and CONTRIBUTING.md.
+
+## Demos
+
+Runnable end-to-end demos live in [`shared/src/test/scala/demo`](shared/src/test/scala/demo). Run any with `sbt 'kyo-aiJVM/Test/runMain demo.<Name>'`.
+
+- [**TypedGenerationDemo**](shared/src/test/scala/demo/TypedGenerationDemo.scala): schema-derived typed generation into a case class.
+- [**ConversationDemo**](shared/src/test/scala/demo/ConversationDemo.scala): one persistent `AI` instance carrying multi-turn history.
+- [**ToolCallDemo**](shared/src/test/scala/demo/ToolCallDemo.scala): Kyo tool registration, model tool calls, tool execution, and final typed answer.
+- [**StreamingDemo**](shared/src/test/scala/demo/StreamingDemo.scala): text-chunk streaming and object-by-object streaming.
+- [**DecisionDemo**](shared/src/test/scala/demo/DecisionDemo.scala): routing, checking and scoring a ticket as typed decisions, with the distributions behind them when `TYPESAFE_API_KEY` is set.
+- [**HarnessCompletionDemo**](shared/src/test/scala/demo/HarnessCompletionDemo.scala): command-backed harness providers with image input and retained history. It prints the resolved provider and model before running.
+- [**AgentDemo**](shared/src/test/scala/demo/AgentDemo.scala): a small typed `Agent` retaining its own conversation.
+- [**SamplingDemo**](shared/src/test/scala/demo/SamplingDemo.scala): parallel sampling and synthesis.
+- [**ThoughtsDemo**](shared/src/test/scala/demo/ThoughtsDemo.scala): thought extraction alongside a final answer.
+- [**WikiResearchDemo**](shared/src/test/scala/demo/WikiResearchDemo.scala): a richer tool-backed research flow.
+
+Self-contained commands for the harness smoke demo, assuming API keys and command harness auth are already available in the environment:
+
+```sh
+KYO_AI_PROVIDER=claude-code scripts/sbt.sh compile -Dsbt.server=false 'kyo-aiJVM/Test/runMain demo.HarnessCompletionDemo'
+KYO_AI_PROVIDER=codex scripts/sbt.sh compile -Dsbt.server=false 'kyo-aiJVM/Test/runMain demo.HarnessCompletionDemo'
+KYO_AI_PROVIDER=anthropic scripts/sbt.sh compile -Dsbt.server=false 'kyo-aiJVM/Test/runMain demo.HarnessCompletionDemo'
+KYO_AI_PROVIDER=openai scripts/sbt.sh compile -Dsbt.server=false 'kyo-aiJVM/Test/runMain demo.HarnessCompletionDemo'
+```
+
+Use the same command shape with `demo.ToolCallDemo` for tool calling and `demo.StreamingDemo` for both streaming modes.

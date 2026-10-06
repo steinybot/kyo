@@ -1,6 +1,5 @@
 package kyo
 
-import kyo.Tag
 import kyo.kernel.ArrowEffect
 import scala.annotation.nowarn
 import scala.annotation.targetName
@@ -42,11 +41,10 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A1, B, S] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (unit, cont) =>
-                        Poll.andMap[Chunk[A1]]: maybeChunk =>
-                            Loop.continue(cont(maybeChunk.map(_.map(f))))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                unit =>
+                    Poll.andMap[Chunk[A1]]: maybeChunk =>
+                        Loop.continue(maybeChunk.map(_.map(f)))
             )
 
     /** Transform a pipe to consume a stream of a different element type using an effectful mapping function.
@@ -63,14 +61,13 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A1, B, S & S1] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (unit, cont) =>
-                        Poll.andMap[Chunk[A1]]:
-                            case Absent => Loop.continue(cont(Absent))
-                            case Present(chunk) =>
-                                Kyo.foreach(chunk)(f).map: chunk2 =>
-                                    Loop.continue(cont(Present(chunk2)))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                unit =>
+                    Poll.andMap[Chunk[A1]]:
+                        case Absent         => Loop.continue(Absent)
+                        case Present(chunk) =>
+                            Kyo.foreach(chunk)(f).map: chunk2 =>
+                                Loop.continue(Present(chunk2))
             )
 
     /** Transform a pipe to consume a stream of a different element type using a pure mapping function that transforms streamed chunks.
@@ -87,11 +84,10 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A1, B, S] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (unit, cont) =>
-                        Poll.andMap[Chunk[A1]]: maybeChunk =>
-                            Loop.continue(cont(maybeChunk.map(f)))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                unit =>
+                    Poll.andMap[Chunk[A1]]: maybeChunk =>
+                        Loop.continue(maybeChunk.map(f))
             )
 
     /** Transform a pipe to consume a stream of a different element type using an effectful mapping function that transforms streamed
@@ -109,14 +105,13 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A1, B, S & S1] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (unit, cont) =>
-                        Poll.andMap[Chunk[A1]]:
-                            case Absent => Loop.continue(cont(Absent))
-                            case Present(chunk) =>
-                                f(chunk).map: chunk2 =>
-                                    Loop.continue(cont(Present(chunk2)))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                unit =>
+                    Poll.andMap[Chunk[A1]]:
+                        case Absent         => Loop.continue(Absent)
+                        case Present(chunk) =>
+                            f(chunk).map: chunk2 =>
+                                Loop.continue(Present(chunk2))
             )
 
     /** Transform a pipe to produce a new output type using a pure function that transforms each streamed element of the original pipe's
@@ -134,10 +129,9 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A, B1, S] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (chunk, cont) =>
-                        Emit.valueWith(chunk.map(f))(Loop.continue(cont(())))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                chunk =>
+                    Emit.valueWith(chunk.map(f))(Loop.continue(()))
             )
 
     /** Transform a pipe to produce a new output type using an effectful function that transforms each streamed element of the original
@@ -155,11 +149,10 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A, B1, S & S1] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (chunk, cont) =>
-                        Kyo.foreach(chunk)(f).map: chunk2 =>
-                            Emit.valueWith(chunk2)(Loop.continue(cont(())))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                chunk =>
+                    Kyo.foreach(chunk)(f).map: chunk2 =>
+                        Emit.valueWith(chunk2)(Loop.continue(()))
             )
 
     /** Transform a pipe to produce a new output type using a pure function that transforms each streamed chunk of the original pipe's
@@ -177,10 +170,9 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A, B1, S] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (chunk, cont) =>
-                        Emit.valueWith(f(chunk))(Loop.continue(cont(())))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                chunk =>
+                    Emit.valueWith(f(chunk))(Loop.continue(()))
             )
 
     /** Transform a pipe to produce a new output type using an effectful function that transforms each streamed chunk of the original pipe's
@@ -198,11 +190,10 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
         fr: Frame
     ): Pipe[A, B1, S & S1] =
         Pipe:
-            ArrowEffect.handleLoop(t1, pollEmit)(
-                [C] =>
-                    (chunk, cont) =>
-                        f(chunk).map: chunk2 =>
-                            Emit.valueWith(chunk2)(Loop.continue(cont(())))
+            ArrowEffect.handleLoop(t1, pollEmit)([C] =>
+                chunk =>
+                    f(chunk).map: chunk2 =>
+                        Emit.valueWith(chunk2)(Loop.continue(()))
             )
 
     /** Join to another pipe producing a new pipe that performs both pipes' transformations in sequence.
@@ -252,8 +243,8 @@ sealed abstract class Pipe[-A, +B, -S] extends Serializable:
                                 handle = [C2] =>
                                     (emitted, emitCont) =>
                                         Loop.continue(emitCont(()), pollCont(Maybe(emitted))),
-                                done = _ => Loop.continue(Kyo.unit, pollCont(Absent))
-                        ),
+                                done = _ => Loop.continue((), pollCont(Absent))
+                            ),
                     done = _ => Loop.done(())
                 )
             }
@@ -276,7 +267,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Emit.valueWith(c)(Loop.continue)
 
@@ -299,7 +290,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Emit.valueWith(c.map(f))(Loop.continue)
 
@@ -322,7 +313,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Kyo.foreach(c)(f).map: c1 =>
                             Emit.valueWith(c1)(Loop.continue)
@@ -339,7 +330,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Emit.valueWith(f(c))(Loop.continue)
 
@@ -357,7 +348,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         f(c).map: c1 =>
                             Emit.valueWith(c1)(Loop.continue)
@@ -376,7 +367,7 @@ object Pipe:
             Pipe:
                 Loop(n): i =>
                     Poll.andMap[Chunk[A]]:
-                        case Absent => Loop.done
+                        case Absent     => Loop.done
                         case Present(c) =>
                             val c1  = c.take(i)
                             val nst = i - c1.size
@@ -394,7 +385,7 @@ object Pipe:
         Pipe:
             Loop(n): i =>
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if i <= 0 then Emit.valueWith(c)(Loop.continue(0))
                         else
@@ -415,7 +406,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue
                         else
@@ -435,7 +426,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue
                         else
@@ -455,7 +446,7 @@ object Pipe:
         Pipe:
             Loop(false): done =>
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue(done)
                         else if done then Emit.valueWith(c)(Loop.continue(done))
@@ -476,7 +467,7 @@ object Pipe:
         Pipe:
             Loop(false): done =>
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue(done)
                         else if done then Emit.valueWith(c)(Loop.continue(done))
@@ -497,7 +488,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         val c1 = c.filter(f)
                         if c1.isEmpty then Loop.continue
@@ -515,7 +506,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Kyo.filter(c)(f).map: c1 =>
                             if c1.isEmpty then Loop.continue
@@ -533,7 +524,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         val c1 = c.map(f).collect({ case Present(v) => v })
                         if c1.isEmpty then Loop.continue
@@ -551,7 +542,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Kyo.collect(c)(f).map: c1 =>
                             if c1.isEmpty then Loop.continue
@@ -570,7 +561,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue
                         else
@@ -597,7 +588,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         if c.isEmpty then Loop.continue
                         else
@@ -639,7 +630,7 @@ object Pipe:
         Pipe:
             Loop(first): state =>
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         val c1       = c.changes(state)
                         val newState = if c1.isEmpty then state else Maybe(c1.last)
@@ -650,6 +641,7 @@ object Pipe:
       *
       * This operation maintains the order of elements while potentially redistributing them into new chunks. Smaller chunks may occur in
       * two cases:
+      *
       *   - When there aren't enough remaining elements to form a complete chunk
       *   - When the input stream emits an empty chunk
       *
@@ -697,7 +689,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         Kyo.foreach(c)(f).andThen:
                             Emit.valueWith(c)(Loop.continue)
@@ -714,7 +706,7 @@ object Pipe:
         Pipe:
             Loop.foreach:
                 Poll.andMap[Chunk[A]]:
-                    case Absent => Loop.done
+                    case Absent     => Loop.done
                     case Present(c) =>
                         f(c).andThen:
                             Emit.valueWith(c)(Loop.continue)

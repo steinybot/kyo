@@ -35,18 +35,18 @@ abstract private[grpc] class BaseUnaryServerCallHandler[Request, Response, Handl
         def start(handler: Handler, promise: Promise[Request, Abort[Status]], ready: SignalRef[Boolean]) =
             for
                 fiber <- Fiber.initUnscoped(sendAndClose(handler, promise, ready))
-                _ <- fiber.onInterrupt: _ =>
+                _     <- fiber.onInterrupt: _ =>
                     val status = Status.CANCELLED.withDescription("Call was cancelled.")
-                    try {
+                    try
                         call.close(status, Metadata())
-                    } catch {
+                    catch
                         case _: IllegalStateException => // Ignore
-                    }
+                    end try
             yield fiber
 
         val init =
             for
-                _ <- Sync.defer(call.request(1))
+                _                  <- Sync.defer(call.request(1))
                 (options, handler) <- f.handle(
                     Env.run(headers),
                     ResponseOptions.run

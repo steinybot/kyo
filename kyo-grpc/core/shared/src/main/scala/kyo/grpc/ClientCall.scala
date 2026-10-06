@@ -92,7 +92,7 @@ object ClientCall:
                 _       <- Sync.defer(call.sendMessage(request))
                 _       <- Sync.defer(call.halfClose())
                 result  <- listener.responsePromise.getResult
-                // TODO: Where is the emit of the effect that waits for completion?
+            // TODO: Where is the emit of the effect that waits for completion?
             yield result
         end sendAndReceive
 
@@ -161,38 +161,43 @@ object ClientCall:
         def processHeaders(
             listener: UnaryClientCallListener[Response],
             requestsEffect: GrpcRequest[Stream[Request, Grpc]]
-        ): GrpcRequest[Stream[Request, Grpc]] = {
-            Console.printLine("Awaiting headers").andThen:
-              listener.headersPromise.get.map(Env.run(_)(requestsEffect))
-        }
+        ): GrpcRequest[Stream[Request, Grpc]] =
+            listener.headersPromise.get.map(Env.run(_)(requestsEffect))
 
         def sendAndClose(
             call: ClientCall[Request, Response],
             listener: UnaryClientCallListener[Response],
             requests: Stream[Request, Grpc]
         ): Result[GrpcFailure, Unit] < Async =
-            // Sends the first message regardless of readiness to ensure progress.
-            val send = requests.foreach(request =>
-                for
-                    _ <- Sync.defer(call.sendMessage(request))
-                    // There is a race condition between setting the ready signal to false and the listener setting it
-                    // to true. Either update may be lost, however, we always check isReady which is the source of
-                    // truth. The only case where the signal value matters is when isReady is false. We know that the
-                    // signal will still be false, and the listener guarantees that the ready signal will be set to true
-                    // when isReady becomes true.
-                    _       <- listener.readySignal.set(false)
-                    isReady <- Sync.defer(call.isReady)
-                    // TODO: We have to handle the case where the listener completes.
-                    _ <- if isReady then Kyo.unit else listener.readySignal.next
-                yield ()
-            )
+            val send = requests
+                .takeWhile(_ => listener.completionPromise.done.map(!_))
+                .foreach(request =>
+                    for
+                        _       <- Sync.defer(call.sendMessage(request))
+                        _       <- listener.readySignal.set(false)
+                        isReady <- Sync.defer(call.isReady)
+                        isDone  <- listener.completionPromise.done
+                        _       <- if isReady || isDone then Kyo.unit else listener.readySignal.next
+                    yield ()
+                )
 
             Abort.run(send).map((result: Result[GrpcFailure, Unit]) =>
-                result match
-                    case success: Result.Success[Unit] @unchecked =>
-                        Sync.defer(call.halfClose()).andThen(success)
-                    case error: Result.Error[GrpcFailure] @unchecked =>
-                        Sync.defer(call.cancel("Call was cancelled due to an error.", error.failureOrPanic)).andThen(error)
+                listener.completionPromise.done.map: isDone =>
+                    result match
+                        case success: Result.Success[Unit] @unchecked =>
+                            if !isDone then
+                                Sync.defer(
+                                    try call.halfClose()
+                                    catch case _: IllegalStateException => ()
+                                ).andThen(success)
+                            else success
+                        case error: Result.Error[GrpcFailure] @unchecked =>
+                            if !isDone then
+                                Sync.defer(
+                                    try call.cancel("Call was cancelled due to an error.", error.failureOrPanic)
+                                    catch case _: IllegalStateException => ()
+                                ).andThen(error)
+                            else error
             )
         end sendAndClose
 
@@ -202,10 +207,10 @@ object ClientCall:
             requestsEffect: GrpcRequest[Stream[Request, Grpc]]
         ): GrpcResponsesAwaitingCompletion[Result[GrpcFailure, Response]] =
             for
-                requests   <- requestsEffect
+                requests <- requestsEffect
 //                _          <- Sync.defer(call.request(1))
                 sendResult <- sendAndClose(call, listener, requests)
-                result <-
+                result     <-
                     sendResult match
                         case Result.Success(_) => listener.responsePromise.getResult
                         case Result.Failure(e) => Kyo.lift(Result.fail(e))
@@ -219,16 +224,14 @@ object ClientCall:
         ]])
             : Response < Grpc =
             Emit.run[GrpcRequestCompletion](completionEffect).map: (handlers, result) =>
-                Console.printLine("processCompletion: start").andThen:
-                  listener.completionPromise.get.map: callClosed =>
-                      val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
-                          acc.andThen(Env.run(callClosed)(handler))
-                      Console.printLine(s"processCompletion: callClosed=${callClosed.status.isOk}").andThen:
-                        completed.andThen:
-                            if !callClosed.status.isOk then
-                                Abort.fail(callClosed.asException)
-                            else
-                                Abort.get(result)
+                listener.completionPromise.get.map: callClosed =>
+                    val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
+                        acc.andThen(Env.run(callClosed)(handler))
+                    completed.andThen:
+                        if !callClosed.status.isOk then
+                            Abort.fail(callClosed.asException)
+                        else
+                            Abort.get(result)
 
         def run(call: ClientCall[Request, Response]): Response < Grpc =
             RequestOptions.run(requestsInit).map: (options, requestsEffect) =>
@@ -275,7 +278,8 @@ object ClientCall:
                 headersPromise <- Promise.init[Metadata, Any]
                 // TODO: What about the Scope?
                 // Assumption is that SPSC is fine which I think it is according to gRPC docs.
-                responseStream    <- Channel.initUnscoped[Response](options.responseCapacityOrDefault, access = Access.SingleProducerSingleConsumer)
+                responseStream <-
+                    Channel.initUnscoped[Response](options.responseCapacityOrDefault, access = Access.SingleProducerSingleConsumer)
                 completionPromise <- Promise.init[CallClosed, Any]
                 readySignal       <- Signal.initRef[Boolean](false)
                 listener = ServerStreamingClientCallListener(headersPromise, responseStream, completionPromise, readySignal)
@@ -302,24 +306,27 @@ object ClientCall:
                 _       <- Sync.defer(call.halfClose())
                 stream  <- listener.responseChannel.streamUntilClosed().tapChunk(onChunk)
             yield stream
+            end for
         end sendAndReceive
 
         def processCompletion(listener: ServerStreamingClientCallListener[Response])(
             completionEffect: GrpcResponsesAwaitingCompletion[Stream[Response, Grpc]]
         ): Stream[Response, Grpc] < Async =
             Emit.run[GrpcRequestCompletion](completionEffect).map: (handlers, responses) =>
-                listener.completionPromise.get.map: callClosed =>
-                    val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
-                        acc.andThen(Env.run(callClosed)(handler))
-                    completed.andThen:
-                        if callClosed.status.isOk then responses
-                        else responses.concat(Stream(Abort.fail(callClosed.asException)))
+                val completionStream = Stream[Response, Grpc]:
+                    listener.completionPromise.get.map: callClosed =>
+                        val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
+                            acc.andThen(Env.run(callClosed)(handler))
+                        completed.andThen:
+                            if callClosed.status.isOk then Kyo.unit
+                            else Abort.fail(callClosed.asException)
+                responses.concat(completionStream)
         end processCompletion
 
         def run(call: ClientCall[Request, Response]): Stream[Response, Grpc] < Async =
             RequestOptions.run(requestInit).map: (options, requestEffect) =>
                 for
-                    listener <- start(call, options)
+                    listener  <- start(call, options)
                     responses <- sendAndReceive(call, listener, requestEffect).handle(
                         processCompletion(listener),
                         cancelOnError(call),
@@ -362,7 +369,8 @@ object ClientCall:
                 headersPromise <- Promise.init[Metadata, Any]
                 // TODO: What about the Scope?
                 // Assumption is that SPSC is fine which I think it is according to gRPC docs.
-                responseStream    <- Channel.initUnscoped[Response](options.responseCapacityOrDefault, access = Access.SingleProducerSingleConsumer)
+                responseStream <-
+                    Channel.initUnscoped[Response](options.responseCapacityOrDefault, access = Access.SingleProducerSingleConsumer)
                 completionPromise <- Promise.init[CallClosed, Any]
                 readySignal       <- Signal.initRef[Boolean](false)
                 listener = ServerStreamingClientCallListener(headersPromise, responseStream, completionPromise, readySignal)
@@ -382,27 +390,35 @@ object ClientCall:
             listener: ServerStreamingClientCallListener[Response],
             requests: Stream[Request, Grpc]
         ): Result[GrpcFailure, Unit] < Async =
-            // Sends the first message regardless of readiness to ensure progress.
-            val send = requests.foreach(request =>
-                for
-                    _ <- Sync.defer(call.sendMessage(request))
-                    // There is a race condition between setting the ready signal to false and the listener setting it
-                    // to true. Either update may be lost, however, we always check isReady which is the source of
-                    // truth. The only case where the signal value matters is when isReady is false. We know that the
-                    // signal will still be false, and the listener guarantees that the ready signal will be set to true
-                    // when isReady becomes true.
-                    _       <- listener.readySignal.set(false)
-                    isReady <- Sync.defer(call.isReady)
-                    _       <- if isReady then Kyo.unit else listener.readySignal.next
-                yield ()
-            )
+            val send = requests
+                .takeWhile(_ => listener.completionPromise.done.map(!_))
+                .foreach(request =>
+                    for
+                        _       <- Sync.defer(call.sendMessage(request))
+                        _       <- listener.readySignal.set(false)
+                        isReady <- Sync.defer(call.isReady)
+                        isDone  <- listener.completionPromise.done
+                        _       <- if isReady || isDone then Kyo.unit else listener.readySignal.next
+                    yield ()
+                )
 
             Abort.run(send).map((result: Result[GrpcFailure, Unit]) =>
-                result match
-                    case success: Result.Success[Unit] @unchecked =>
-                        Sync.defer(call.halfClose()).andThen(success)
-                    case error: Result.Error[GrpcFailure] @unchecked =>
-                        Sync.defer(call.cancel("Call was cancelled due to an error.", error.failureOrPanic)).andThen(error)
+                listener.completionPromise.done.map: isDone =>
+                    result match
+                        case success: Result.Success[Unit] @unchecked =>
+                            if !isDone then
+                                Sync.defer(
+                                    try call.halfClose()
+                                    catch case _: IllegalStateException => ()
+                                ).andThen(success)
+                            else success
+                        case error: Result.Error[GrpcFailure] @unchecked =>
+                            if !isDone then
+                                Sync.defer(
+                                    try call.cancel("Call was cancelled due to an error.", error.failureOrPanic)
+                                    catch case _: IllegalStateException => ()
+                                ).andThen(error)
+                            else error
             )
         end sendAndClose
 
@@ -421,19 +437,27 @@ object ClientCall:
                 _      <- Fiber.initUnscoped(sendAndClose(call, listener, requests))
                 stream <- listener.responseChannel.streamUntilClosed().tapChunk(onResponseChunk)
             yield stream
+            end for
         end sendAndReceive
 
         def processCompletion(listener: ServerStreamingClientCallListener[Response])(
             completionEffect: GrpcResponsesAwaitingCompletion[Stream[Response, Grpc]]
         ): Stream[Response, Grpc] < Async =
-            Emit.runForeach(completionEffect)(handler =>
-                listener.completionPromise.get.map(Env.run(_)(handler))
-            )
+            Emit.run[GrpcRequestCompletion](completionEffect).map: (handlers, responses) =>
+                val completionStream = Stream[Response, Grpc]:
+                    listener.completionPromise.get.map: callClosed =>
+                        val completed = handlers.foldLeft(Kyo.unit: Unit < Async): (acc, handler) =>
+                            acc.andThen(Env.run(callClosed)(handler))
+                        completed.andThen:
+                            if callClosed.status.isOk then Kyo.unit
+                            else Abort.fail(callClosed.asException)
+                responses.concat(completionStream)
+        end processCompletion
 
         def run(call: ClientCall[Request, Response]): Stream[Response, Grpc] < Async =
             RequestOptions.run(requestsInit).map: (options, requestsEffect) =>
                 for
-                    listener <- start(call, options)
+                    listener  <- start(call, options)
                     responses <- (for
                         requestsWithHeaders <- processHeaders(listener, requestsEffect)
                         responses           <- sendAndReceive(call, listener, requestsWithHeaders)
@@ -448,18 +472,22 @@ object ClientCall:
             Sync.defer(channel.newCall(method, options)).map(run)
     end bidiStreaming
 
-    private def cancelOnError[E <: Throwable : ConcreteTag, Response, S](call: ClientCall[?, ?])(v: => Response < (Abort[E] & S))(using Frame): Response < (Abort[E] & Sync & S) =
+    private def cancelOnError[E <: Throwable: ConcreteTag, Response, S](call: ClientCall[?, ?])(v: => Response < (Abort[E] & S))(using
+        Frame
+    ): Response < (Abort[E] & Sync & S) =
         Abort.recoverError[E](error =>
             Sync.defer(call.cancel("Call was cancelled due to an error.", error.failureOrPanic))
                 .andThen(Abort.error(error))
         )(v)
 
-    private def cancelOnInterrupt[E, Response](call: ClientCall[?, ?])(v: => Response < (Abort[E] & Async))(using Frame): Response < (Abort[E] & Async) =
+    private def cancelOnInterrupt[E, Response](call: ClientCall[?, ?])(v: => Response < (Abort[E] & Async))(using
+        Frame
+    ): Response < (Abort[E] & Async) =
         Async.tapFiber(v)(fiber =>
             fiber.onInterrupt(error =>
                 val ex = error match
                     case Result.Panic(e) => e
-                    case _ => null
+                    case _               => null
                 Sync.defer(call.cancel("Kyo Fiber was interrupted.", ex))
             )
         )

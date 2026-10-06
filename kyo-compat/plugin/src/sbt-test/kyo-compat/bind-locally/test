@@ -1,0 +1,13 @@
+# Scripted test - .bindLocally via case-class .copy on the builder.
+> checkLocalDep
+> checkNoMavenDep
+# Partial bindLocally: Future bound, Kyo unbound (falls through to maven).
+> checkPartialFutureLocal
+> checkPartialFutureNoMaven
+> checkPartialKyoMaven
+> checkPartialKyoNoLocal
+# CompatBackendAxis.local: a vendored backend bound to a local project.
+> checkLocalAxisDep
+> checkLocalAxisNoMaven
+# An unbound CompatBackendAxis.local backend fails with a clear message.
+> checkUnboundLocalErrors

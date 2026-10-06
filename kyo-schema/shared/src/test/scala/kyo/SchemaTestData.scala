@@ -1,0 +1,150 @@
+package kyo
+
+case class MTPerson(name: String, age: Int) derives CanEqual
+case class MTAddress(street: String, city: String, zip: String) derives CanEqual, Schema
+case class MTPersonAddr(name: String, age: Int, address: MTAddress) derives CanEqual, Schema
+case class MTTeam(name: String, lead: MTPersonAddr, members: List[MTPersonAddr]) derives CanEqual, Schema
+case class MTCompany(name: String, hq: MTTeam) derives CanEqual, Schema
+case class MTConfig(host: String, port: Int = 8080, ssl: Boolean = false) derives CanEqual
+case class MTPair[A, B](first: A, second: B) derives CanEqual
+
+// Generic case classes WITH default values. Regression coverage for the macro bug where
+// `MacroUtils.getDefault` failed to apply the case class's type arguments to the generated
+// `$lessinit$greater$default$N` method, raising "Expected an expression. This is a partially
+// applied Term" at Schema-derivation time.
+case class MTGenericDefault[A](value: A, tag: String = "default") derives CanEqual
+case class MTGenericMaybe[A](result: Maybe[A] = Absent, error: Maybe[String] = Absent) derives CanEqual
+case class MTGenericTwoParam[A, B](first: A, second: B, label: String = "pair") derives CanEqual
+case class MTOrder(id: Int, items: List[MTItem]) derives CanEqual, Schema
+case class MTItem(name: String, price: Double) derives CanEqual, Schema
+case class MTWrapper(value: String) derives CanEqual
+case class MTEvil(get: String, set: Int, path: String, selectDynamic: Boolean) derives CanEqual
+case class MTUser(name: String, age: Int, email: String, ssn: String) derives CanEqual
+
+case class MTOptional(name: String, nickname: Option[String]) derives CanEqual
+case class MTAllDefaults(a: Int = 1, b: String = "hello", c: Boolean = false) derives CanEqual
+case class MTNestedDefault(name: String, address: MTAddress = MTAddress("", "", "")) derives CanEqual
+case class MTWithDefault(name: String, age: Int, active: Boolean = true) derives CanEqual
+case class MTThreeField(x: Int, y: String, z: Boolean) derives CanEqual
+case class MTSmallTeam(lead: MTPerson, size: Int) derives CanEqual
+case class MTNamedTeam(name: String, lead: MTPerson, size: Int) derives CanEqual
+
+sealed trait MTShape derives CanEqual, Schema
+case class MTCircle(radius: Double)                   extends MTShape derives CanEqual
+case class MTRectangle(width: Double, height: Double) extends MTShape derives CanEqual
+case class MTDrawing(title: String, shape: MTShape) derives CanEqual, Schema
+
+case class MTDebugConfig(host: String, port: Int = 8080, debug: Boolean = false) derives CanEqual
+case class MTPublicUser(name: String, age: Int) derives CanEqual
+case class MTEmpty() derives CanEqual
+case class MTLarge(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int) derives CanEqual
+case class MTUserName(userName: String, age: Int) derives CanEqual
+case class MTUserResponse(userName: String, age: Int, active: Boolean) derives CanEqual
+case class MTEmailAge(email: String, age: Int) derives CanEqual
+case class MTRegistration(username: String, age: Int, email: String, referralCode: Option[String]) derives CanEqual
+case class MTDisplayUser(displayName: String, age: Int) derives CanEqual
+case class MTStringAge(name: String, age: String) derives CanEqual
+
+// ETL test types
+case class MTRawEvent(userId: String, eventType: String, timestamp: Long, metadata: String) derives CanEqual
+case class MTCleanEvent(user: String, kind: String, ts: String) derives CanEqual
+
+// Migration test types
+case class MTUserV1(name: String, age: Int, email: String) derives CanEqual
+case class MTUserV2(fullName: String, age: Int, email: String, active: Boolean = true) derives CanEqual
+case class MTUserV2NoDefault(fullName: String, age: Int, email: String, role: String) derives CanEqual
+case class MTMigrated(user: String, age: Int, active: Boolean) derives CanEqual
+case class MTMigratedStringAge(name: String, age: String) derives CanEqual
+
+// Generic middleware test type
+case class MTProduct(name: String, price: Double, sku: String) derives CanEqual
+
+// Domain event test types
+case class MTOrderEvent(orderId: String, action: String, amount: Double, timestamp: Long) derives CanEqual
+case class MTAuditEntry(orderId: String, action: String, amount: String, time: Long) derives CanEqual
+
+// Account test type
+case class MTAccount(name: String, email: String, tier: String, score: Int) derives CanEqual
+
+// Contact test type
+case class MTContact(name: String, email: String, phone: String) derives CanEqual
+
+// Versioning test types
+case class MTUserV2WithRole(fullName: String, age: Int, email: String, active: Boolean, role: String) derives CanEqual
+case class MTUserV2Renamed(displayName: String, age: Int, email: String, active: Boolean) derives CanEqual
+case class MTUserV2StringAge(fullName: String, age: String, email: String) derives CanEqual
+
+// Each test types
+case class MTEachItem(name: String, price: Double, tags: Seq[String]) derives CanEqual, Schema
+case class MTEachOrder(id: Int, items: Seq[MTEachItem], note: String) derives CanEqual, Schema
+case class MTWarehouse(name: String, orders: Seq[MTEachOrder]) derives CanEqual, Schema
+case class MTVecOrder(id: Int, items: Vector[MTEachItem]) derives CanEqual, Schema
+case class MTListOrder(id: Int, items: List[MTEachItem]) derives CanEqual, Schema
+
+// Focus composition test types
+case class MTGallery(name: String, drawings: Seq[MTDrawing]) derives CanEqual, Schema
+case class MTDepartment(name: String, team: MTTeam) derives CanEqual, Schema
+
+// Non-derivable types for error message tests
+class MTOpaque(val inner: Int)
+trait MTOpenTrait
+
+// Recursive test types
+case class TreeNode(value: Int, children: List[TreeNode]) derives CanEqual, Schema
+
+case class RTDepartment(name: String, manager: RTEmployee) derives CanEqual
+case class RTEmployee(name: String, department: Maybe[RTDepartment]) derives CanEqual
+
+object RTDepartment:
+    given Schema[RTDepartment] = Schema.derived[RTDepartment]
+
+object RTEmployee:
+    given Schema[RTEmployee] = Schema.derived[RTEmployee]
+
+sealed trait Expr derives CanEqual, Schema
+case class Lit(value: Int)              extends Expr derives CanEqual
+case class Add(left: Expr, right: Expr) extends Expr derives CanEqual
+case class Neg(inner: Expr)             extends Expr derives CanEqual
+
+// Protobuf map/nested-wrapper test types
+case class MTProtoMapHolder(name: String, scores: Map[String, Int]) derives CanEqual
+case class MTListOfOption(name: String, tags: List[Option[Int]]) derives CanEqual
+
+// Discriminator test types
+sealed trait MTStatus derives CanEqual
+case object MTActive                   extends MTStatus derives CanEqual
+case class MTSuspended(reason: String) extends MTStatus derives CanEqual
+
+// Plain two-coordinate product, shared by the codec suites that each declared their own Point.
+case class MTPoint(x: Int, y: Int) derives CanEqual
+
+// dictSchema non-String-key round-trip fixtures, shared by every codec suite. Each entry encodes as
+// a two-field {key, value} record; the two cover a scalar value and a collection value.
+case class MTIntStringDict(d: Dict[Int, String]) derives CanEqual, Schema
+case class MTIntChunkDict(d: Dict[Int, Chunk[String]]) derives CanEqual, Schema
+
+// OrderedDict Schema given round-trip fixtures, shared by every codec suite's insertion-order
+// leaf: MTOrderedDictConfig resolves stringOrderedDictSchema (String key, object wire form) and
+// MTOrderedDictLevels resolves orderedDictSchema (non-String key, array-of-{key,value} wire form).
+case class MTOrderedDictConfig(settings: OrderedDict[String, Int]) derives CanEqual, Schema
+case class MTOrderedDictLevels(byLevel: OrderedDict[Int, String]) derives CanEqual, Schema
+
+// Carries the map between two scalar fields, so a decode that falls back to the absent default for
+// the map still has to read the fields around it.
+case class MTOrderedDictRecord(name: String, settings: OrderedDict[String, Int], count: Int) derives CanEqual, Schema
+
+// String-key Dict holder: resolves stringDictSchema, the object wire form.
+case class MTStringDict(d: Dict[String, Int]) derives CanEqual, Schema
+
+// omitEmptyCollections / .omit(_.f).whenEmpty coverage for OrderedDict and Dict fields, both key
+// shapes. Each record carries the map field between two scalars (name, count), the same shape as
+// MTOrderedDictRecord, so a decode that omits the map field still has to read the fields around it.
+case class MTOrderedDictLevelsRecord(name: String, byLevel: OrderedDict[Int, String], count: Int) derives CanEqual, Schema
+case class MTStringDictRecord(name: String, tags: Dict[String, Int], count: Int) derives CanEqual, Schema
+case class MTIntStringDictRecord(name: String, byId: Dict[Int, String], count: Int) derives CanEqual, Schema
+
+// The same omit coverage for Map, whose two givens split on the key type exactly as Dict's do:
+// stringMapSchema (String key, object wire form) and mapSchema (non-String key, array-of-{key,value}
+// wire form).
+case class MTStringMapRecord(name: String, tags: Map[String, Int], count: Int) derives CanEqual, Schema
+case class MTIntMapRecord(name: String, byId: Map[Int, String], count: Int) derives CanEqual, Schema

@@ -1,25 +1,24 @@
 package kyo
 
-import Tagged.*
 import kyo.Aspect.Cut
 
-class AspectTest extends Test:
+class AspectTest extends kyo.test.Test[Any]:
 
     "one aspect" - {
         val aspect       = Aspect.init[Const[Int], Const[Int], Any]
         def test(v: Int) = aspect(v)(_ + 1)
 
-        "default" in run {
+        "default" in {
             test(1).map(v => assert(v == 2))
         }
 
-        "with cut" in run {
+        "with cut" in {
             aspect.let([C] => (input, cont) => cont(input + 1)) {
                 test(1).map(v => assert(v == 3))
             }
         }
 
-        "sandboxed" in run {
+        "sandboxed" in {
             aspect.let([C] => (input, cont) => cont(input + 1)) {
                 aspect.sandbox {
                     test(1)
@@ -27,7 +26,7 @@ class AspectTest extends Test:
             }
         }
 
-        "nested cuts" in run {
+        "nested cuts" in {
             aspect.let([C] => (input, cont) => cont(input * 3)) {
                 aspect.let([C] => (input, cont) => cont(input + 5)) {
                     test(2).map(v => assert(v == 2 * 3 + 5 + 1))
@@ -37,7 +36,7 @@ class AspectTest extends Test:
     }
 
     "multiple aspects" - {
-        "independent aspects" in run {
+        "independent aspects" in {
             val aspect1 = Aspect.init[Const[Int], Const[Int], Any]
             val aspect2 = Aspect.init[Const[Int], Const[Int], Any]
 
@@ -54,7 +53,7 @@ class AspectTest extends Test:
             }
         }
 
-        "chained aspects" in run {
+        "chained aspects" in {
             val aspect1 = Aspect.init[Const[Int], Const[Int], Any]
             val aspect2 = Aspect.init[Const[Int], Const[Int], Any]
 
@@ -69,7 +68,7 @@ class AspectTest extends Test:
         }
     }
 
-    "use aspect as a cut" in run {
+    "use aspect as a cut" in {
         val aspect1 = Aspect.init[Const[Int], Const[Int], Any]
         val aspect2 = Aspect.init[Const[Int], Const[Int], Any]
 
@@ -86,7 +85,7 @@ class AspectTest extends Test:
         }
     }
 
-    "Cut.andThen" in run {
+    "Cut.andThen" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         val chainedCut = Cut.andThen[Const[Int], Const[Int], Any](
@@ -99,7 +98,7 @@ class AspectTest extends Test:
         }
     }
 
-    "aspect sandbox with multiple aspects" in run {
+    "aspect sandbox with multiple aspects" in {
         val aspect1 = Aspect.init[Const[Int], Const[Int], Any]
         val aspect2 = Aspect.init[Const[Int], Const[Int], Any]
 
@@ -118,7 +117,7 @@ class AspectTest extends Test:
         }
     }
 
-    "nested aspect lets" in run {
+    "nested aspect lets" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         def test(v: Int) = aspect(v)(_ + 1)
@@ -130,7 +129,7 @@ class AspectTest extends Test:
         }
     }
 
-    "aspect order of application" in run {
+    "aspect order of application" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         def test(v: Int) = aspect(v)(_ + 1)
@@ -145,7 +144,7 @@ class AspectTest extends Test:
         }
     }
 
-    "aspect reuse after let" in run {
+    "aspect reuse after let" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         def test(v: Int) = aspect(v)(_ + 1)
@@ -157,7 +156,7 @@ class AspectTest extends Test:
         test(2).map(v => assert(v == 3))
     }
 
-    "aspect chain with identity cut" in run {
+    "aspect chain with identity cut" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         val chainedCut = Cut.andThen[Const[Int], Const[Int], Any](
@@ -170,7 +169,7 @@ class AspectTest extends Test:
         }
     }
 
-    "aspect interaction with effects" in run {
+    "aspect interaction with effects" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Var[Int]]
 
         def test(v: Int) =
@@ -182,12 +181,11 @@ class AspectTest extends Test:
 
         val cut =
             Cut[Const[Int], Const[Int], Var[Int]] {
-                [C] =>
-                    (input, cont) =>
-                        for
-                            _      <- Var.update[Int](_ * 2)
-                            result <- cont(input * 2)
-                        yield result
+                [C] => (input, cont) =>
+                    for
+                        _      <- Var.update[Int](_ * 2)
+                        result <- cont(input * 2)
+                    yield result
             }
 
         Var.run(0) {
@@ -204,7 +202,7 @@ class AspectTest extends Test:
         case class Wrapped[+A, B](value: A, meta: B) derives CanEqual
         case class Container[+A](value: A, meta: String) derives CanEqual
 
-        "with same input/output wrapper" in run {
+        "with same input/output wrapper" in {
             val aspect = Aspect.init[Wrapped[*, String], Wrapped[*, String], Any]
 
             def test[A](v: A) =
@@ -219,7 +217,7 @@ class AspectTest extends Test:
             }
         }
 
-        "with different input/output wrappers" in run {
+        "with different input/output wrappers" in {
             val aspect = Aspect.init[Wrapped[*, String], Container, Any]
 
             def test[A](v: A) = aspect(Wrapped(v, "init"))(w =>
@@ -230,7 +228,8 @@ class AspectTest extends Test:
                 (input, cont) =>
                     if input.meta == "init" then
                         cont(Wrapped(input.value, "modified"))
-                    else cont(input)) {
+                    else cont(input)
+            ) {
                 test[String]("test").map { result =>
                     assert(result.value == "test")
                     assert(result.meta == "modified")
@@ -238,7 +237,7 @@ class AspectTest extends Test:
             }
         }
 
-        "with multiple type parameters" in run {
+        "with multiple type parameters" in {
             case class DataResult[+A, +B](data: A, extra: B) derives CanEqual
 
             val aspect = Aspect.init[Wrapped[*, String], DataResult[*, Int], Any]
@@ -254,7 +253,7 @@ class AspectTest extends Test:
             }
         }
 
-        "sandbox with generic parameters" in run {
+        "sandbox with generic parameters" in {
             val aspect = Aspect.init[[A] =>> Wrapped[A, String], [A] =>> Container[A], Any]
 
             def test[A](v: A) = aspect(Wrapped(v, "init"))(w =>
@@ -271,7 +270,7 @@ class AspectTest extends Test:
         }
     }
 
-    "no binding" in run {
+    "no binding" in {
         val aspect = Aspect.init[Const[Int], Const[Int], Any]
 
         aspect(5)(identity).map { result =>
@@ -281,7 +280,7 @@ class AspectTest extends Test:
 
     "parametrized generic aspects" - {
 
-        "different type instantiations maintain separate cuts" in run {
+        "different type instantiations maintain separate cuts" in {
             def genericAspect[A: Tag]: Aspect[Const[A], Const[A], Any] =
                 Aspect.init[Const[A], Const[A], Any]
 
@@ -303,7 +302,7 @@ class AspectTest extends Test:
             }
         }
 
-        "same generic aspect with different types don't interfere" in run {
+        "same generic aspect with different types don't interfere" in {
             def processingAspect[A: Tag]: Aspect[Const[A], Const[Option[A]], Any] =
                 Aspect.init[Const[A], Const[Option[A]], Any]
 
@@ -312,10 +311,12 @@ class AspectTest extends Test:
 
             intProcessor.let([C] =>
                 (input, cont) =>
-                    if input > 0 then cont(input * 2) else None) {
+                    if input > 0 then cont(input * 2) else None
+            ) {
                 stringProcessor.let([C] =>
                     (input, cont) =>
-                        if input.nonEmpty then cont(input.toUpperCase) else None) {
+                        if input.nonEmpty then cont(input.toUpperCase) else None
+                ) {
                     for
                         r1 <- intProcessor(5)(Some(_))
                         r2 <- intProcessor(-5)(Some(_))
@@ -330,7 +331,7 @@ class AspectTest extends Test:
             }
         }
 
-        "nested generic aspects with same type parameter but different frames" in run {
+        "nested generic aspects with same type parameter but different frames" in {
             def loggingAspect[A: Tag](using Frame): Aspect[Const[A], Const[(A, String)], Any] =
                 Aspect.init[Const[A], Const[(A, String)], Any]
 
@@ -349,7 +350,7 @@ class AspectTest extends Test:
             }
         }
 
-        "generic aspect factory with complex types" in run {
+        "generic aspect factory with complex types" in {
             def validationAspect[A: Tag]: Aspect[Const[A], Const[Either[String, A]], Any] =
                 Aspect.init[Const[A], Const[Either[String, A]], Any]
 
@@ -363,10 +364,12 @@ class AspectTest extends Test:
                     if input.age >= 0 && input.name.nonEmpty then
                         cont(input)
                     else
-                        Left("Invalid user")) {
+                        Left("Invalid user")
+            ) {
                 intValidator.let([C] =>
                     (input, cont) =>
-                        if input >= 0 then cont(input) else Left("Negative number")) {
+                        if input >= 0 then cont(input) else Left("Negative number")
+                ) {
                     for
                         r1 <- userValidator(User("Alice", 25))(Right(_))
                         r2 <- userValidator(User("", -1))(Right(_))

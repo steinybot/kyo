@@ -1,0 +1,97 @@
+name: deploy-site
+# Builds and deploys getkyo.io to GitHub Pages "from Actions". FORWARD-ONLY: renders the docs from
+# the CURRENT checked-out repo (the live root README + each kyo-*/README.md) into latest + the current
+# version path + versions.json, and deploys one Pages artifact. No per-tag README extraction and no
+# historical-version rendering; a future release ships its version going forward. SEPARATE from
+# release.yml (not coupled into the release job). The one-time manual prerequisite (flip repo Pages
+# "Source" to "GitHub Actions") is the user's action; the workflow emits CNAME + .nojekyll so getkyo.io
+# survives the cutover.
+# TRIGGERS: a published release (the tag's checkout IS the released content, so the rendered docs match
+# their version label) and a manual dispatch (to bootstrap the site or preview main). NOT every push to
+# main: a main-push deploy would publish unreleased content under the last release's label, and rebuild
+# the whole site on commits that never touch the docs.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'getkyo/kyo'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      # The deps-<os>- namespace .github/actions/setup uses, not coursier/cache-action's own. That action
+      # keys on the job name, minting another ~1.6 GB entry holding the coursier tree the ci poles already
+      # cache, against a 10 GB per-repo budget where eviction is what pushed the deps and kyo-browser
+      # entries out. ubuntu-latest is the linux-x64 pole.
+      #
+      # restore, not the full cache action: a key is immutable once written, so a consumer with a thinner
+      # tree than a ci leg must not be the one that mints it. The ci legs write; this restores.
+      - uses: ./.github/actions/caches
+        with:
+          os: linux-x64
+          mode: restore
+          browser: false
+      - uses: coursier/setup-action@v3.0.3
+        with:
+          jvm: corretto:25
+          apps: sbt
+      # The site reaches kyo-net through kyo-http, so rendering it compiles kyo-net's C shims. This
+      # workflow does not use .github/actions/setup, so the native build deps are installed here, as
+      # checks.yml does for the same reason.
+      #
+      # liburing (build-time only): the io_uring shim (kyo_uring.c) statically links -luring.
+      - name: Install liburing (Linux)
+        run: bash scripts/apt-install.sh liburing-dev
+      # BoringSSL has to be staged, not stubbed. Without the staged tree build.sbt compiles the
+      # c-boringssl-stub shim, and kyo-net's `Compile / packageBin` runs kyoNetNativeClassifierGuard
+      # (build.sbt), which fails on a stub. The site render needs kyo-net's packageBin, so it trips
+      # the guard even though it publishes nothing.
+      - uses: ./.github/actions/stage-natives
+        with:
+          aeron: 'false'
+          sqlite: 'false'
+          doltlite: 'false'
+      - name: Link the browser bundle (fullLinkJS)
+        run: scripts/sbt.sh compile 'kyo-website-bundleJS/Compile/fullLinkJS'
+      - name: Render and assemble the site from the current repo
+        run: scripts/sbt.sh compile "kyo-websiteJVM/run --out $GITHUB_WORKSPACE/site --repo-root $GITHUB_WORKSPACE"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+  deploy:
+    needs: build
+    if: github.repository == 'getkyo/kyo'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+# Action version pins (@v3/@v4, checkout @v6.0.2, coursier versions) mirror release.yml lines 25 to
+# 37 and the verified upload-pages-artifact + deploy-pages pair. The render is FORWARD-ONLY: WebsiteMain
+# reads the LIVE root README `## Modules` table and each live kyo-*/README.md (WebsiteContent.fromRepo
+# against --repo-root) and serves one current version + /latest/, labelled from the repo's newest
+# release tag; fetch-depth: 0 brings the tags so that label resolves. No `git archive` per-tag
+# extraction and no historical version directories. Each deploy renders the current state; a future
+# release-tag deploy may append a prior version's snapshot via --content.
+# The render command is DOUBLE-quoted so the shell expands $GITHUB_WORKSPACE, and --out/--repo-root are
+# absolute: sbt forks the run with its working directory at kyo-website/jvm, so relative paths would
+# resolve there, not at the workspace, leaving the artifact empty. The render omits --bundle-dir: when
+# absent, WebsiteMain discovers the fullLinkJS output under kyo-website-bundle/js/target/scala-<version>/
+# (the -opt sibling holding main.js), and --repo-root resolves kyo.png, kyo-website/assets/kyo.ico, and
+# the discovered bundle dir from the workspace root.
+# Nothing here writes the generated output back to the repo with git; the site ships only as the Pages artifact.

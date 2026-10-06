@@ -2,14 +2,15 @@ package kyo
 
 import java.io.EOFException
 import java.io.IOException
+import kyo.internal.ConsolePlatformSpecific
 
 /** Represents a console for input and output operations.
   *
-  * The methods that print to the console output and error streams ([[print]], [[printErr]], [[printLine]], [[printLineErr]]) don't return
-  * an [[Abort]] effect because they don't throw exceptions. The behavior is the same as the standard Scala `scala.Console` methods, which
+  * The methods that print to the console output and error streams ([[print]], [[printErr]], [[println]], [[printLineErr]]) don't return an
+  * [[Abort]] effect because they don't throw exceptions. The behavior is the same as the standard Scala `scala.Console` methods, which
   * don't throw exceptions either. The cause is the underlying Java `PrintStream` class implementation, which doesn't throw exceptions when
   * writing to the console output or error streams (see
-  * [[https://stackoverflow.com/questions/297303/printwriter-and-printstream-never-throw-ioexceptions PrintWriter and PrintStream never throw IOExceptions]]
+  * [PrintWriter and PrintStream never throw IOExceptions](https://stackoverflow.com/questions/297303/printwriter-and-printstream-never-throw-ioexceptions)
   * for more details).
   *
   * To check if an error occurred in the console output or error streams, use the [[checkErrors]], which returns a boolean indicating if an
@@ -22,48 +23,48 @@ final case class Console(unsafe: Console.Unsafe):
       * @return
       *   A String representing the line read from the console.
       */
-    def readLine(using Frame): String < (Sync & Abort[IOException]) = Sync.Unsafe(Abort.get(unsafe.readLine()))
+    def readLine(using Frame): String < (Sync & Abort[IOException]) = Sync.Unsafe.defer(Abort.get(unsafe.readLine()))
 
     /** Prints a string to the console without a newline.
       *
       * @param s
       *   The string to print.
       */
-    def print(s: Text)(using Frame): Unit < Sync = Sync.Unsafe(unsafe.print(s.show))
+    def print(s: String)(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.print(s))
 
     /** Prints a string to the console's error stream without a newline.
       *
       * @param s
       *   The string to print to the error stream.
       */
-    def printErr(s: Text)(using Frame): Unit < Sync = Sync.Unsafe(unsafe.printErr(s.show))
+    def printErr(s: String)(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.printErr(s))
 
     /** Prints a string to the console followed by a newline.
       *
       * @param s
       *   The string to print.
       */
-    def println(s: Text)(using Frame): Unit < Sync = Sync.Unsafe(unsafe.printLine(s.show))
+    def println(s: String)(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.printLine(s))
 
     /** Prints a string to the console's error stream followed by a newline.
       *
       * @param s
       *   The string to print to the error stream.
       */
-    def printLineErr(s: Text)(using Frame): Unit < Sync = Sync.Unsafe(unsafe.printLineErr(s.show))
+    def printLineErr(s: String)(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.printLineErr(s))
 
     /** Checks if an error occurred in the console output or error streams.
       *
       * @return
       *   True if an error occurred, false otherwise.
       */
-    def checkErrors(using Frame): Boolean < Sync = Sync.Unsafe(unsafe.checkErrors)
+    def checkErrors(using Frame): Boolean < Sync = Sync.Unsafe.defer(unsafe.checkErrors)
 
     /** Flushes the console output streams.
       *
       * This method ensures that any buffered output is written to the console.
       */
-    def flush(using Frame): Unit < Sync = Sync.Unsafe(unsafe.flush())
+    def flush(using Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.flush())
 end Console
 
 /** Companion object for Console, providing utility methods and a live implementation.
@@ -74,9 +75,9 @@ object Console:
       */
     val live: Console = Console(
         new Unsafe:
-            def readLine()(using AllowUnsafe) =
-                Result.catching[IOException](Maybe(scala.Console.in.readLine()))
-                    .flatMap(_.toResult(Result.fail(new EOFException("Consoles.readLine failed."))))
+            // Standard input is the one stream whose shape differs per platform: JVM and Native read `scala.Console.in`, while Node has no
+            // synchronous stdin at all and reads descriptor 0 directly. The output side is uniform, so only the read is delegated.
+            def readLine()(using AllowUnsafe)              = ConsolePlatformSpecific.readLine()
             def print(s: String)(using AllowUnsafe)        = scala.Console.out.print(s)
             def printErr(s: String)(using AllowUnsafe)     = scala.Console.err.print(s)
             def printLine(s: String)(using AllowUnsafe)    = scala.Console.out.println(s)
@@ -136,11 +137,11 @@ object Console:
       */
     def withIn[A, S](lines: Iterable[String])(v: A < S)(using Frame): A < (Sync & S) =
         Sync.withLocal(local) { console =>
-            val it = lines.iterator
+            val it    = lines.iterator
             val proxy =
                 new Proxy(console.unsafe):
                     override def readLine()(using AllowUnsafe) =
-                        if !it.hasNext then Result.fail(new EOFException("Consoles.readLine failed."))
+                        if !it.hasNext then Result.fail(new EOFException("Console.readLine reached the end of standard input."))
                         else Result.succeed(it.next())
             let(Console(proxy))(v)
         }
@@ -169,7 +170,7 @@ object Console:
         Sync.withLocal(local) { console =>
             val stdOut = new StringBuffer
             val stdErr = new StringBuffer
-            val proxy =
+            val proxy  =
                 new Proxy(console.unsafe):
                     override def print(s: String)(using AllowUnsafe) =
                         stdOut.append(s)

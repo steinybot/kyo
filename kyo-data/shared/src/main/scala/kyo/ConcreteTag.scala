@@ -1,6 +1,5 @@
 package kyo
 
-import kyo.Maybe
 import kyo.internal.ConcreteTagMacro
 import scala.quoted.*
 
@@ -12,6 +11,7 @@ import scala.quoted.*
   * ClassTag.
   *
   * Limitations:
+  *
   *   - Does not support generic types (types with type parameters)
   *   - Cannot represent Null type
   *
@@ -42,9 +42,95 @@ object ConcreteTag:
     case object AnyValTag  extends Element
     case object NothingTag extends Element
 
-    inline given apply[A]: ConcreteTag[A] = ${ ConcreteTagMacro.derive[A] }
+    inline given derive[A]: ConcreteTag[A] = ${ ConcreteTagMacro.derive[A] }
+
+    // Expands the macro on `A` as written rather than summoning: an implicit search treats `String | Null` as `String`, so a summoner
+    // would hand back a String tag where the macro refuses the Null.
+    inline def apply[A]: ConcreteTag[A] = derive[A]
+
+    /** Creates a ConcreteTag from a Java class, mapping primitive classes to their corresponding Primitive tags.
+      *
+      * @param cls
+      *   the Java class
+      * @return
+      *   a ConcreteTag corresponding to the class
+      */
+    def fromClass[A](cls: Class[?]): ConcreteTag[A] =
+        (if cls eq java.lang.Integer.TYPE then IntTag
+         else if cls eq java.lang.Long.TYPE then LongTag
+         else if cls eq java.lang.Double.TYPE then DoubleTag
+         else if cls eq java.lang.Float.TYPE then FloatTag
+         else if cls eq java.lang.Byte.TYPE then ByteTag
+         else if cls eq java.lang.Short.TYPE then ShortTag
+         else if cls eq java.lang.Character.TYPE then CharTag
+         else if cls eq java.lang.Boolean.TYPE then BooleanTag
+         else cls) .asInstanceOf[ConcreteTag[A]]
+    end fromClass
+
+    /** Derives a ConcreteTag from an existing array's component type.
+      *
+      * @param array
+      *   the array to inspect
+      * @return
+      *   a ConcreteTag matching the array's primitive or reference component type
+      */
+    def fromArray[A](array: Array[A]): ConcreteTag[A] =
+        fromClass(array.getClass.getComponentType)
+
+    /** Creates a new array with the correct primitive or reference type.
+      *
+      * Tags without a single class (unions, intersections, literals, `AnyVal`, `Nothing`) allocate `Object` arrays.
+      *
+      * @param len
+      *   the length of the array to create
+      * @param ct
+      *   the ConcreteTag determining the array's component type
+      * @return
+      *   a new array of the appropriate type, or the shared empty array of that type when `len` is zero
+      */
+    def newArray[A](len: Int)(using ct: ConcreteTag[A]): Array[A] =
+        ShallowTag.fromClass[A](ct.toClass).newArray(len)
+
+    /** Copies an array to a new length, preserving the component type.
+      *
+      * @param array
+      *   the source array
+      * @param newLen
+      *   the length of the new array
+      * @return
+      *   a new array with elements copied from the source, or the shared empty array of that type when `newLen` is zero
+      */
+    def copyOf[A](array: Array[A], newLen: Int): Array[A] =
+        val copy = ShallowTag.fromArray(array).newArray(newLen)
+        System.arraycopy(array, 0, copy, 0, Math.min(array.length, newLen))
+        copy
+    end copyOf
 
     extension [A](self: ConcreteTag[A])
+
+        /** Returns the Java class corresponding to this ConcreteTag.
+          *
+          * For primitive tags, returns the primitive class (e.g. `java.lang.Integer.TYPE` for `Int`). For reference types, returns the
+          * class directly. For complex types (Union, Intersection, Literal, AnyVal, Nothing), returns `classOf[AnyRef]`.
+          *
+          * @return
+          *   the Java class for this tag
+          */
+        def toClass: Class[?] =
+            self match
+                case IntTag        => java.lang.Integer.TYPE
+                case LongTag       => java.lang.Long.TYPE
+                case DoubleTag     => java.lang.Double.TYPE
+                case FloatTag      => java.lang.Float.TYPE
+                case ByteTag       => java.lang.Byte.TYPE
+                case ShortTag      => java.lang.Short.TYPE
+                case CharTag       => java.lang.Character.TYPE
+                case BooleanTag    => java.lang.Boolean.TYPE
+                case UnitTag       => java.lang.Void.TYPE
+                case cls: Class[?] => cls
+                case _             => classOf[AnyRef]
+            end match
+        end toClass
 
         /** Checks if the given value is accepted by this ConcreteTag
           *
@@ -62,24 +148,26 @@ object ConcreteTag:
                     case LiteralTag(literal)    => value == literal
                     case NothingTag             => false
                     case UnitTag                => value.isInstanceOf[Unit]
-                    case AnyValTag =>
+                    case AnyValTag              =>
                         value match
                             case (_: Int | _: Long | _: Double | _: Float | _: Byte | _: Short | _: Char | _: Boolean) =>
                                 true
                             case _ =>
                                 val cls = value.getClass
                                 classOf[AnyVal].isAssignableFrom(cls) && (cls ne classOf[AnyVal])
-                    case _: Primitive =>
-                        value match
-                            case _: Int     => self eq IntTag
-                            case _: Long    => self eq LongTag
-                            case _: Double  => self eq DoubleTag
-                            case _: Float   => self eq FloatTag
-                            case _: Byte    => self eq ByteTag
-                            case _: Short   => self eq ShortTag
-                            case _: Char    => self eq CharTag
-                            case _: Boolean => self eq BooleanTag
-                            case _          => false
+                    // Each primitive asks the platform about its own type instead of classifying the
+                    // value first and comparing the answer to this tag. On the JVM the two are the
+                    // same, since the boxes are distinct classes. On JS and Wasm every number is one
+                    // runtime type, so classifying first let the widest match win: `_: Double` answers
+                    // for every number, and FloatTag, ByteTag and ShortTag accepted nothing at all.
+                    case IntTag         => value.isInstanceOf[Int]
+                    case LongTag        => value.isInstanceOf[Long]
+                    case DoubleTag      => value.isInstanceOf[Double]
+                    case FloatTag       => value.isInstanceOf[Float]
+                    case ByteTag        => value.isInstanceOf[Byte]
+                    case ShortTag       => value.isInstanceOf[Short]
+                    case CharTag        => value.isInstanceOf[Char]
+                    case BooleanTag     => value.isInstanceOf[Boolean]
                     case self: Class[?] => self.isInstance(value)
                 end match
             }
@@ -141,19 +229,19 @@ object ConcreteTag:
                 case Union(elements)        => elements.forall(_ <:< that)
                 case Intersection(elements) => elements.exists(_ <:< that)
                 case LiteralTag(value)      => that.accepts(value)
-                case _ =>
+                case _                      =>
                     that match
                         case NothingTag             => false
                         case Union(elements)        => elements.exists(self <:< _)
                         case Intersection(elements) => elements.forall(self <:< _)
                         case LiteralTag(value)      => false
-                        case AnyValTag =>
+                        case AnyValTag              =>
                             self match
                                 case AnyValTag | IntTag | LongTag | DoubleTag | FloatTag | ByteTag | ShortTag | CharTag | BooleanTag | UnitTag =>
                                     true
                                 case _ => false
-                        case UnitTag      => self eq UnitTag
-                        case _: Primitive => self eq that
+                        case UnitTag       => self eq UnitTag
+                        case _: Primitive  => self eq that
                         case cls: Class[?] =>
                             self match
                                 case self: Class[?] => cls.isAssignableFrom(self)
@@ -161,12 +249,19 @@ object ConcreteTag:
             end match
         end <:<
 
-        /** Returns a string representation of this ConcreteTag
+        /** Renders the TYPE this ConcreteTag describes, with no wrapper around it.
+          *
+          * `Int`, `(Int | String)`, `Person`. This is what a message about a value's type should
+          * interpolate, since a sentence already saying "value of type" does not want the tag's own name
+          * repeated inside it. Use [[show]] when the ConcreteTag itself is the subject.
+          *
+          * Unlike `toClass.getSimpleName` this is total and lossless: unions, intersections, literal types
+          * and `Nothing` each render as themselves, where `toClass` collapses all of them to `Object`.
           *
           * @return
-          *   A string describing the structure of this ConcreteTag
+          *   the rendered type, without the enclosing `ConcreteTag[...]`
           */
-        def show: String =
+        def showType: String =
             def showInner(tag: ConcreteTag[Any]): String =
                 given CanEqual[Any, Any] = CanEqual.derived
                 tag match
@@ -188,8 +283,15 @@ object ConcreteTag:
                 end match
             end showInner
 
-            s"ConcreteTag[${showInner(self)}]"
-        end show
+            showInner(self)
+        end showType
+
+        /** Returns a string representation of this ConcreteTag
+          *
+          * @return
+          *   A string describing the structure of this ConcreteTag
+          */
+        def show: String = s"ConcreteTag[$showType]"
     end extension
 
 end ConcreteTag

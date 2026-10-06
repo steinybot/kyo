@@ -3,10 +3,11 @@ package kyo
 import java.util.concurrent.ConcurrentHashMap
 import kyo.Tag.internal.Type.Entry.*
 import kyo.internal.Platform
+import kyo.internal.TagHash
 import kyo.internal.TagMacro
+import kyo.internal.XXHash
 import scala.annotation.tailrec
 import scala.collection.immutable.HashMap
-import scala.util.hashing.MurmurHash3
 
 /** Tag provides a lightweight, efficient representation of types that supports operations like equality checking, subtype testing, and type
   * composition.
@@ -19,6 +20,7 @@ import scala.util.hashing.MurmurHash3
   * time, the derivation has a fallback that constructs type information at runtime.
   *
   * Tag supports a rich set of operations:
+  *
   *   - Type equality testing with =:= and =!=
   *   - Subtype relationship testing with <:< and >:>
   *   - Type composition with & (intersection) and | (union)
@@ -37,7 +39,7 @@ import scala.util.hashing.MurmurHash3
   */
 opaque type Tag[A] = String | Tag.internal.Dynamic
 
-object Tag:
+object Tag extends kyo.internal.TagPlatformSpecific:
 
     import internal.*
 
@@ -56,6 +58,17 @@ object Tag:
       * objects.
       *
       * Within the `kyo` package, this method fails instead of falling back to a dynamic tag for performance reasons.
+      *
+      * Inside the template that declares an opaque type, and inside its companion object, the compiler substitutes the underlying type for
+      * the opaque one wherever it has to infer, and it does so before this macro runs. A tag derived there would describe the underlying
+      * type while every derivation outside the scope describes the opaque type, so the two would disagree and a value handed across that
+      * boundary would be looked up under a different key than it was stored under. Nothing at that point can say which type was meant, so
+      * a derivation whose type mentions the underlying type of an opaque type transparent there is refused, whether it was inferred or
+      * written. Naming the opaque type explicitly in `Tag.derive[X]` always survives the substitution and derives the same tag as
+      * anywhere else. An implicit query such as `Tag[X]` or a `using Tag[X]` parameter may or may not survive, depending on how the
+      * compiler resolves it; when it does not, the derivation is refused rather than misnamed. A `given Tag[X]` must not be defined in
+      * that scope either: it is a `Tag` for the underlying type there and would answer every such query. The remedy for a refusal is to
+      * pass `Tag.derive[X]` explicitly, or to move the derivation out of the scope.
       *
       * @tparam A
       *   The type for which to derive a Tag
@@ -123,13 +136,22 @@ object Tag:
           */
         def erased: Tag[Any] = self.asInstanceOf[Tag[Any]]
 
-        /** Computes a hash code for this Tag based on its type structure. This hash is used in the caching system for subtype checking.
+        /** A content-stable XXH32 hash of this Tag's type, stable across JVM processes.
+          *
+          * Static tags hash the encoded `String` form. Dynamic tags hash their encoded string and
+          * sorted dynamic sub-tag hashes. This is deliberately NOT the decoded `Type`'s `hashCode`,
+          * which is identity-influenced by the `Array`-backed `Span` fields and so is stable only
+          * within a single JVM. Cross-JVM stability is required because kyo-aeron derives aeron stream
+          * ids from this hash, so a publish and a subscribe of the same type in separate JVMs must
+          * hash identically.
           *
           * @return
-          *   A hash code for this Tag
+          *   A content-stable hash code for this Tag's type
           */
         def hash: Int =
-            self.tpe.hashCode()
+            self match
+                case self: String  => XXHash.hash32(self)
+                case self: Dynamic => self.hashCode
 
         /** Retrieves the decoded Type representation of this Tag. If the Tag is already a Type, it is returned directly. If it's an encoded
           * string, it is decoded (with caching) and then returned.
@@ -151,24 +173,24 @@ object Tag:
         def show: String =
             self.tpe.toString()
 
-        /** Fast-path optimization for type equality checking.
+        /** Compare two encoded tags exactly. Which pre-check is worth making before reading the contents differs by an order of magnitude
+          * between platforms, so the comparison itself lives in `TagPlatformSpecific`, whose two halves carry the measurements.
           *
-          * Since the set of statically derived tags is bounded and fixed at compile time, hash code collisions between different types are
-          * extremely unlikely. This method checks for these common cases before falling back to the more expensive full type-based checking
-          * if any of the tags are dynamic.
+          * `eq` answers equal tags before that: a statically derived tag is a string literal, so equal encodings are the same interned
+          * object, and only unequal pairs reach the comparison. It cannot answer alone, because it means value equality on JS and
+          * reference identity on the JVM.
           */
-        private def fastPathEqual[B](that: Tag[B]): Boolean =
-            (self eq that) || {
-                self match
-                    case self: String =>
-                        that match
-                            case that: String =>
-                                self.hashCode == that.hashCode
-                            case _ =>
-                                false
-                    case _ =>
-                        false
-            }
+        private def fastPathEqual[B](that: Tag[B]): Boolean = (self eq that) || {
+            self match
+                case self: String =>
+                    that match
+                        case that: String =>
+                            equalEncodings(self, that)
+                        case _ =>
+                            false
+                case _ =>
+                    false
+        }
 
         /** Checks if this Tag represents a concrete class type (without type parameters).
           *
@@ -217,15 +239,21 @@ object Tag:
                         case NothingEntry                 => "scala.Nothing"
                         case NullEntry                    => "scala.Null"
                         case LiteralEntry(widened, value) => value
-                        case IntersectionEntry(set)       => "(" + set.map(render(owner, _)).mkString(" & ") + ")"
-                        case UnionEntry(set)              => "(" + set.map(render(owner, _)).mkString(" | ") + ")"
+                        case IntersectionEntry(set)       =>
+                            val b = new ChunkBuilder[String]
+                            set.foreach(id => b.addOne(render(owner, id)))
+                            "(" + b.result().sorted.mkString(" & ") + ")"
+                        case UnionEntry(set) =>
+                            val b = new ChunkBuilder[String]
+                            set.foreach(id => b.addOne(render(owner, id)))
+                            "(" + b.result().sorted.mkString(" | ") + ")"
                         case LambdaEntry(params, _, _, body) =>
                             s"[${params.mkString(", ")}] => ${render(owner, body)}"
                         case OpaqueEntry(name, lower, upper, variances, params) =>
                             if params.isEmpty then
                                 s"($name >: ${render(owner, lower)} <: ${render(owner, upper)})"
                             else
-                                val size = variances.size
+                                val size                                                = variances.size
                                 @tailrec def loop(idx: Int, acc: Chunk[String]): String =
                                     if idx == size then acc.mkString(", ")
                                     else loop(idx + 1, acc.append(variances(idx).show + render(owner, params(idx))))
@@ -234,7 +262,7 @@ object Tag:
                             if params.isEmpty then
                                 className
                             else
-                                val size = params.size
+                                val size                                                = params.size
                                 @tailrec def loop(idx: Int, acc: Chunk[String]): String =
                                     if idx == size then acc.mkString(", ")
                                     else loop(idx + 1, acc.append(variances(idx).show + render(owner, params(idx))))
@@ -301,74 +329,62 @@ object Tag:
             else Runtime.getRuntime().availableProcessors() * 8
 
         private val cacheEntries = 128
-        private val cacheSlots   = Array.ofDim[Long](threadSlots, cacheEntries)
+        final private case class Comparison(a: Tag[Any], b: Tag[Any], mode: Mode, result: Boolean)
+        private val cacheSlots: Array[Array[Maybe[Comparison]]] = Array.fill(threadSlots) {
+            Array.fill[Maybe[Comparison]](cacheEntries)(Absent)
+        }
+
+        private def dynamicHashCode(tag: String, map: Map[Entry.Id, Any]): Int =
+            val builder = new java.lang.StringBuilder(tag)
+            map.toSeq.sortBy(_._1).foreach { (key, value) =>
+                val valueHash =
+                    value match
+                        case value: String  => XXHash.hash32(value)
+                        case value: Dynamic => value.hashCode
+                        case value          => value.hashCode
+                builder.append('\u0000').append(key).append('\u0001').append(valueHash)
+            }
+            XXHash.hash32(builder.toString)
+        end dynamicHashCode
 
         final case class Dynamic(tag: String, map: Map[Entry.Id, Any]):
             lazy val tpe          = Type(decode(tag).staticDB, map.asInstanceOf[Map[Type.Entry.Id, Tag[Any]]])
-            override val hashCode = MurmurHash3.productHash(this)
+            override val hashCode = dynamicHashCode(tag, map)
 
         enum Mode(val factor: Int) derives CanEqual:
             case Equality extends Mode(31)
             case Subtype  extends Mode(37)
 
-        /** Determines if one type is a subtype or equal to another, with caching for performance.
+        /** Cache type checks only when the actual compared tags and comparison mode match.
           *
-          * This method uses a thread-local caching strategy to optimize repeated subtype checks. The cache is implemented as an array of
-          * longs for efficiency, where each entry represents a specific type check pair (a <:< b or a =:= b):
-          *
-          *   - Each long value packs both type hash codes together: subtype hash in the upper 32 bits and supertype hash in the lower 32
-          *     bits
-          *   - This combined hash is then scrambled using xor-shift operations to improve distribution and specialize it to either equality
-          *     or sub type checking.
-          *   - The sign of the stored long indicates the result: positive for true, negative for false
-          *   - Zero indicates an unused cache entry
-          *
-          * The implementation has two distinct types of potential collisions:
-          *
-          *   1. Thread slot collisions: Multiple threads may map to the same cache slot based on thread hash code. These collisions only
-          *      affect performance through cache thrashing, not correctness. The cache deliberately avoids synchronization mechanisms, as
-          *      any race conditions would only result in redundant calculations rather than incorrect results.
-          *   2. Type pair hash collisions: Different (tagA, tagB) pairs could theoretically generate the same 64-bit hash. The risk of
-          *      these true hash conflicts is extremely low due to:
-          *      - The large 63-bit effective hash space with over 9 quintillion possible values (1 bit reserved for the result flag)
-          *      - Effective xor-shift mixing that distributes bits throughout the hash
-          *      - The composite nature of the hash (requiring collisions in both subtype and supertype components)
-          *
-          * In the extremely rare case of a true hash collision between different type pairs, an incorrect cached result could be returned.
-          * However, the probability is negligible in practical applications, making this a reasonable tradeoff for the significant
-          * performance benefits of the caching system.
-          *
-          * @param a
-          *   The potential subtype
-          * @param b
-          *   The potential supertype
-          * @return
-          *   true if a is a subtype of b, false otherwise
+          * Hashes choose the slot; they never authorize reuse. A slot holds one immutable comparison, so a racing
+          * replacement can cost a reader its hit but cannot hand it one pair's result under another pair's identity.
+          * The entry's fields are final, which is what lets an unsynchronized slot carry it: a reader that observes
+          * the reference at all observes it fully constructed, and a reader that observes a stale one simply misses.
           */
         def checkTypes[A, B](a: Tag[A], b: Tag[B], mode: Mode): Boolean =
-            var hash = (a.hashCode.toLong << 32) | (b.hashCode & 0xffffffffL)
+            // Use memoized hashes to select a slot, then verify the actual compared tags before reusing a result.
+            var hash = (TagHash.of(a).toLong << 32) | (TagHash.of(b) & 0xffffffffL)
             hash += mode.factor
             hash ^= (hash >>> 30)
             hash *= 0xbf58476d1ce4e5b9L
             hash ^= (hash >>> 27)
             hash &= Long.MaxValue
-            val idx    = (hash & (cacheEntries - 1)).toInt
-            val cache  = cacheSlots(Thread.currentThread().hashCode & (threadSlots - 1))
-            val cached = cache(idx)
-            if hash == cached then
-                true
-            else if hash == -cached then
-                false
-            else
-                val aTpe = a.tpe
-                val bTpe = b.tpe
-                val res =
-                    mode match
-                        case Mode.Equality => isSameType(aTpe, bTpe, aTpe.entryId, bTpe.entryId)
-                        case Mode.Subtype  => isSubType(aTpe, bTpe, aTpe.entryId, bTpe.entryId)
-                cache(idx) = if res then hash else -hash
-                res
-            end if
+            val idx   = (hash & (cacheEntries - 1)).toInt
+            val cache = cacheSlots(Thread.currentThread().hashCode & (threadSlots - 1))
+            cache(idx) match
+                case Present(cached) if (a eq cached.a) && (b eq cached.b) && mode == cached.mode =>
+                    cached.result
+                case _ =>
+                    val aTpe   = a.tpe
+                    val bTpe   = b.tpe
+                    val result =
+                        mode match
+                            case Mode.Equality => isSameType(aTpe, bTpe, aTpe.entryId, bTpe.entryId)
+                            case Mode.Subtype  => isSubType(aTpe, bTpe, aTpe.entryId, bTpe.entryId)
+                    cache(idx) = Present(Comparison(a.erased, b.erased, mode, result))
+                    result
+            end match
         end checkTypes
 
         private def isSubType(aOwner: Type[?], bOwner: Type[?], aId: Entry.Id, bId: Entry.Id): Boolean =
@@ -385,7 +401,7 @@ object Tag:
                 aEntry match
                     case NothingEntry => true
                     case AnyEntry     => bEntry eq AnyEntry
-                    case NullEntry    => true
+                    case NullEntry    => !bEntry.isInstanceOf[LiteralEntry]
 
                     case IntersectionEntry(aSet) =>
                         bEntry match
@@ -412,7 +428,7 @@ object Tag:
 
                     case LambdaEntry(aParams, aLower, aUpper, aBody) =>
                         bEntry match
-                            case AnyEntry => true
+                            case AnyEntry                                    => true
                             case LambdaEntry(bParams, bLower, bUpper, bBody) =>
                                 aParams.size == bParams.size &&
                                 Span.forallZip(aLower, bLower) { (aLowerId, bLowerId) =>
@@ -488,8 +504,7 @@ object Tag:
                 end match
         end isSubType
 
-        private def isSameString(a: String, b: String): Boolean =
-            (a eq b) || (a.hashCode() == b.hashCode() && a.equals(b))
+        private def isSameString(a: String, b: String): Boolean = (a eq b) || (a.hashCode() == b.hashCode() && a.equals(b))
 
         private def isSameType(aOwner: Type[?], bOwner: Type[?], aId: Entry.Id, bId: Entry.Id): Boolean =
             if !aOwner.staticDB.contains(aId) then
@@ -596,7 +611,7 @@ object Tag:
 
         private val decodeFunction: java.util.function.Function[String, Type[?]] =
             (encoded: String) =>
-                val lines = encoded.drop(1).linesIterator // discard concreteFlag
+                val lines    = encoded.drop(1).linesIterator // discard concreteFlag
                 val staticDb =
                     HashMap.empty[Entry.Id, Entry] ++
                         lines.map { encoded =>

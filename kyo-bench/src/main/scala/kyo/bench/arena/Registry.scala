@@ -13,7 +13,7 @@ object Registry:
 
     def loadAll(): Seq[ArenaBench[?]] =
         val packageName = this.getClass.getPackage.getName
-        val classes =
+        val classes     =
             findClasses(packageName).sortBy(_.getSimpleName())
 
         classes.map(cls =>
@@ -28,7 +28,9 @@ object Registry:
     end loadAll
 
     private def findClasses(packageName: String): Seq[Class[?]] =
-        Files.list(Path.of(getClass.getResource(".").getPath().toString().replace("test-", "")))
+        val resourcePath = Path.of(getClass.getResource(".").toURI())
+        val targetPath   = resourcePath.toString.replace("test-", "")
+        Files.list(Path.of(targetPath))
             .collect(Collectors.toList())
             .asScala.toSeq
             .map(_.getFileName.toString)

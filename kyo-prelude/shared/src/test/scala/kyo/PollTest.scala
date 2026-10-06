@@ -2,7 +2,7 @@ package kyo
 
 import kyo.*
 
-class PollTest extends Test:
+class PollTest extends kyo.test.Test[Any]:
 
     "one" - {
         "empty" in {
@@ -127,7 +127,7 @@ class PollTest extends Test:
     }
 
     "runFirst" - {
-        "basic operation" in run {
+        "basic operation" in {
             Abort.run {
                 for
                     cont1  <- Poll.runFirst(Poll.fold[Int](0)(_ + _)).map(Abort.get(_))
@@ -141,7 +141,7 @@ class PollTest extends Test:
             }
         }
 
-        "empty" in run {
+        "empty" in {
             Abort.run {
                 for
                     cont1  <- Poll.runFirst(Poll.andMap[Int](_ => 42)).map(Abort.get(_))
@@ -153,7 +153,7 @@ class PollTest extends Test:
             }
         }
 
-        "with effects" in run {
+        "with effects" in {
             Abort.run {
                 for
                     result <- Var.runTuple(0) {
@@ -199,7 +199,7 @@ class PollTest extends Test:
     "runEmit" - {
         "one" in {
             val result = Poll.runEmit(Emit.value(1))(Poll.one[Int])
-            assert(result.eval == ((), Maybe(1)))
+            assert(result.eval == (Present(()), Maybe(1)))
         }
 
         "two" in {
@@ -209,10 +209,10 @@ class PollTest extends Test:
                     case Present(v) => Maybe(v * 3)
                 }
             }
-            assert(result.eval == ((), Maybe(3)))
+            assert(result.eval == (Absent, Maybe(3)))
         }
 
-        "basic emit-poll cycle" in run {
+        "basic emit-poll cycle" in {
             val emitter =
                 for
                     _ <- Emit.value(1)
@@ -227,10 +227,10 @@ class PollTest extends Test:
                 yield (v1, v2)
 
             val result = Poll.runEmit(emitter)(poller)
-            assert(result.eval == ("emitted", (Maybe(1), Maybe(2))))
+            assert(result.eval == (Absent, (Maybe(1), Maybe(2))))
         }
 
-        "early poller termination" in run {
+        "early poller termination" in {
             val emitter =
                 for
                     _ <- Emit.value(1)
@@ -241,10 +241,10 @@ class PollTest extends Test:
             val poller = Poll.one[Int]
 
             val result = Poll.runEmit(emitter)(poller)
-            assert(result.eval == ("emitted", Maybe(1)))
+            assert(result.eval == (Absent, Maybe(1)))
         }
 
-        "fold with emit" in run {
+        "fold with emit" in {
             val emitter =
                 for
                     _ <- Emit.value(1)
@@ -255,10 +255,10 @@ class PollTest extends Test:
             val poller = Poll.fold[Int](0)(_ + _)
 
             val result = Poll.runEmit(emitter)(poller)
-            assert(result.eval == ("done", 6))
+            assert(result.eval == (Present("done"), 6))
         }
 
-        "interleaved effects" in run {
+        "interleaved effects" in {
             var count = 0
 
             val emitter =
@@ -279,7 +279,7 @@ class PollTest extends Test:
             val result = Var.runTuple(0) {
                 Poll.runEmit(emitter)(poller)
             }
-            assert(result.eval == (3, ("emitted", (Maybe(1), Maybe(2)))))
+            assert(result.eval == (3, (Present("emitted"), (Maybe(1), Maybe(2)))))
         }
     }
 
@@ -303,7 +303,7 @@ class PollTest extends Test:
                 Chunk(t21, t22, t23).collect { case Present(v) => v.str }
             )
 
-        "run" in run {
+        "run" in {
             assert(Poll.run[T.T2](Chunk.empty[T.T2])(Poll.run[T.T1](Chunk(T.T1(0), T.T1(1), T.T1(2)))(poll)).eval == (
                 Chunk(0, 1, 2),
                 Chunk()
@@ -314,20 +314,20 @@ class PollTest extends Test:
             ))
         }
 
-        "runFirst" in run {
+        "runFirst" in {
             val ranFirst = Poll.run(Chunk.empty):
                 Poll.runFirst[T.T2](poll).map:
                     case Right(cont) =>
-                        Poll.runFirst[T.T1](cont(Present(T.T2("zero")))).map:
+                        Poll.runFirst[T.T1](cont(Present(T.T2("zero")): Maybe[T.T2])).map:
                             case Right(cont) =>
-                                Poll.run(Chunk.empty)(cont(Present(T.T1(0))))
+                                Poll.run(Chunk.empty)(cont(Present(T.T1(0)): Maybe[T.T1]))
                             case Left(a) => a
                     case Left(a) => a
 
             assert(ranFirst.eval == (Chunk(0), Chunk("zero")))
         }
 
-        "runEmit" in run {
+        "runEmit" in {
             val emit =
                 for
                     _ <- Emit.value[T.T1](T.T1(0))
@@ -340,9 +340,24 @@ class PollTest extends Test:
 
             assert:
                 Poll.runEmit[T.T1](emit)(poll)
-                    .handle(Poll.run(Chunk.empty[T.T2])(_), Emit.runDiscard[T.T2](_)).eval == ((), (Chunk(0, 1, 2), Chunk()))
+                    .handle(Poll.run(Chunk.empty[T.T2])(_), Emit.runDiscard[T.T2](_)).eval == (Present(()), (Chunk(0, 1, 2), Chunk()))
         }
 
+    }
+
+    "runEmit stops the emitter when the poller completes" - {
+        "the emitter is not continued after the poller completed" in {
+            var emitted = 0
+            val emitter =
+                Emit.valueWith(1) { emitted += 1; () }
+                    .andThen(Emit.valueWith(2) { emitted += 1; () })
+                    .andThen(Emit.valueWith(3) { emitted += 1; () })
+            val res = Poll.runEmit(emitter)(Poll.one[Int]).eval
+            assert(
+                res._2 == Maybe(1) && emitted == 1,
+                s"the emitter was continued after the poller completed: emitted $emitted times, $res"
+            )
+        }
     }
 
 end PollTest

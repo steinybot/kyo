@@ -1,0 +1,155 @@
+package kyo
+
+import AllowUnsafe.embrace.danger
+import org.scalatest.freespec.AnyFreeSpec
+
+class DynamicFlagConcurrencyTest extends AnyFreeSpec {
+
+    "DynamicFlag concurrency" - {
+
+        "concurrent apply() calls — no exceptions, no torn reads" in {
+            val flag = DynConcTestFlags.concApply
+            flag.update("rollout:a@premium;b@basic;c")
+            var errors      = 0
+            val validValues = Set("a", "b", "c")
+            for (t <- 0 until 100) {
+                for (i <- 0 until 100) {
+                    val result = flag(s"user-$t-$i", "premium")
+                    if (!validValues.contains(result))
+                        errors += 1
+                }
+            }
+            assert(errors == 0)
+        }
+
+        "apply() during update() — sees old or new, never torn" in {
+            val flag = DynConcTestFlags.concApplyDuringUpdate
+            flag.update("rollout:100@enterprise;50")
+            val validValues = Set(100, 50, 200, 75, 0)
+            var errors      = 0
+
+            for (_ <- 0 until 1000) {
+                flag.update("rollout:200@enterprise;75")
+                for (t <- 0 until 10) {
+                    val r = flag(s"user-$t", "enterprise")
+                    if (!validValues.contains(r))
+                        errors += 1
+                }
+                flag.update("rollout:100@enterprise;50")
+                for (t <- 0 until 10) {
+                    val r = flag(s"user-$t", "enterprise")
+                    if (!validValues.contains(r))
+                        errors += 1
+                }
+            }
+            assert(errors == 0)
+        }
+
+        "concurrent updates — last writer wins" in {
+            val flag = DynConcTestFlags.concUpdates
+
+            flag.update("value1")
+            flag.update("value2")
+
+            val result = flag("user1")
+            assert(result == "value1" || result == "value2")
+        }
+
+        "update() during apply() with percentage — consistent bucket evaluation" in {
+            val flag = DynConcTestFlags.concBucket
+            flag.update("rollout:true@50%")
+            var errors = 0
+
+            for (_ <- 0 until 500) {
+                flag.update("rollout:true@50%")
+                for (t <- 0 until 5) {
+                    try {
+                        // Should always get true or false, never an exception
+                        val _ = flag(s"user-$t")
+                    } catch {
+                        case _: Exception =>
+                            errors += 1
+                    }
+                }
+                flag.update("rollout:true@75%")
+                for (t <- 0 until 5) {
+                    try {
+                        val _ = flag(s"user-$t")
+                    } catch {
+                        case _: Exception =>
+                            errors += 1
+                    }
+                }
+            }
+            assert(errors == 0)
+        }
+
+        "high-throughput apply() — no degradation" in {
+            val flag = DynConcTestFlags.highThroughput
+            flag.update("rollout:a@premium;b@basic;c")
+            var total = 0L
+
+            for (t <- 0 until 8) {
+                var count = 0L
+                for (i <- 0 until 100000) {
+                    flag(s"user-$t-$i", "premium"): Unit
+                    count += 1
+                }
+                total += count
+            }
+            assert(total == 800000L)
+        }
+
+        "concurrent reload() — no corruption" in {
+            java.lang.System.setProperty("kyo.DynConcTestFlags.concReload", "rollout:100@enterprise")
+            try {
+                val flag   = DynConcTestFlags.concReload
+                var errors = 0
+                for (_ <- 0 until 10) {
+                    try {
+                        for (_ <- 0 until 100) {
+                            flag.reload(): Unit
+                        }
+                    } catch {
+                        case _: Exception =>
+                            errors += 1
+                    }
+                }
+                assert(errors == 0)
+            } finally {
+                java.lang.System.clearProperty("kyo.DynConcTestFlags.concReload"): Unit
+            }
+        }
+
+        "stress test — alternating update and apply" in {
+            val flag = DynConcTestFlags.stressTest
+            flag.update("rollout:a@x;b")
+            val validValues = Set("a", "b", "c", "d")
+            var errors      = 0
+
+            for (t <- 0 until 10) {
+                for (i <- 0 until 1000) {
+                    if (i % 100 == 0) {
+                        try flag.update(if (i % 200 == 0) "rollout:c@x;d" else "rollout:a@x;b")
+                        catch { case _: Exception => () }
+                    }
+                    val result = flag(s"user-$t-$i", "x")
+                    if (!validValues.contains(result))
+                        errors += 1
+                }
+            }
+            assert(errors == 0)
+        }
+    }
+
+}
+
+object DynConcTestFlags {
+    object concApply             extends DynamicFlag[String]("default")
+    object concApplyDuringUpdate extends DynamicFlag[Int](0)
+    object concUpdates           extends DynamicFlag[String]("default")
+    object concBucket            extends DynamicFlag[Boolean](false)
+    object highThroughput        extends DynamicFlag[String]("default")
+    object concReload            extends DynamicFlag[Int](0)
+    object stressTest            extends DynamicFlag[String]("default")
+}

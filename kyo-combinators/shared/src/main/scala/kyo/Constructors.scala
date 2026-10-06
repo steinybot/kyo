@@ -1,6 +1,7 @@
 package kyo
 
 import java.io.IOException
+import kyo.internal.Reducible
 import scala.concurrent.Future
 import scala.util.Failure
 import scala.util.NotGiven
@@ -38,18 +39,19 @@ extension (kyoObject: Kyo.type)
       *   An effect that can be completed by the given register function
       */
     def async[A, E](register: (A < (Abort[E] & Async) => Unit) => Any < (Abort[E] & Async))(using Frame): A < (Abort[E] & Async) =
-        for
-            promise <- Promise.init[A, Abort[E]]
-            registerFn = (eff: A < (Abort[E] & Async)) =>
-                val effFiber = Fiber.initUnscoped(eff)
-                val updatePromise =
-                    effFiber.map(_.onComplete(a => promise.completeDiscard(a)))
-                val updatePromiseIO = Fiber.initUnscoped(updatePromise).unit
+        Promise.initWith[A, Abort[E]] { promise =>
+            val registerFn = (eff: A < (Abort[E] & Async)) =>
                 import AllowUnsafe.embrace.danger
-                Sync.Unsafe.evalOrThrow(updatePromiseIO)
-            _ <- register(registerFn)
-            a <- promise.get
-        yield a
+                // Unsafe: the effect is spawned, wired to the promise, and linked to it in one step, so an interrupt of
+                // the promise stops it and nothing it registered runs on unowned.
+                val effFiber = Fiber.Unsafe.init(eff)
+                effFiber.onComplete(a => promise.unsafe.completeDiscard(a))
+                Fiber.Unsafe.onInterrupt(promise.unsafe)(e => discard(effFiber.interrupt(e)))
+            // The effect runs from the moment it is registered, before the caller reaches the join. Interrupting the
+            // promise whenever this region ends stops the effect wherever an interrupt lands on the caller; after a
+            // completion the interrupt is a no-op.
+            Sync.ensure(promise.interrupt.unit)(register(registerFn).andThen(promise.get))
+        }
 
     /** Creates an effect that attempts to run the given effect and handles any exceptions that occur to Abort[Throwable].
       *
@@ -183,7 +185,7 @@ extension (kyoObject: Kyo.type)
       * @return
       *   An effect that attempts to run the given effect and handles the Future to Async.
       */
-    def fromFuture[A](future: => Future[A])(using Frame): A < (Async & Abort[Throwable]) =
+    def fromFuture[A](future: => Future[A])(using Frame): A < Async =
         Async.fromFuture(future)
 
     /** Creates an effect from a Promise[A] and handles the Promise to Async.
@@ -193,7 +195,7 @@ extension (kyoObject: Kyo.type)
       * @return
       *   An effect that attempts to run the given effect and handles the Promise to Async.
       */
-    def fromPromiseScala[A](promise: => scala.concurrent.Promise[A])(using Frame): A < (Async & Abort[Throwable]) =
+    def fromPromiseScala[A](promise: => scala.concurrent.Promise[A])(using Frame): A < Async =
         fromFuture(promise.future)
 
     /** Creates an effect from a sequence and handles the sequence to Choice.

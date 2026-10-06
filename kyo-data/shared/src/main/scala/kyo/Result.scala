@@ -10,6 +10,7 @@ import scala.util.control.NonFatal
   * maintaining type safety.
   *
   * Result has the following possible states:
+  *
   *   - `Success[A]`: Contains a successful value of type `A`
   *   - `Error[E]`: Base type for both Failure and Panic
   *     - `Failure[E]`: Represents expected errors of type `E`
@@ -18,6 +19,7 @@ import scala.util.control.NonFatal
   * For a narrower version of Result that includes only `Success[A]` and `Failure[E]`, see `Result.Partial[E, A]`.
   *
   * Result provides several groups of operations:
+  *
   *   - Fold operations (`fold`, `foldError`, `foldOrThrow`) for matching on the different states
   *   - Map operations (`map`, `mapError`, `mapFailure`, `mapPanic`) for transforming specific states
   *   - FlatMap operations (`flatMap`, `flatMapError`, `flatMapFailure`, `flatMapPanic`) for sequencing computations and handling errors
@@ -49,6 +51,18 @@ object Result:
 
     import internal.*
 
+    /** Widens a `Success[A]` built by `Success.apply` to the `Result[E, A]` its constructor returns.
+      *
+      * `Success[A] <: Result[E, A]` holds by construction and needs no cast where the opaque types are
+      * transparent. It needs one where they are not: when an inline body below is expanded into user
+      * code and re-checked under `-Xcheck-macros`, the compiler sees `Success` through one inline proxy
+      * and `Result` through another, and does not substitute the proxy across the nesting, so
+      * `Result[E, A]` unfolds to a union naming the un-proxied `Success` and the conformance is
+      * rejected. The cast is erased, both sides being the same representation, and can go once the
+      * compiler expands the proxies of nested opaque types consistently.
+      */
+    private[kyo] inline def widen[E, A](inline v: Success[A]): Result[E, A] = v.asInstanceOf[Result[E, A]]
+
     /** Creates a Result from an expression that might throw an exception.
       *
       * @param expr
@@ -58,7 +72,7 @@ object Result:
       */
     inline def apply[A](inline expr: => A): Result[Nothing, A] =
         try
-            Success(expr)
+            widen(Success(expr))
         catch
             case ex =>
                 Panic(ex)
@@ -156,7 +170,7 @@ object Result:
         using inline ct: ConcreteTag[E]
     )[A](inline expr: => A): Result[E, A] =
         try
-            Success(expr)
+            widen(Success(expr))
         catch
             case ct(ex) => Failure(ex)
             case ex     => Panic(ex)
@@ -175,9 +189,9 @@ object Result:
           */
         def apply[A](value: A): Success[A] =
             value match
-                case v: SuccessError[?]       => v.nest.asInstanceOf[Success[A]]
-                case v: Failure[A] @unchecked => SuccessError(v)
-                case v                        => v
+                case v: SuccessError[?]     => v.nest.asInstanceOf[Success[A]]
+                case v: Error[A] @unchecked => SuccessError(v)
+                case v                      => v
 
         /** Extracts the value from a Success Result.
           *
@@ -397,13 +411,11 @@ object Result:
         /** Gets the successful value or throws the error.
           *
           * @param ev
-          *   Evidence that E is a subtype of Throwable
+          *   Evidence that `E` is a subtype of `Throwable`
           * @return
           *   The successful value
-          * @throws E
-          *   if the Result is a Failure
           * @throws Throwable
-          *   if the Result is a Panic
+          *   if the Result is a Failure (the underlying `E`) or a Panic
           */
         def getOrThrow(
             using
@@ -497,8 +509,8 @@ object Result:
         inline def flatMap[E2, B](inline f: A => Result[E2, B]): Result[E | E2, B] =
             self match
                 case self: Error[E] @unchecked => self
-                case self =>
-                    try f(self.asInstanceOf[Success[A]].getOrThrow)
+                case self                      =>
+                    try f(self.asInstanceOf[Result[Nothing, A]].getOrThrow)
                     catch
                         case ex =>
                             Panic(ex)
@@ -717,20 +729,24 @@ object Result:
     inline given [E, A]: CanEqual[Result[E, A], Panic]                                         = CanEqual.derived
 
     given [E, A, ResultEA <: Result[E, A]](using re: Render[E], ra: Render[A]): Render[ResultEA] with
-        def asText(value: ResultEA): String = value match
-            case Success(a)    => s"Success(${ra.asText(a.asInstanceOf[A])})"
-            case f: Failure[?] => s"Failure(${re.asText(f.failure.asInstanceOf[E])})"
-            case other         => other.toString()
+        def asString(value: ResultEA): String = value match
+            case Success(a)    => s"Success(${ra.asString(a.asInstanceOf[A])})"
+            case f: Failure[?] => s"Failure(${re.asString(f.failure.asInstanceOf[E])})"
+            // A bare `Success(null)` is the raw `null` representation and does not match `Success(a)`, so it reaches
+            // here as a null `other`; String.valueOf renders it as "null" instead of throwing an NPE.
+            case other => String.valueOf(other)
     end given
 
     /** A subtype of Result representing computations that can succeed or fail with an expected error. Result is effectively the Kyo
       * equivalent of Either.
       *
       * Result has the following possible states:
+      *
       *   - `Success[A]`: Contains a successful value of type `A`
       *   - `Failure[E]`: Represents expected errors of type `E`
       *
       * Being a subtype of Result, Result.Partial supports all the operations of Result as a few narrower versions of these methods:
+      *
       *   - foldPartial
       *   - toEitherPartial
       *   - flattenPartial

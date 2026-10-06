@@ -2,34 +2,34 @@ package kyo.scheduler.regulator
 
 import java.util.concurrent.atomic.LongAdder
 import java.util.function.DoubleSupplier
+import kyo.AllowUnsafe.embrace.danger
 import kyo.scheduler.InternalTimer
 import kyo.scheduler.top.RegulatorStatus
 import kyo.scheduler.util.*
-import scala.util.control.NonFatal
 
 /** A self-tuning regulator that dynamically adjusts scheduler behavior based on system performance metrics. This base class provides
   * automatic adjustment of scheduler parameters based on real-time performance measurements and statistical analysis of timing variations.
   *
-  * ==Measurement Collection==
+  * #### Measurement Collection
   *
   * The regulator collects timing measurements through periodic probes at configured intervals. These measurements are stored in a moving
   * window, which provides an efficient way to maintain recent performance history while automatically discarding old data. This approach
   * enables quick detection of emerging performance trends while smoothing out momentary irregularities.
   *
-  * ==Jitter Analysis==
+  * #### Jitter Analysis
   *
   * Collected measurements are analyzed using a moving standard deviation calculation to determine system stability. This "jitter" metric
   * reveals performance characteristics such as sudden instability, ongoing systemic issues, and recovery patterns. The analysis focuses on
   * detecting significant deviations that indicate potential performance problems.
   *
-  * ==Adjustment Mechanism==
+  * #### Adjustment Mechanism
   *
   * Based on the jitter analysis, the regulator makes incremental adjustments to maintain system stability. When jitter exceeds the upper
   * threshold, the regulator adjusts using negative steps. Conversely, when jitter falls below the lower threshold and load meets the
   * target, it adjusts with positive steps. Step sizes increase exponentially with consecutive adjustments in the same direction but reset
   * when the direction changes, providing both responsiveness and stability.
   *
-  * ==Configuration==
+  * #### Configuration
   *
   * The regulator's behavior is controlled through configuration parameters that define the measurement window size, collection and
   * regulation intervals, jitter thresholds, target load, and step escalation rate. These parameters can be tuned to match specific system
@@ -44,6 +44,7 @@ import scala.util.control.NonFatal
   *
   * @note
   *   Implementations must provide probe() and update() methods to define measurement collection and adjustment application respectively.
+  *   Nothing runs until start() is called on the constructed regulator.
   *
   * @see
   *   Config for configuration parameters
@@ -68,6 +69,10 @@ abstract class Regulator(
     private val adjustments     = new LongAdder
     private val updates         = new LongAdder
 
+    // Set by `stop`. The scheduler stops its regulators before its timer executor is shut down, and that shutdown interrupts a probe
+    // still sleeping: an interrupt seen once this is set is the shutdown, not a failure.
+    @volatile private var stopped = false
+
     /** Collect a performance measurement.
       *
       * This method should implement the specific probing mechanism for the regulator. Implementations must call `measure()` with the
@@ -78,20 +83,21 @@ abstract class Regulator(
     /** Apply a regulation adjustment.
       *
       * @param diff
-      *   The size and direction of adjustment to apply Positive values indicate increase Negative values indicate decrease Magnitude
-      *   increases with consecutive adjustments
+      *   The size and direction of adjustment to apply. Positive values indicate increase, negative values indicate decrease. Magnitude
+      *   increases with consecutive adjustments.
       */
     protected def update(diff: Int): Unit
 
     /** Record a measurement value for regulation.
       *
-      * @param v
-      *   The measurement value in nanoseconds
-      *
       * Measurements are used to:
+      *
       *   - Calculate jitter (standard deviation)
       *   - Detect performance anomalies
       *   - Guide adjustment decisions
+      *
+      * @param v
+      *   The measurement value in nanoseconds
       */
     protected def measure(v: Long): Unit = {
         probesCompleted.increment()
@@ -99,28 +105,64 @@ abstract class Regulator(
         synchronized(measurements.observe(v))
     }
 
+    // Scheduled by `start`, never by the constructor: a task scheduled during construction can run before a subclass body is
+    // initialized, and `probe` and `update` read subclass state (Admission's `admissionPercent` would read 0).
+    private var collectTask: InternalTimer.TimerTask  = null
+    private var regulateTask: InternalTimer.TimerTask = null
+
+    /** Start the periodic probes and adjustments.
+      *
+      * Called once the regulator is fully constructed. Later calls, and calls after `stop`, do nothing.
+      *
+      * @return
+      *   This regulator
+      */
+    final def start(): this.type = {
+        synchronized {
+            if (!stopped && collectTask == null) {
+                collectTask = timer.schedule(collectInterval)(collect())
+                regulateTask = timer.schedule(regulateInterval)(adjust())
+            }
+        }
+        this
+    }
+
     /** Stop the regulator.
       *
       * Cancels all scheduled tasks and cleans up resources.
       */
-    def stop(): Unit = {
+    def stop(): Unit = synchronized {
         def discard(v: Any) = {}
-        discard(collectTask.cancel())
-        discard(regulateTask.cancel())
+        stopped = true
+        if (collectTask != null) discard(collectTask.cancel())
+        if (regulateTask != null) discard(regulateTask.cancel())
     }
 
-    private val collectTask =
-        timer.schedule(collectInterval)(collect())
+    protected val statsScope = kyo.scheduler.statsScope.scope("regulator", getClass.getSimpleName().toLowerCase())
 
-    private val regulateTask =
-        timer.schedule(regulateInterval)(adjust())
+    private object stats {
+        val loadavg     = statsScope.histogram("loadavg")
+        val measurement = statsScope.histogram("measurement")
+        val update      = statsScope.histogram("update")
+        val jitter      = statsScope.histogram("jitter")
+        val gauges      = List(
+            statsScope.gauge("probes_sent")(probesSent.sum().toDouble),
+            statsScope.gauge("probes_completed")(probesSent.sum().toDouble),
+            statsScope.gauge("adjustments")(adjustments.sum().toDouble),
+            statsScope.gauge("updates")(updates.sum.toDouble)
+        )
+    }
 
     final private def collect(): Unit = {
         try {
             probesSent.increment()
             probe()
         } catch {
-            case ex if NonFatal(ex) =>
+            case _: InterruptedException if stopped =>
+                Thread.currentThread().interrupt()
+            // Any Throwable, fatal ones included: this runs as a periodic task, and the executor suppresses every later run once
+            // one throws. A probe schedules a task, so it reaches the scheduler's drains.
+            case ex: Throwable =>
                 kyo.scheduler.bug(s"${getClass.getSimpleName()} regulator's probe collection has failed.", ex)
         }
     }
@@ -148,7 +190,7 @@ abstract class Regulator(
 
             if (step != 0) {
                 // Calculate exponential adjustment size based on consecutive steps
-                val pow = Math.pow(Math.abs(step), stepExp).toInt
+                val pow   = Math.pow(Math.abs(step), stepExp).toInt
                 val delta =
                     if (step < 0) -pow
                     else pow
@@ -160,23 +202,12 @@ abstract class Regulator(
             stats.jitter.observe(jitter)
             stats.loadavg.observe(load)
         } catch {
-            case ex if NonFatal(ex) =>
+            case _: InterruptedException if stopped =>
+                Thread.currentThread().interrupt()
+            // Any Throwable, for the same reason as `collect`: one escaping failure would end the adjustments for good.
+            case ex: Throwable =>
                 kyo.scheduler.bug(s"${getClass.getSimpleName()} regulator's adjustment has failed.", ex)
         }
-    }
-    protected val statsScope = kyo.scheduler.statsScope.scope("regulator", getClass.getSimpleName().toLowerCase())
-
-    private object stats {
-        val loadavg     = statsScope.histogram("loadavg")
-        val measurement = statsScope.histogram("measurement")
-        val update      = statsScope.histogram("update")
-        val jitter      = statsScope.histogram("jitter")
-        val gauges = List(
-            statsScope.gauge("probes_sent")(probesSent.sum().toDouble),
-            statsScope.gauge("probes_completed")(probesSent.sum().toDouble),
-            statsScope.gauge("adjustments")(adjustments.sum().toDouble),
-            statsScope.gauge("updates")(updates.sum.toDouble)
-        )
     }
 
     protected def regulatorStatus(): RegulatorStatus =

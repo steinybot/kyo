@@ -1,11 +1,11 @@
 package kyo
 
-class MemoTest extends Test:
+class MemoTest extends kyo.test.Test[Any]:
 
     "apply" - {
         "memoizes pure functions" in {
             var count = 0
-            val f = Memo[Int, Int, Any] { x =>
+            val f     = Memo[Int, Int, Any] { x =>
                 count += 1
                 x * 2
             }
@@ -25,7 +25,7 @@ class MemoTest extends Test:
 
         "memoizes effectful functions" in {
             var count = 0
-            val f = Memo[Int, Int, Env[Int]] { x =>
+            val f     = Memo[Int, Int, Env[Int]] { x =>
                 Env.use[Int] { env =>
                     count += 1
                     x * env
@@ -171,7 +171,7 @@ class MemoTest extends Test:
     "interaction with other effects" - {
         "works with Env" in {
             var count = 0
-            val f = Memo[Int, Int, Env[Int]] { x =>
+            val f     = Memo[Int, Int, Env[Int]] { x =>
                 Env.use[Int] { env =>
                     count += 1
                     x * env
@@ -194,7 +194,7 @@ class MemoTest extends Test:
 
         "works with Abort" in {
             var count = 0
-            val f = Memo[Int, Int, Abort[String]] { x =>
+            val f     = Memo[Int, Int, Abort[String]] { x =>
                 count += 1
                 if x < 0 then Abort.fail("Negative input")
                 else x * 2
@@ -216,7 +216,7 @@ class MemoTest extends Test:
 
         "memoizes effects correctly" in {
             var sideEffect = 0
-            val f = Memo[Int, Int, Env[Int]] { x =>
+            val f          = Memo[Int, Int, Env[Int]] { x =>
                 Env.use[Int] { env =>
                     sideEffect += 1
                     x * env
@@ -245,7 +245,7 @@ class MemoTest extends Test:
 
         "memoizes across different effect combinations" in {
             var count = 0
-            val f = Memo[Int, Int, Env[Int] & Var[String] & Abort[String]] { x =>
+            val f     = Memo[Int, Int, Env[Int] & Var[String] & Abort[String]] { x =>
                 count += 1
                 for
                     env <- Env.get[Int]
@@ -277,9 +277,9 @@ class MemoTest extends Test:
     }
 
     "isolate" - {
-        "combines caches from isolated and outer scopes" in run {
+        "combines caches from isolated and outer scopes" in {
             var count = 0
-            val f = Memo[Int, Int, Any] { x =>
+            val f     = Memo[Int, Int, Any] { x =>
                 count += 1
                 x * 2
             }
@@ -301,9 +301,9 @@ class MemoTest extends Test:
             assert(count == 3)
         }
 
-        "proper state restoration after nested isolations" in run {
+        "proper state restoration after nested isolations" in {
             var count = 0
-            val f = Memo[Int, Int, Any] { x =>
+            val f     = Memo[Int, Int, Any] { x =>
                 count += 1
                 x * 2
             }
@@ -311,11 +311,11 @@ class MemoTest extends Test:
             val result = Memo.run {
                 for
                     start <- f(1)
-                    v1 <- Isolate[Memo, Any, Memo].run {
+                    v1    <- Isolate[Memo, Any, Memo].run {
                         f(2)
                     }
                     middle <- f(3)
-                    v2 <- Isolate[Memo, Any, Memo].run {
+                    v2     <- Isolate[Memo, Any, Memo].run {
                         f(4)
                     }
                     end <- f(5)
@@ -326,9 +326,9 @@ class MemoTest extends Test:
         }
 
         "composition" - {
-            "can combine multiple isolates" in run {
+            "can combine multiple isolates" in {
                 var count = 0
-                val f = Memo[Int, Int, Any] { x =>
+                val f     = Memo[Int, Int, Any] { x =>
                     count += 1
                     x * 2
                 }
@@ -351,9 +351,9 @@ class MemoTest extends Test:
                 assert(count == 2)
             }
 
-            "preserves individual isolation behaviors when composed" in run {
+            "preserves individual isolation behaviors when composed" in {
                 var count = 0
-                val f = Memo[Int, Int, Any] { x =>
+                val f     = Memo[Int, Int, Any] { x =>
                     count += 1
                     x * 2
                 }

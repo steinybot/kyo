@@ -1,0 +1,398 @@
+package kyo
+
+import kyo.*
+import kyo.internal.codec.OpenApiGenerator
+import kyo.internal.server.HttpRouter
+import kyo.internal.server.UnsafeServerDispatch
+import kyo.internal.transport.NetConfigTranslation
+import kyo.net.NetException
+
+/** HTTP server that binds one or more handlers to a port and manages the server lifecycle.
+  *
+  * `HttpServer.init` returns a server managed by `Scope`, it shuts down automatically when the enclosing scope exits. Use
+  * `HttpServer.initUnscoped` when you need manual lifecycle control and must close the server explicitly via `close()`. Both forms accept
+  * one or more `HttpHandler` instances as varargs and an optional `HttpServerConfig`.
+  *
+  * When `HttpServerConfig.openApi` is configured, the server automatically generates an OpenAPI 3.x spec from all registered handlers and
+  * serves it at the configured path (default: `/openapi.json`).
+  *
+  * The `initWith` variants combine `init` and a continuation, they bind the server and pass it to a function, which is useful for keeping
+  * the server reference local to the block that uses it.
+  *
+  * Note: Port 0 tells the OS to assign any available port. After binding, the actual port is available via `server.port`. This is the
+  * recommended approach for tests where port collisions would be a problem.
+  *
+  * A bind failure (for example the address is already in use) is an expected, recoverable condition: `init`, `initUnscoped`, and their
+  * `initWith` variants surface it as `Abort.fail(HttpBindException)`, so a caller can recover it with `Abort.run[HttpBindException]` rather
+  * than handling it as a defect.
+  *
+  * The default host is `127.0.0.1`, so a server is reachable only from the local machine unless configured otherwise. WARNING: binding to
+  * `0.0.0.0` exposes the server on all network interfaces.
+  *
+  * @see
+  *   [[kyo.HttpHandler]] The endpoint implementations to register
+  * @see
+  *   [[kyo.HttpServerConfig]] Controls port, host, content limits, and optional features
+  * @see
+  *   [[kyo.HttpAddress]] The address type returned by `server.address`
+  * @see
+  *   [[kyo.HttpTlsConfig]] TLS termination configuration
+  */
+opaque type HttpServer = HttpServer.Unsafe
+
+object HttpServer:
+
+    extension (self: HttpServer)
+        /** Returns the address the server is bound to. */
+        def address: HttpAddress = self.address
+
+        /** Returns the port the server is listening on. Returns -1 for Unix sockets. */
+        def port: Int = self.port
+
+        /** Returns the host the server is bound to. */
+        def host: String = self.host
+
+        /** Closes the server gracefully: it stops accepting, ends each connection between requests at once and each other one after it
+          * answers the requests it has already received, and completes when every connection has begun closing and the port is released,
+          * so a connect right after it is refused and a rebind of the port succeeds. A connection still open when `gracePeriod` ends is
+          * closed then, interrupting its handler.
+          */
+        def close(gracePeriod: Duration)(using Frame): Unit < Async =
+            Sync.Unsafe.defer(self.closeFiber(gracePeriod).safe.get)
+
+        /** Closes the server with a default grace period (30 seconds). */
+        def close(using Frame): Unit < Async = close(30.seconds)
+
+        /** Closes the server immediately without waiting for in-flight requests. */
+        def closeNow(using Frame): Unit < Async = close(Duration.Zero)
+
+        /** Awaits until the server closes. */
+        def await(using Frame): Unit < Async =
+            Sync.Unsafe.defer(self.awaitFiber.safe.get)
+
+        /** Returns the underlying unsafe server instance. */
+        def unsafe: Unsafe = self
+    end extension
+
+    // --- Scoped init methods ---
+
+    def init(handlers: HttpHandler[?, ?, ?]*)(using Frame): HttpServer < (Async & Scope & Abort[HttpBindException]) =
+        init(HttpServerConfig.default)(handlers*)
+
+    def init(port: Int, host: String)(handlers: HttpHandler[?, ?, ?]*)(using
+        Frame
+    ): HttpServer < (Async & Scope & Abort[HttpBindException]) =
+        init(HttpServerConfig.default.port(port).host(host))(handlers*)
+
+    def init(config: HttpServerConfig)(handlers: HttpHandler[?, ?, ?]*)(using
+        Frame
+    ): HttpServer < (Async & Scope & Abort[HttpBindException]) =
+        // The listener is owned by a scope finalizer registered before the bind's join, reading the bound server from a
+        // cell the bind fills: a plain `Scope.acquireRelease` over the join leaves a window (the JVM bind completes
+        // synchronously) where an abandoned caller strands the listener.
+        Sync.Unsafe.defer(AtomicRef.Unsafe.init(Maybe.empty[HttpServer])).map { serverCell =>
+            Scope.ensure { _ =>
+                Sync.Unsafe.defer(serverCell.get()).map {
+                    case Present(server) => server.closeNow
+                    case Absent          => ()
+                }
+            }.andThen(initInto(config, serverCell)(handlers*))
+        }
+
+    def initWith[A, S](handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Scope & Abort[HttpBindException]) =
+        init(handlers*).map(f)
+
+    def initWith[A, S](port: Int, host: String)(handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Scope & Abort[HttpBindException]) =
+        init(port, host)(handlers*).map(f)
+
+    def initWith[A, S](config: HttpServerConfig)(handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Scope & Abort[HttpBindException]) =
+        init(config)(handlers*).map(f)
+
+    // --- Unscoped init methods ---
+
+    def initUnscoped(handlers: HttpHandler[?, ?, ?]*)(using Frame): HttpServer < (Async & Abort[HttpBindException]) =
+        initUnscoped(HttpServerConfig.default)(handlers*)
+
+    def initUnscoped(port: Int, host: String)(handlers: HttpHandler[?, ?, ?]*)(using
+        Frame
+    ): HttpServer < (Async & Abort[HttpBindException]) =
+        initUnscoped(HttpServerConfig.default.port(port).host(host))(handlers*)
+
+    def initUnscoped(config: HttpServerConfig)(handlers: HttpHandler[?, ?, ?]*)(using
+        Frame
+    ): HttpServer < (Async & Abort[HttpBindException]) =
+        Sync.Unsafe.defer(AtomicRef.Unsafe.init(Maybe.empty[HttpServer])).map(serverCell => initInto(config, serverCell)(handlers*))
+
+    private def initInto(config: HttpServerConfig, serverCell: AtomicRef.Unsafe[Maybe[HttpServer]])(handlers: HttpHandler[?, ?, ?]*)(using
+        Frame
+    ): HttpServer < (Async & Abort[HttpBindException]) =
+        val allHandlers = config.openApi match
+            case Present(ep) =>
+                val spec = OpenApiGenerator.generate(
+                    handlers,
+                    OpenApiGenerator.Config(ep.title, ep.version, ep.description)
+                )
+                val json      = HttpOpenApi.toJson(spec)
+                val jsonBytes = Span.fromUnsafe(json.getBytes("UTF-8"))
+                handlers :+ HttpHandler.init(HttpRoute.getRaw(ep.path).response(_.bodyBinary)) { _ =>
+                    HttpResponse.ok(jsonBytes).addHeader("Content-Type", "application/json")
+                }
+            case Absent =>
+                handlers
+        val serverFilter =
+            if config.autoFilters then HttpFilter.Factory.composedServer
+            else HttpFilter.noop
+        val filteredHandlers =
+            if serverFilter eq HttpFilter.noop then allHandlers
+            else allHandlers.map(h => HttpHandler.withFilter(h, serverFilter))
+        Clock.use { clock =>
+            initListening(config, serverCell, filteredHandlers, clock)
+        }
+    end initInto
+
+    private def initListening(
+        config: HttpServerConfig,
+        serverCell: AtomicRef.Unsafe[Maybe[HttpServer]],
+        filteredHandlers: Seq[HttpHandler[?, ?, ?]],
+        clock: Clock
+    )(using Frame): HttpServer < (Async & Abort[HttpBindException]) =
+        Sync.Unsafe.defer {
+            val transport   = kyo.net.NetPlatform.transport
+            val listenFiber = Unsafe.init(transport, config, filteredHandlers, clock)
+            // The bound server reaches the caller through a promise, with the bind failure already translated, so no
+            // step separates the join from what the caller registers on the value. A caller stopped at the join settles
+            // the promise first; a bind completing afterwards finds nobody to hand the server to and closes it.
+            val bound = Promise.Unsafe.init[HttpServer, Abort[HttpBindException]]()
+            listenFiber.onComplete { result =>
+                result.foldError(
+                    // The cell is set in
+                    // the same step `bound` completes, so `init`'s finalizer finds it whether or not the caller took the handoff.
+                    serverComp =>
+                        val server = serverComp.eval.safe
+                        serverCell.set(Maybe(server))
+                        if !bound.complete(Result.succeed(server)) then discard(server.closeFiber(Duration.Zero))
+                    ,
+                    {
+                        // Type patterns, not the `Failure` extractor: its `unapply` returns `Maybe`, so an extractor match
+                        // is not provably exhaustive over the opaque `Error` union and `-Werror` rejects it.
+                        case panic: Result.Panic                              => bound.completeDiscard(panic)
+                        case failure: Result.Failure[NetException] @unchecked =>
+                            val bindTarget = config.unixSocket match
+                                case Present(path) => path
+                                case Absent        => config.host
+                            bound.completeDiscard(
+                                Result.fail(HttpBindException(bindTarget, config.port, new java.io.IOException(failure.failure.getMessage)))
+                            )
+                    }
+                )
+            }
+            bound.safe.get
+        }
+    end initListening
+
+    def initUnscopedWith[A, S](handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Abort[HttpBindException]) =
+        initUnscoped(handlers*).map(f)
+
+    def initUnscopedWith[A, S](port: Int, host: String)(handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Abort[HttpBindException]) =
+        initUnscoped(port, host)(handlers*).map(f)
+
+    def initUnscopedWith[A, S](config: HttpServerConfig)(handlers: HttpHandler[?, ?, ?]*)(f: HttpServer => A < S)(using
+        Frame
+    ): A < (S & Async & Abort[HttpBindException]) =
+        initUnscoped(config)(handlers*).map(f)
+
+    // --- Unsafe API ---
+
+    /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
+    abstract class Unsafe:
+        /** Returns the port the server is listening on. Returns -1 for Unix sockets. */
+        def port: Int
+
+        /** Returns the host the server is bound to. */
+        def host: String
+
+        /** Returns the address the server is bound to. */
+        def address: HttpAddress
+
+        /** Closes the server as the safe `close` describes. Returns a fiber that completes when every connection has begun closing. */
+        def closeFiber(gracePeriod: Duration)(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Any]
+
+        /** Returns a fiber that completes when the server closes. */
+        def awaitFiber: Fiber.Unsafe[Unit, Any]
+
+        /** Returns the safe wrapper for this unsafe server. */
+        final def safe: HttpServer = this
+    end Unsafe
+
+    /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
+    object Unsafe:
+        /** Creates an unsafe HTTP server using the given transport.
+          *
+          * @param transport
+          *   The transport layer to use for connections
+          * @param config
+          *   Server configuration
+          * @param handlers
+          *   HTTP handlers to register
+          * @param clock
+          *   The clock every connection's idle and lingering timers and the close grace period run on; the safe `init` passes the ambient
+          *   one, so a server started under `Clock.withTimeControl` times its connections on that clock
+          * @return
+          *   A fiber that completes with the unsafe server once bound
+          */
+        def init(
+            transport: kyo.net.Transport,
+            config: HttpServerConfig,
+            handlers: Seq[HttpHandler[?, ?, ?]],
+            clock: Clock
+        )(using AllowUnsafe, Frame): Fiber.Unsafe[Unsafe, Abort[NetException]] =
+            val router = HttpRouter(handlers, config.cors)
+            // Track every accepted connection so the server can close them on shutdown: the transport listener owns only
+            // the listening socket, so an accepted keep-alive connection would otherwise stay open until a 60s idle timer
+            // fires (it leaks whenever the peer keeps its side pooled rather than sending an EOF). The shared registry is
+            // the same mechanism HttpClientBackend uses for the connections it creates.
+            val registry                                = new kyo.internal.ConnectionRegistry[Served]
+            val draining                                = AtomicBoolean.Unsafe.init(false)
+            def tracked(conn: kyo.net.Connection): Unit =
+                // Prune closed entries on accept (no per-connection close hook), then register this one. register closes
+                // the connection itself and returns false when a shutdown races this accept, so the connection is
+                // neither served nor left open, and a failing close is contained inside the registry rather than
+                // surfacing on the accept path.
+                registry.pruneClosed(_.connection.isOpen)
+                val served = Served(conn, UnsafeServerDispatch.Drain(draining))
+                if registry.register(served)(_.connection.close()) then
+                    // Pass the connection's close signal so a handler parked on a foreign await is interrupted when the
+                    // connection closes (kyo.net.Connection.onClosing, completed in closeFn's win branch), plus a close
+                    // hook the idle timer routes through so an idle-close also fires that signal (and flushes the
+                    // outbound tail) instead of racing the WritePump re-entry.
+                    UnsafeServerDispatch.serve(
+                        router,
+                        conn.inbound,
+                        conn.outbound,
+                        config,
+                        Present(conn.onClosing),
+                        Present(() => conn.close()),
+                        clock,
+                        Present(served.drain)
+                    )
+                else
+                    (
+                )
+                end if
+            end tracked
+            val netConfig   = NetConfigTranslation.toNetConfig(config.transportConfig)
+            val listenFiber = (config.unixSocket, config.tls) match
+                case (Present(path), _) =>
+                    transport.listenUnix(path, config.backlog, netConfig)(tracked)
+                case (Absent, Present(tls)) =>
+                    NetConfigTranslation.listenTls(
+                        transport,
+                        config.host,
+                        config.port,
+                        config.backlog,
+                        tls,
+                        config.transportConfig
+                    )(tracked)
+                case _ =>
+                    transport.listen(config.host, config.port, config.backlog, netConfig)(tracked)
+            listenFiber.map(listener => new ListenerUnsafe(listener, transport, registry, draining, clock))
+        end init
+    end Unsafe
+
+    // --- Private implementations ---
+
+    /** An accepted connection and its part in a graceful close. Compared by identity, as the registry's set requires. */
+    final private class Served(val connection: kyo.net.Connection, val drain: UnsafeServerDispatch.Drain)
+
+    /** Unsafe implementation wrapping a Listener from Transport, plus the registry of accepted connections it owns.
+      *
+      * The server does NOT own its transport: one transport is shared by every client and server in the process, so closing the server closes
+      * its listener, which releases the bound port, and its accepted connections, and leaves the transport alone. Closing it would take every
+      * co-tenant's connections down.
+      */
+    final private class ListenerUnsafe(
+        listener: kyo.net.Listener,
+        transport: kyo.net.Transport,
+        registry: kyo.internal.ConnectionRegistry[Served],
+        draining: AtomicBoolean.Unsafe,
+        clock: Clock
+    )(using allow: AllowUnsafe) extends Unsafe:
+        private val closedPromise            = Promise.Unsafe.init[Unit, Any]()
+        private val httpAddress: HttpAddress = NetConfigTranslation.toHttpAddress(listener.address)
+
+        def port: Int = httpAddress match
+            case HttpAddress.Tcp(_, p) => p
+            case HttpAddress.Unix(_)   => -1
+
+        def host: String = httpAddress match
+            case HttpAddress.Tcp(h, _) => h
+            case HttpAddress.Unix(_)   => "localhost"
+
+        def address: HttpAddress = httpAddress
+
+        def closeFiber(gracePeriod: Duration)(using AllowUnsafe, Frame): Fiber.Unsafe[Unit, Any] =
+            listener.close()       // stop accepting new connections first
+            registry.markClosing() // any accept racing the close now closes itself in `tracked` instead of being orphaned
+
+            // The close completes once the connections are settled AND the listen descriptor is released: the listener's close returns
+            // while the port may still accept, and a caller that rebinds the port or expects a refusal right after close must not see it.
+            // `released` is awaited after the connections, since on Node it completes only once every accepted connection has ended.
+            val connectionsSettled = Promise.Unsafe.init[Unit, Any]()
+            connectionsSettled.onComplete(_ =>
+                listener.released.onComplete(_ => discard(closedPromise.completeDiscard(Result.succeed(()))))
+            )
+
+            def forceCloseAndComplete(): Unit =
+                registry.closeAll(_.connection.close())
+                // The transport is NOT closed here. It is process-shared across every client and server using the same settings, so closing it
+                // would take every co-tenant's connections down with this server. What this server owns is its listener (closed above, which
+                // releases the bound port) and its accepted connections (closed just above), and those are what shutting it down must reclaim.
+                discard(connectionsSettled.completeDiscard(Result.succeed(())))
+            end forceCloseAndComplete
+
+            if gracePeriod <= Duration.Zero then
+                // closeNow: force-close every accepted connection at once, the path the Scope finalizer (`_.closeNow`)
+                // takes. Accepted keep-alive connections otherwise outlive the listening socket, held open until the
+                // 60s idle timer fires.
+                forceCloseAndComplete()
+            else
+                // Graceful: a connection between requests ends now, one with requests received after their answers. The close completes
+                // once every connection has begun closing, and what is still open when the grace ends is closed then.
+                draining.set(true)
+                val served          = registry.snapshot
+                val remaining       = AtomicInt.Unsafe.init(served.size + 1)
+                def settled(): Unit =
+                    if remaining.decrementAndGet() == 0 then discard(connectionsSettled.completeDiscard(Result.succeed(())))
+                // An infinite grace never forces the close, so no timer is armed for it.
+                if gracePeriod.isFinite then
+                    val grace = clock.unsafe.sleep(gracePeriod)
+                    grace.onComplete {
+                        case Result.Success(_) => forceCloseAndComplete()
+                        case _                 => () // interrupted once every connection closed
+                    }
+                    connectionsSettled.onComplete(_ => discard(grace.interrupt()))
+                    closedPromise.onComplete(_ => discard(grace.interrupt()))
+                end if
+                served.foreach { s =>
+                    s.drain.endIfIdle()
+                    s.connection.onClosing.onComplete(_ => settled())
+                }
+                settled()
+            end if
+            closedPromise
+        end closeFiber
+
+        def awaitFiber: Fiber.Unsafe[Unit, Any] = closedPromise
+    end ListenerUnsafe
+
+end HttpServer

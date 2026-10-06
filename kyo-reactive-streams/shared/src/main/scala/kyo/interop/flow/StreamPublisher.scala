@@ -20,7 +20,7 @@ abstract private[kyo] class StreamPublisher[V, S](
     end subscribe
 
     private[StreamPublisher] def getSubscription(subscriber: Subscriber[? >: V])(using Frame): StreamSubscription[V, S] < Sync =
-        Sync.Unsafe(new StreamSubscription[V, S](stream, subscriber))
+        Sync.Unsafe.defer(new StreamSubscription[V, S](stream, subscriber))
     end getSubscription
 
 end StreamPublisher
@@ -50,21 +50,42 @@ object StreamPublisher:
             channel: Channel[Subscriber[? >: V]],
             supervisor: Fiber.Promise[Nothing, Unit]
         ): Unit < (Async & S) =
+            // Taking a subscriber out of the channel and setting it up is one indivisible step. In between, the subscriber
+            // holds a live subscription that nothing is yet committed to ending, so an interrupt landing there strands it.
+            // Masking the pair leaves an interrupt only two places to land: before the subscriber leaves the channel, where
+            // the channel's own close discards it, or after the registrations below, which stop it. Taking INSIDE the mask
+            // is what stops a subscriber from being out of the channel and not yet in a subscription at the same time.
+            def setUpOne: Unit < (Abort[Closed] & Async & S) =
+                for
+                    subscriber   <- channel.take
+                    subscription <- publisher.getSubscription(subscriber)
+                    _            <- subscription.subscribe
+                    _            <- supervisor.onInterrupt(_ => Sync.defer(subscription.stop()))
+                    _            <- subscription.consume
+                    // Registering on an ALREADY-settled promise is silently dropped, so a subscription set up while the
+                    // publisher was being torn down would keep no registration at all. Re-reading the supervisor covers
+                    // that. `stop` is idempotent and total, so the ordinary path costs one completed-promise read.
+                    _ <- supervisor.done.map: settled =>
+                        if settled then Sync.defer(subscription.stop())
+                        else Kyo.unit
+                yield ()
+
             Abort.recover[Closed](_ => supervisor.interrupt.unit)(
-                channel.stream().foreach: subscriber =>
-                    for
-                        subscription <- publisher.getSubscription(subscriber)
-                        fiber        <- subscription.subscribe.andThen(subscription.consume)
-                        _            <- supervisor.onInterrupt(_ => fiber.interrupt(Result.Panic(Interrupted(summon[Frame]))))
-                    yield ()
+                Loop.foreach(
+                    Fiber.initUnscoped[Closed, Unit, S, Any](setUpOne)
+                        .map(_.uninterruptible)
+                        .map(_.get)
+                        .andThen(Loop.continue)
+                )
             )
+        end consumeChannel
 
         for
             channel <-
                 Scope.acquireRelease(Channel.init[Subscriber[? >: V]](capacity))(
                     _.close.map(_.foreach(_.foreach(discardSubscriber(_))))
                 )
-            publisher <- Sync.Unsafe {
+            publisher <- Sync.Unsafe.defer {
                 new StreamPublisher[V, S](stream):
                     override protected def bind(
                         subscriber: Subscriber[? >: V]

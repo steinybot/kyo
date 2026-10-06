@@ -1,6 +1,6 @@
 package kyo
 
-class EmitTest extends Test:
+class EmitTest extends kyo.test.Test[Any]:
 
     "int" in {
         val v: String < Emit[Int] =
@@ -69,7 +69,7 @@ class EmitTest extends Test:
 
     "runForeach" - {
         "with pure function" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -82,7 +82,7 @@ class EmitTest extends Test:
         }
 
         "with effects" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -102,7 +102,7 @@ class EmitTest extends Test:
         }
 
         "early termination" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -122,7 +122,7 @@ class EmitTest extends Test:
 
     "runWhile" - {
         "with pure function" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -137,7 +137,7 @@ class EmitTest extends Test:
         }
 
         "with effects" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -156,11 +156,11 @@ class EmitTest extends Test:
                     }
                 }.eval
             assert(seen == List(0, 1, 2, 3, 4))
-            assert(result == (5, ()))
+            assert(result == (5, Absent))
         }
 
         "early termination" in {
-            var seen = List.empty[Int]
+            var seen                            = List.empty[Int]
             def emits(i: Int): Unit < Emit[Int] =
                 if i == 5 then ()
                 else Emit.valueWith(i)(emits(i + 1))
@@ -226,7 +226,7 @@ class EmitTest extends Test:
 
         "with effects" in {
             var count = 0
-            val v =
+            val v     =
                 for
                     _ <- Emit.value(1)
                     _ <- Emit.value(2)
@@ -240,7 +240,7 @@ class EmitTest extends Test:
     }
 
     "runFirst" - {
-        "basic operation" in run {
+        "basic operation" in {
             val v =
                 for
                     _ <- Emit.value(1)
@@ -250,10 +250,10 @@ class EmitTest extends Test:
 
             for
                 (v1, cont1)    <- Emit.runFirst(v)
-                (v2, cont2)    <- Emit.runFirst(cont1())
-                (v3, cont3)    <- Emit.runFirst(cont2())
-                (v4, cont4)    <- Emit.runFirst(cont3())
-                (rest, result) <- Emit.run(cont4())
+                (v2, cont2)    <- Emit.runFirst(cont1(()))
+                (v3, cont3)    <- Emit.runFirst(cont2(()))
+                (v4, cont4)    <- Emit.runFirst(cont3(()))
+                (rest, result) <- Emit.run(cont4(()))
             yield
                 assert(v1.contains(1) && v2.contains(2) && v3.contains(3))
                 assert(v4.isEmpty)
@@ -262,12 +262,12 @@ class EmitTest extends Test:
             end for
         }
 
-        "empty emission" in run {
+        "empty emission" in {
             val v: String < Emit[Int] = "done"
 
             for
                 (v1, cont1)    <- Emit.runFirst(v)
-                (rest, result) <- Emit.run(cont1())
+                (rest, result) <- Emit.run(cont1(()))
             yield
                 assert(v1.isEmpty)
                 assert(rest.isEmpty)
@@ -275,7 +275,7 @@ class EmitTest extends Test:
             end for
         }
 
-        "with effects" in run {
+        "with effects" in {
             val v =
                 for
                     _ <- Emit.value(1)
@@ -288,9 +288,9 @@ class EmitTest extends Test:
                 result <- Var.runTuple(0) {
                     for
                         (v1, cont1)    <- Emit.runFirst(v)
-                        (v2, cont2)    <- Emit.runFirst(cont1())
-                        (v3, cont3)    <- Emit.runFirst(cont2())
-                        (rest, result) <- Emit.run(cont3())
+                        (v2, cont2)    <- Emit.runFirst(cont1(()))
+                        (v3, cont3)    <- Emit.runFirst(cont2(()))
+                        (rest, result) <- Emit.run(cont3(()))
                     yield (v1, v2, v3, rest, result)
                 }
             yield
@@ -433,10 +433,10 @@ class EmitTest extends Test:
 
     "isolate" - {
         "merge" - {
-            "combines emitted values from isolated and outer scopes" in run {
+            "combines emitted values from isolated and outer scopes" in {
                 val result = Emit.run {
                     for
-                        _ <- Emit.value(1)
+                        _        <- Emit.value(1)
                         isolated <- Emit.isolate.merge[Int].run {
                             for
                                 _ <- Emit.value(2)
@@ -449,13 +449,13 @@ class EmitTest extends Test:
                 assert(result.eval == (Chunk(1, 2, 3, 4), "inner"))
             }
 
-            "proper state restoration after nested isolations" in run {
+            "proper state restoration after nested isolations" in {
                 val result = Emit.run {
                     for
-                        _ <- Emit.value("start")
+                        _  <- Emit.value("start")
                         v1 <- Emit.isolate.merge[String].run {
                             for
-                                _ <- Emit.value("inner1")
+                                _  <- Emit.value("inner1")
                                 v2 <- Emit.isolate.merge[String].run {
                                     Emit.value("nested").map(_ => "nested-result")
                                 }
@@ -469,10 +469,10 @@ class EmitTest extends Test:
         }
 
         "discard" - {
-            "inner emissions don't affect outer scope" in run {
+            "inner emissions don't affect outer scope" in {
                 val result = Emit.run {
                     for
-                        _ <- Emit.value(1)
+                        _        <- Emit.value(1)
                         isolated <- Emit.isolate.discard[Int].run {
                             for
                                 _ <- Emit.value(2)
@@ -485,13 +485,13 @@ class EmitTest extends Test:
                 assert(result.eval == (Chunk(1, 4), "inner"))
             }
 
-            "nested discards maintain isolation" in run {
+            "nested discards maintain isolation" in {
                 val result = Emit.run {
                     for
-                        _ <- Emit.value("outer")
+                        _  <- Emit.value("outer")
                         v1 <- Emit.isolate.discard[String].run {
                             for
-                                _ <- Emit.value("discarded1")
+                                _  <- Emit.value("discarded1")
                                 v2 <- Emit.isolate.discard[String].run {
                                     Emit.value("discarded2").map(_ => "nested-result")
                                 }
@@ -505,7 +505,7 @@ class EmitTest extends Test:
         }
 
         "composition" - {
-            "can combine with Var isolate" in run {
+            "can combine with Var isolate" in {
                 val emitIsolate = Emit.isolate.merge[Int]
                 val varIsolate  = Var.isolate.discard[Int]
 
@@ -526,9 +526,9 @@ class EmitTest extends Test:
                 assert(result.eval == (Chunk(1, 1), (0, "done")))
             }
 
-            "can combine with Memo isolate" in run {
+            "can combine with Memo isolate" in {
                 var count = 0
-                val f = Memo[Int, Int, Any] { x =>
+                val f     = Memo[Int, Int, Any] { x =>
                     count += 1
                     x * 2
                 }
@@ -554,7 +554,7 @@ class EmitTest extends Test:
                 assert(count == 1)
             }
 
-            "preserves individual isolation behaviors when composed" in run {
+            "preserves individual isolation behaviors when composed" in {
                 val emitDiscard = Emit.isolate.discard[Int]
                 val emitMerge   = Emit.isolate.merge[Int]
 
@@ -627,7 +627,7 @@ class EmitTest extends Test:
             assert(result == (2, (Chunk(1, 2), "done")))
         }
 
-        "with complex conditions" in run {
+        "with complex conditions" in {
             val isEven     = (n: Int) => n % 2 == 0
             val isPositive = (n: Int) => n > 0
 
@@ -662,18 +662,18 @@ class EmitTest extends Test:
                 _ <- Emit.value[T.T2](T.T2("two"))
             yield ()
 
-        "run" in run {
+        "run" in {
             assert(Emit.runDiscard(Emit.run[T.T1](emit)).eval == (Chunk(T.T1(0), T.T1(1), T.T1(2)), ()))
             assert(Emit.run(Emit.runDiscard[T.T1](emit)).eval == (Chunk(T.T2("zero"), T.T2("one"), T.T2("two")), ()))
         }
 
-        "runForeach" in run {
+        "runForeach" in {
             var chunk = Chunk.empty[T.T1]
             Emit.runDiscard(Emit.runForeach[T.T1](emit)(t1 => chunk = chunk.appended(t1))).eval
             assert(chunk == Chunk(T.T1(0), T.T1(1), T.T1(2)))
         }
 
-        "runWhile" in run {
+        "runWhile" in {
             var chunk = Chunk.empty[T.T1]
             Emit.runDiscard(Emit.runWhile[T.T1](emit)(t1 =>
                 chunk = chunk.appended(t1)
@@ -682,17 +682,107 @@ class EmitTest extends Test:
             assert(chunk == Chunk(T.T1(0), T.T1(1)))
         }
 
-        "runFirst" in run {
+        "runFirst" in {
             val ranFirst = Emit.runDiscard:
                 Emit.runFirst[T.T2](emit).map:
                     case (mv2, cont) =>
-                        Emit.runFirst[T.T1](cont()).map:
+                        Emit.runFirst[T.T1](cont(())).map:
                             case (mv1, cont) =>
-                                Emit.runDiscard(cont())
+                                Emit.runDiscard(cont(()))
                                     .andThen((mv2, mv1))
 
             assert(ranFirst.eval == (Present(T.T2("zero")), Present(T.T1(1))))
         }
 
     }
+
+    "runWhile stops the emitter when the predicate is false" - {
+        // Each `valueWith` side effect runs in the emitter's cont, so a predicate that refuses the first value never resumes it.
+        "the emitter is not continued after the predicate returned false" in {
+            var emitted = 0
+            val emitter =
+                Emit.valueWith(1) { emitted += 1; () }
+                    .andThen(Emit.valueWith(2) { emitted += 1; () })
+                    .andThen(Emit.valueWith(3) { emitted += 1; () })
+            assert(Emit.runWhile(emitter)(_ => false).eval == Absent)
+            assert(emitted == 0, s"the emitter was continued after the predicate returned false: emitted $emitted times")
+        }
+
+        "a predicate that goes false partway stops the emitter there" in {
+            var emitted = 0
+            val emitter =
+                Emit.valueWith(1) { emitted += 1; () }
+                    .andThen(Emit.valueWith(2) { emitted += 1; () })
+                    .andThen(Emit.valueWith(3) { emitted += 1; () })
+            assert(Emit.runWhile(emitter)(v => v < 2).eval == Absent)
+            assert(emitted == 1, s"expected the emitter to advance once and stop: emitted $emitted times")
+        }
+    }
+
+    // Emitting from inside an opaque type's own scope once tagged the effect by the underlying
+    // type, while the handler installed outside was keyed on the opaque one, so the values never
+    // reached it (issue #1367).
+    "across an opaque type's scope boundary" - {
+        import EmitTestOpaques.*
+
+        "values emitted inside are seen by a handler installed outside" in {
+            val (values, _) = Emit.run(Meters.emitInside(Meters(5L), Meters(7L))).eval
+            assert(values.map(Meters.unwrap) == Chunk(5L, 7L))
+        }
+
+        "and a handler installed inside sees values emitted outside" in {
+            val (values, _) = Meters.runInside(Emit.value(Meters(9L))).eval
+            assert(values.map(Meters.unwrap) == Chunk(9L))
+        }
+
+        "the extension method from #1367 emits under the opaque type's tag" - {
+            "with the tag passed explicitly" in {
+                val (values, _) = Emit.run(Meters(3L).emit).eval
+                assert(values.map(Meters.unwrap) == Chunk(3L))
+            }
+            "inferred, with the declared result type" in {
+                val (values, _) = Emit.run[Meters](Meters(3L).emitInferred).eval
+                assert(values.map(Meters.unwrap) == Chunk(3L))
+            }
+            "inferred, without a declared result type" in {
+                val (values, _) = Emit.run[Meters](Meters(3L).emitInferredNoExpected).eval
+                assert(values.map(Meters.unwrap) == Chunk(3L))
+            }
+            "and a handler installed inside the scope sees it too" in {
+                val (values, _) = Meters.runInside(Meters(3L).emitInferred).eval
+                assert(values.map(Meters.unwrap) == Chunk(3L))
+            }
+            "and it is not the underlying type's effect" in {
+                assert(Tag[Emit[Long]] =!= Tag[Emit[Meters]])
+                assert(!(Tag[Emit[Long]] <:< Tag[Emit[Meters]]))
+            }
+        }
+    }
 end EmitTest
+
+object EmitTestOpaques:
+    opaque type Meters = Long
+    object Meters:
+        def apply(value: Long): Meters  = value
+        def unwrap(value: Meters): Long = value
+        // A summoned tag is refused inside the scope; the one derived by name is passed explicitly.
+        val tag: Tag[Emit[Meters]] = Tag.derive[Emit[Meters]]
+
+        def emitInside(a: Meters, b: Meters): Unit < Emit[Meters] =
+            Emit.valueWith(a)(Emit.value(b)(using tag, summon[Frame]).unit)(using tag, summon[Frame])
+
+        def runInside[A, S](v: A < (Emit[Meters] & S)): (Chunk[Meters], A) < S =
+            Emit.run[Meters](using tag, summon[Frame])(v)
+
+        // The shape reported in #1367: an extension method in the companion emitting the value.
+        // Inferred, the value's type reaches the tag macro as Long and the derivation is refused;
+        // with the tag passed explicitly the emitted value reaches a handler installed outside.
+        extension (m: Meters)
+            def emit: Unit < Emit[Meters] = Emit.value(m)(using tag, summon[Frame])
+
+        extension (m: Meters)
+            def emitInferred: Unit < Emit[Meters] = Emit.value(m)
+            def emitInferredNoExpected            = Emit.value(m)
+        end extension
+    end Meters
+end EmitTestOpaques

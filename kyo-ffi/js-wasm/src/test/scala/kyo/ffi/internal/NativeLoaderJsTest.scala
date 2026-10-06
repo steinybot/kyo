@@ -1,0 +1,179 @@
+package kyo.ffi.internal
+
+import kyo.*
+import kyo.discard
+import kyo.ffi.FfiLoadError
+import kyo.ffi.Test
+import scala.scalajs.js as sjs
+
+/** Validates the JS-side resolver precedence, now that each branch is a REAL presence check (not a blind
+  * candidate):
+  *
+  *   1. `process.env.KYO_FFI_<LIBID>_PATH` wins WHEN the file it names exists.
+  *   2. `require.resolve('<packagePrefix>/native/<os>-<arch>/lib<id>.<ext>')` (uses `kyo.ffi.js.packagePrefix`).
+  *   3. Known system libraries resolve to the process-default scope.
+  *   4. A `koffi.load` probe of the bare id (an installed system library resolves here).
+  *   5. None of the above: [[FfiLoadError.LibraryNotFound]].
+  *
+  * The test environment has no installed `@kyo/ffi-native` package and no `koffi`, and the fixture ids name no
+  * installed library, so an unresolvable id raises `LibraryNotFound` rather than silently returning a bad name.
+  */
+class NativeLoaderJsTest extends Test:
+
+    private val libId      = "kyo_test_loader"
+    private val envKey     = s"KYO_FFI_${libId.toUpperCase.replace('-', '_')}_PATH"
+    private val prefixProp = "kyo.ffi.js.packagePrefix"
+
+    // A path that is guaranteed to exist on the Node host: the running node binary itself.
+    private def existingPath: String =
+        sjs.Dynamic.global.process.execPath.asInstanceOf[String]
+
+    "env var KYO_FFI_<ID>_PATH wins when the file it names exists" in {
+        // Even with an obviously missing package prefix, an existing env-path short-circuits resolution.
+        withResolverState(env = Some(existingPath), prefix = Some("@nope/never-installed")) {
+            assert(NativeLoader.jsResolve(libId) == existingPath)
+        }
+    }
+
+    "env var pointing at a missing file is not honored; an unresolvable id raises LibraryNotFound" in {
+        val ex =
+            withResolverState(env = Some("/abs/path/that/does/not/exist/libkyo_test_loader.so"), prefix = Some("@nope/never-installed")) {
+                intercept[FfiLoadError.LibraryNotFound](NativeLoader.jsResolve(libId))
+            }
+        assert(ex.libraryId == libId)
+        assert(ex.candidates.nonEmpty)
+        // The tag is the one the package lookup searched under, which the message names as the package to install.
+        assert(ex.platformTag.nonEmpty && !ex.platformTag.contains("unknown"), s"got '${ex.platformTag}'")
+        assert(ex.getMessage.contains(s"package for ${ex.platformTag}"))
+    }
+
+    "env var naming an existing file is not honored on a host without Node's fs module, which cannot confirm it exists" in {
+        val process = sjs.Dynamic.global.process
+        val saved   = process.getBuiltinModule
+        val ex      = withResolverState(env = Some(existingPath), prefix = Some("@nope/never-installed")) {
+            process.updateDynamic("getBuiltinModule")(sjs.undefined)
+            try intercept[FfiLoadError.LibraryNotFound](NativeLoader.jsResolve(libId))
+            finally process.updateDynamic("getBuiltinModule")(saved)
+        }
+        assert(ex.libraryId == libId)
+    }
+
+    "without env var, an unresolvable package prefix raises LibraryNotFound (no blind bare-name fallback)" in {
+        val ex = withResolverState(env = None, prefix = Some("@nope/never-installed")) {
+            intercept[FfiLoadError.LibraryNotFound](NativeLoader.jsResolve(libId))
+        }
+        assert(ex.libraryId == libId)
+    }
+
+    "the default package prefix is also unresolvable in this test env and raises LibraryNotFound" in {
+        // No env, no override; default is `@kyo/ffi-native`, absent from node_modules for tests.
+        val ex = withResolverState(env = None, prefix = None) {
+            intercept[FfiLoadError.LibraryNotFound](NativeLoader.jsResolve(libId))
+        }
+        assert(ex.libraryId == libId)
+    }
+
+    "envKey computation uppercases and replaces hyphens with underscores" in {
+        val id         = "my-lib-x"
+        val expectedEv = "KYO_FFI_MY_LIB_X_PATH"
+        setEnv(expectedEv, existingPath)
+        try
+            assert(NativeLoader.jsResolve(id) == existingPath)
+        finally
+            clearEnv(expectedEv)
+        end try
+    }
+
+    // --- system-library resolution (libc and friends) ---
+
+    "resolveSystemLib maps known system libraries to the process default scope (null) on POSIX hosts" in {
+        // `null` makes koffi.load bind against the process default symbol scope (RTLD_DEFAULT), which carries
+        // libc / libm / pthread on every POSIX platform.
+        for os <- List("linux", "darwin", "freebsd", "unknown") do
+            assert(NativeLoader.resolveSystemLib("c", os) == Some(null))
+            assert(NativeLoader.resolveSystemLib("m", os) == Some(null))
+            assert(NativeLoader.resolveSystemLib("pthread", os) == Some(null))
+            assert(NativeLoader.resolveSystemLib("dl", os) == Some(null))
+            assert(NativeLoader.resolveSystemLib("rt", os) == Some(null))
+        end for
+    }
+
+    "resolveSystemLib maps the C and math families to the universal CRT on Windows" in {
+        // Windows has no RTLD_DEFAULT-style process scope koffi can bind portably; ucrtbase.dll
+        // carries the standard C and math symbols. The POSIX-only families have no Windows
+        // counterpart and keep the default-scope resolution, failing at symbol lookup.
+        assert(NativeLoader.resolveSystemLib("c", "windows") == Some("ucrtbase.dll"))
+        assert(NativeLoader.resolveSystemLib("m", "windows") == Some("ucrtbase.dll"))
+        assert(NativeLoader.resolveSystemLib("pthread", "windows") == Some(null))
+        assert(NativeLoader.resolveSystemLib("dl", "windows") == Some(null))
+        assert(NativeLoader.resolveSystemLib("rt", "windows") == Some(null))
+    }
+
+    "resolveSystemLib returns None for non-system libraries so they keep bare-name resolution" in {
+        assert(NativeLoader.resolveSystemLib("kyo_test_loader", "linux") == None)
+        assert(NativeLoader.resolveSystemLib("kyonet_posix_uring", "linux") == None)
+        assert(NativeLoader.resolveSystemLib("crypto", "darwin") == None)
+    }
+
+    "jsResolve('c') resolves libc to a loadable system resolution, not the unloadable bare name 'c'" in {
+        // Before the fix this returned the bare id "c", which koffi.load cannot dlopen on Linux glibc
+        // (the loadable SONAME is libc.so.6). POSIX hosts resolve to null (RTLD_DEFAULT); a Windows
+        // host resolves to the universal CRT.
+        val expected = if kyo.internal.Platform.isWindows then "ucrtbase.dll" else null
+        assert(NativeLoader.jsResolve("c") == expected)
+    }
+
+    "jsResolve env-var override still wins over system-library resolution for 'c' when the file exists" in {
+        val cEnvKey = "KYO_FFI_C_PATH"
+        setEnv(cEnvKey, existingPath)
+        try
+            assert(NativeLoader.jsResolve("c") == existingPath)
+        finally
+            clearEnv(cEnvKey)
+        end try
+    }
+
+    "detectOsWith reports musl as its own pole, since a glibc library does not load there" in {
+        val musl = Set("/lib/ld-musl-x86_64.so.1")
+        assert(NativeLoader.detectOsWith("linux", musl.contains) == "linux-musl")
+        assert(NativeLoader.detectOsWith("linux", Set("/lib/ld-musl-aarch64.so.1").contains) == "linux-musl")
+        assert(NativeLoader.detectOsWith("linux", _ => false) == "linux")
+    }
+
+    "detectOsWith maps the platforms Node names to the tags the artifacts are packaged under" in {
+        assert(NativeLoader.detectOsWith("darwin", _ => false) == "darwin")
+        assert(NativeLoader.detectOsWith("win32", _ => false) == "windows")
+        assert(NativeLoader.detectOsWith("freebsd", _ => false) == "freebsd")
+    }
+
+    "detectOsWith does not consult the filesystem off linux, where musl is not a distinction" in {
+        assert(NativeLoader.detectOsWith("darwin", _ => throw new AssertionError("must not probe")) == "darwin")
+    }
+
+    // --- helpers ---
+
+    /** Runs `f` with the resolver's env var and package-prefix property set as given, restoring both before it returns.
+      *
+      * The restore happens inside the leaf's own synchronous body rather than in a scope finalizer: kyo-test interleaves a
+      * suite's leaves, and `process.env` and `sys.props` are process-wide, so state left until the leaf's scope closes is
+      * visible to the next leaf that runs.
+      */
+    private def withResolverState[A](env: Option[String], prefix: Option[String])(f: => A): A =
+        val savedEnv    = Option(sjs.Dynamic.global.process.env.selectDynamic(envKey)).filterNot(sjs.isUndefined).map(_.toString)
+        val savedPrefix = sys.props.get(prefixProp)
+        env.fold(clearEnv(envKey))(setEnv(envKey, _))
+        prefix.fold(discard(sys.props.remove(prefixProp)))(sys.props.update(prefixProp, _))
+        try f
+        finally
+            savedEnv.fold(clearEnv(envKey))(setEnv(envKey, _))
+            savedPrefix.fold(discard(sys.props.remove(prefixProp)))(sys.props.update(prefixProp, _))
+        end try
+    end withResolverState
+
+    private def setEnv(key: String, value: String): Unit =
+        sjs.Dynamic.global.process.env.updateDynamic(key)(value)
+
+    private def clearEnv(key: String): Unit =
+        // In Node.js, assigning `undefined` to a process.env key stores the literal string "undefined"; you must `delete` instead.
+        sjs.special.delete(sjs.Dynamic.global.process.env, key)
+end NativeLoaderJsTest

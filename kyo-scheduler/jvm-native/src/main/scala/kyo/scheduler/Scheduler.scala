@@ -5,49 +5,51 @@ import java.util.ArrayList
 import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.Callable
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.LongAdder
 import java.util.concurrent.locks.LockSupport
 import kyo.scheduler.regulator.Admission
 import kyo.scheduler.regulator.Concurrency
+import kyo.scheduler.top.BusyWorker
 import kyo.scheduler.top.Reporter
 import kyo.scheduler.top.Status
-import kyo.scheduler.util.Flag
 import kyo.scheduler.util.LoomSupport
+import kyo.scheduler.util.Sleep
 import kyo.scheduler.util.Threads
+import kyo.scheduler.util.WorkerExecutors
 import kyo.scheduler.util.XSRandom
 import scala.annotation.nowarn
+import scala.annotation.tailrec
 import scala.concurrent.ExecutionContext
-import scala.util.control.NonFatal
 
 /** A high-performance task scheduler with adaptive concurrency control and admission regulation.
   *
   * The scheduler provides a foundation for concurrent task execution with features including dynamic worker pool sizing, admission control
   * to prevent overload, work stealing for load balancing, task preemption, and comprehensive performance monitoring.
   *
-  * ==Worker Management==
+  * #### Worker Management
   *
   * The scheduler maintains a pool of worker threads that execute tasks. The number of workers adjusts dynamically between configured
   * minimum and maximum bounds based on system load and performance metrics. Workers can steal tasks from each other to balance load across
   * the pool, ensuring efficient resource utilization.
   *
-  * ==Admission Control==
+  * #### Admission Control
   *
   * An admission regulator prevents system overload by selectively rejecting tasks when the system shows signs of congestion. The admission
   * rate adjusts automatically based on measured queuing delays, providing natural backpressure that helps maintain system stability under
   * varying loads.
   *
-  * ==Concurrency Control==
+  * #### Concurrency Control
   *
   * A concurrency regulator continuously monitors system scheduling efficiency through sophisticated timing measurements. By analyzing
   * scheduling delays and system load, it dynamically adjusts the worker pool size to maintain optimal performance. The regulator detects
   * both under-utilization and thread interference, scaling the thread count up or down accordingly.
   *
-  * ==Thread Blocking and Adaptive Concurrency==
+  * #### Thread Blocking and Adaptive Concurrency
   *
   * The scheduler employs a sophisticated approach to handle thread blocking that requires no explicit signaling or special handling from
   * tasks. Instead of treating blocking as an exceptional case, the system embraces it as a natural part of task execution through its
@@ -63,14 +65,14 @@ import scala.util.control.NonFatal
   * worker pool if possible and necessary. As blocked threads resume, the improved scheduling efficiency triggers a gradual reduction in
   * worker count.
   *
-  * ==Loom Integration==
+  * #### Loom Integration
   *
   * The scheduler seamlessly integrates with Java's Project Loom virtual threads when available, providing enhanced scalability for
   * I/O-bound workloads. To enable virtual threads, add the JVM argument '--add-opens=java.base/java.lang=ALL-UNNAMED' and set
   * '-Dkyo.scheduler.virtualizeWorkers=true'. The scheduler transparently manages virtual thread creation and scheduling through the worker
   * executor.
   *
-  * ==Monitoring==
+  * #### Monitoring
   *
   * Comprehensive metrics about scheduler operation are exposed through JMX and optional console reporting, providing detailed insight into
   * worker utilization, task execution, regulation decisions, and system load.
@@ -91,34 +93,64 @@ import scala.util.control.NonFatal
   * @see
   *   Concurrency for concurrency regulation details
   */
-final class Scheduler(
-    workerExecutor: Executor = Scheduler.defaultWorkerExecutor,
-    clockExecutor: Executor = Scheduler.defaultClockExecutor,
-    timerExecutor: ScheduledExecutorService = Scheduler.defaultTimerExecutor,
-    config: Config = Config.default
+final class Scheduler private[scheduler] (
+    workerExecutor: Executor,
+    clockExecutor: Executor,
+    timerExecutor: ScheduledExecutorService,
+    config: Config,
+    clockSource: () => Long
 ) {
+
+    def this(
+        workerExecutor: Executor = Scheduler.defaultWorkerExecutor,
+        clockExecutor: Executor = Scheduler.defaultClockExecutor,
+        timerExecutor: ScheduledExecutorService = Scheduler.defaultTimerExecutor,
+        config: Config = Config.default
+    ) = this(workerExecutor, clockExecutor, timerExecutor, config, () => InternalClock.monotonicMillis())
 
     import config.*
 
     private val pool    = LoomSupport.tryVirtualize(virtualizeWorkers, workerExecutor)
-    private val clock   = new InternalClock(clockExecutor)
+    private val clock   = new InternalClock(clockExecutor, clockSource)
     private val workers = new Array[Worker](maxWorkers)
     private val flushes = new LongAdder
+    // Declared before cycleTask, which starts the loop that writes them: an initializer that ran after the loop started would
+    // overwrite what it wrote. `cycleThread` lets tests aim at the cycle's own work, since other threads check worker
+    // availability too.
+    private[scheduler] val cycleFailures                 = new LongAdder
+    private[scheduler] val placementFallbacks            = new LongAdder
+    @volatile private[scheduler] var cycleThread: Thread = null
 
     @volatile private var allocatedWorkers = 0
     @volatile private var currentWorkers   = coreWorkers
+
+    // Initialized before ensureWorkers(): each worker's rebalance() reads interruptEpoch through
+    // currentInterruptEpoch(), and a worker can begin running before this constructor completes
+    // (observed on Scala Native), so the field must already hold its AtomicLong when the first
+    // worker runs. Declaring it after ensureWorkers() let a worker read a null reference.
+    private val interruptEpoch = new AtomicLong(0L)
 
     ensureWorkers()
 
     private val timer = InternalTimer(timerExecutor)
 
     private val admissionRegulator =
-        new Admission(() => loadAvg(), schedule, () => System.currentTimeMillis, timer)
+        new Admission(() => loadAvg(), schedule, () => InternalClock.monotonicMillis(), timer).start()
 
     private val concurrencyRegulator =
-        new Concurrency(() => loadAvg(), updateWorkers, Thread.sleep(_), () => System.nanoTime, timer)
+        new Concurrency(() => loadAvg(), updateWorkers, Sleep(_), () => System.nanoTime, timer).start()
 
-    private val top = new Reporter(status, enableTopJMX, enableTopConsoleMs, timer)
+    private val top = new Reporter(status, enableTopJMX, enableTopConsoleMs, topStatusFile, topStatusFileMs)
+
+    private[scheduler] val blockingMonitor = new BlockingMonitor(workers, () => currentWorkers, maxWorkers, timerExecutor)
+
+    /** Records a real interrupt: bumps the interrupt epoch (consumed by each worker's rebalance gate
+      * to re-heapify queued tasks) and wakes the blocking monitor for an immediate scan.
+      */
+    def notifyInterrupt(): Unit = {
+        interruptEpoch.incrementAndGet()
+        blockingMonitor.wake()
+    }
 
     /** Schedules a task for execution by the scheduler.
       *
@@ -130,6 +162,23 @@ final class Scheduler(
       */
     def schedule(task: Task): Unit =
         schedule(task, null)
+
+    /** Schedules a task, preferring a worker other than the caller's current one.
+      *
+      * Intended for a task that parks its carrier in a blocking wait and re-arms itself each cycle, such as an I/O driver's readiness poll. The
+      * plain `schedule` would place the successor on the caller's own worker (the `Worker.current()` fast path), so the carrier that just
+      * finished a cycle would immediately park again with the completions it produced queued behind it. Excluding the caller lets that carrier
+      * drain those completions while a different one takes the next wait.
+      *
+      * Placement is best effort, not a guarantee: the search skips the caller and unavailable workers, but the random placement used when no
+      * other worker is available does not. A task that lands on the caller is not stranded: the worker attempts a steal whenever its own queue
+      * empties and only goes idle when that steal also comes back empty, and while it stays parked past its slice the cycle drains its queue.
+      *
+      * @param task
+      *   The task to schedule for execution
+      */
+    def scheduleExcludingCurrent(task: Task): Unit =
+        schedule(task, Worker.current())
 
     /** Tests if a new task should be rejected based on current system conditions.
       *
@@ -255,9 +304,31 @@ final class Scheduler(
       * Implements a work-stealing load balancing strategy:
       *   - If submitted by a worker, tries to execute on that worker first
       *   - Otherwise samples a subset of workers to find one with minimal load
-      *   - Falls back to random worker assignment if no suitable worker found
+      *   - Scans the remaining workers for any available one when the sample holds none
+      *   - Falls back to random worker assignment only when no worker is available
       */
     private def schedule(task: Task, submitter: Worker): Unit = {
+        val worker =
+            try selectWorker(submitter)
+            catch {
+                case ex: Throwable =>
+                    // The scan checks availability, which preempts and drains other workers. A drain hands this task here after
+                    // taking it off its queue, so it exists nowhere else: place it before the failure propagates.
+                    placementFallbacks.increment()
+                    randomWorker().enqueue(task)
+                    throw ex
+            }
+        worker.enqueue(task)
+    }
+
+    private def randomWorker(): Worker = {
+        var worker: Worker = null
+        while (worker eq null)
+            worker = workers(XSRandom.nextInt(currentWorkers))
+        worker
+    }
+
+    private def selectWorker(submitter: Worker): Worker = {
         val nowMs          = clock.currentMillis()
         var worker: Worker = null
         if (submitter eq null) {
@@ -269,8 +340,13 @@ final class Scheduler(
             val currentWorkers = this.currentWorkers
             var position       = XSRandom.nextInt(currentWorkers)
             var stride         = Math.min(currentWorkers, scheduleStride)
-            var minLoad        = Int.MaxValue
-            while (stride > 0 && minLoad != 0) {
+            // Samples `stride` workers for the least loaded available one. When the sample holds no available worker, the
+            // scan goes on over the remaining workers, so the random placement below is reached only when no worker at all
+            // is available: a task placed on an unavailable worker waits for that worker's task to yield, or for the cycle
+            // to drain it.
+            var remaining = currentWorkers
+            var minLoad   = Int.MaxValue
+            while (remaining > 0 && minLoad != 0 && (stride > 0 || (worker eq null))) {
                 val candidate = workers(position)
                 if (
                     (candidate ne null) &&
@@ -287,11 +363,10 @@ final class Scheduler(
                 if (position == currentWorkers)
                     position = 0
                 stride -= 1
+                remaining -= 1
             }
         }
-        while (worker eq null)
-            worker = workers(XSRandom.nextInt(currentWorkers))
-        worker.enqueue(task)
+        if (worker eq null) randomWorker() else worker
     }
 
     /** Attempts to steal a task from another worker with higher load.
@@ -367,6 +442,24 @@ final class Scheduler(
         sum.toDouble / currentWorkers
     }
 
+    /** The allocated workers holding work, queued or executing.
+      *
+      * Unlike [[loadAvg]], this reads past the regulator's current window: a worker the window shrank away from keeps running the task it
+      * holds until that task yields, so a probe for work that never ends has to see it.
+      */
+    def busyWorkers(): Int = {
+        val allocated = this.allocatedWorkers
+        var position  = 0
+        var busy      = 0
+        while (position < allocated) {
+            val w = workers(position)
+            if ((w ne null) && w.load() > 0)
+                busy += 1
+            position += 1
+        }
+        busy
+    }
+
     /** Shuts down the scheduler and releases resources.
       *
       * Stops all internal threads, cancels pending tasks, and cleans up monitoring systems. The scheduler cannot be restarted after
@@ -374,8 +467,10 @@ final class Scheduler(
       */
     def shutdown(): Unit = {
         cycleTask.cancel(true)
+        blockingMonitor.stop()
         admissionRegulator.stop()
         concurrencyRegulator.stop()
+        clock.stop()
         top.close()
     }
 
@@ -386,9 +481,38 @@ final class Scheduler(
       *   - Decreases workers when detecting scheduling delays
       *   - Maintains count between minWorkers and maxWorkers
       */
-    private def updateWorkers(delta: Int) = {
-        currentWorkers = Math.max(minWorkers, Math.min(maxWorkers, currentWorkers + delta))
+    private[scheduler] def updateWorkers(delta: Int) = {
+        // Blocked-carrier floor: never let the worker count sit below the number of blocked carriers plus minWorkers, so
+        // blocked carriers (parked I/O drivers, blocking fibers) cannot starve runnable work even when the concurrency
+        // regulator, reading host jitter, would otherwise fail to grow or shrink the pool below the blocked count. When
+        // nothing is blocked the floor is minWorkers (the unchanged idle sizing).
+        val floor    = Math.min(maxWorkers, blockedWorkerCount() + minWorkers)
+        val previous = currentWorkers
+        val next     = Math.max(floor, Math.min(maxWorkers, previous + delta))
+        currentWorkers = next
         ensureWorkers()
+        // An excluded worker polls its queue only once its current task returns, so without this drain a task queued behind a parked
+        // carrier stays there with no consumer. It runs after the new count is published, so the drained tasks are placed inside it.
+        var position = next
+        while (position < previous) {
+            val worker = workers(position)
+            if (worker ne null)
+                worker.drain()
+            position += 1
+        }
+    }
+
+    /** Counts the active workers currently flagged blocked (parked in a syscall or on a lock), as maintained by the
+      * BlockingMonitor. Read by updateWorkers to floor the worker count at blocked + minWorkers.
+      */
+    private def blockedWorkerCount(): Int = {
+        @tailrec def loop(i: Int, acc: Int): Int =
+            if (i >= currentWorkers) acc
+            else {
+                val w = workers(i)
+                loop(i + 1, if ((w ne null) && w.blocked) acc + 1 else acc)
+            }
+        loop(0, 0)
     }
 
     /** Ensures required number of workers are allocated and initialized.
@@ -402,7 +526,8 @@ final class Scheduler(
         for (idx <- allocatedWorkers until currentWorkers) {
             workers(idx) =
                 new Worker(idx, pool, schedule, steal, clock, timeSliceMs) {
-                    def shouldStop(): Boolean = idx >= currentWorkers
+                    def shouldStop(): Boolean         = idx >= currentWorkers
+                    def currentInterruptEpoch(): Long = interruptEpoch.get()
                 }
             allocatedWorkers += 1
         }
@@ -412,10 +537,12 @@ final class Scheduler(
             (
                 () => {
                     val thread = Thread.currentThread()
+                    cycleThread = thread
                     while (!thread.isInterrupted()) {
                         cycleWorkers()
                         LockSupport.parkNanos(cycleIntervalNs)
                     }
+                    Thread.interrupted(): Unit
                 }
             ): Callable[Unit]
         )
@@ -429,11 +556,13 @@ final class Scheduler(
       *
       * Critical for work stealing and load balancing decisions.
       */
-    private def cycleWorkers(): Unit = {
+    private[scheduler] def cycleWorkers(): Unit = {
         try {
             val nowMs    = clock.currentMillis()
             var position = 0
-            while (position < currentWorkers) {
+            // Every allocated worker, while placement and steal stop at the window: a worker outside it can still hold a parked task
+            // with work queued behind it, and this drain is the one path that moves that work back into the window.
+            while (position < allocatedWorkers) {
                 val worker = workers(position)
                 if (worker ne null) {
                     val _ = worker.checkAvailability(nowMs)
@@ -441,7 +570,10 @@ final class Scheduler(
                 position += 1
             }
         } catch {
-            case ex if NonFatal(ex) =>
+            // Any Throwable, fatal ones included: this runs as one long-lived loop that nothing restarts, and without it no worker
+            // is detected as stalled, preempted or drained again. A StackOverflowError has unwound by the time it lands here.
+            case ex: Throwable =>
+                cycleFailures.increment()
                 bug(s"Worker cyclying has failed.", ex)
         }
     }
@@ -452,7 +584,9 @@ final class Scheduler(
             statsScope.gauge("current_workers")(currentWorkers),
             statsScope.gauge("allocated_workers")(allocatedWorkers),
             statsScope.gauge("load_avg")(loadAvg()),
-            statsScope.gauge("flushes")(flushes.sum().toDouble)
+            statsScope.gauge("flushes")(flushes.sum().toDouble),
+            statsScope.gauge("loop_failures")((cycleFailures.sum() + blockingMonitor.failures.sum()).toDouble),
+            statsScope.gauge("placement_fallbacks")(placementFallbacks.sum().toDouble)
         )
 
     def status(): Status = {
@@ -480,13 +614,43 @@ final class Scheduler(
             concurrencyRegulator.status()
         )
     }
+
+    /** Per-busy-worker fiber attribution for the end-of-run leak probe: one [[kyo.scheduler.top.BusyWorker]] for every
+      * worker that holds work (`load > 0`) at call time, each carrying the worker's mount thread name and the rendered
+      * kyo Trace of the task it is running (or "" when that task carries no kyo trace).
+      *
+      * Covers EVERY busy worker, in worker-index order, not just the first. Total: it never throws, even while a worker
+      * thread concurrently completes its task or nulls a trace; a worker that goes idle between the load read and the
+      * task read contributes nothing. This is a leak-probe diagnostic, not a monitoring surface: it renders a kyo trace
+      * per busy worker, so it is called once at a leak finding, never on a hot path.
+      */
+    def busyFiberTraces(): Seq[BusyWorker] = {
+        val out = Seq.newBuilder[BusyWorker]
+        var i   = 0
+        while (i < allocatedWorkers) {
+            val w = workers(i)
+            if ((w ne null) && w.load() > 0) {
+                val t         = w.currentTask
+                val m         = w.mount
+                val mountName = if (m ne null) m.getName() else ""
+                out += BusyWorker(mountName, if (t ne null) t.fiberTrace() else "")
+            }
+            i += 1
+        }
+        out.result()
+    }
 }
 
 object Scheduler {
 
-    private lazy val defaultWorkerExecutor = Executors.newCachedThreadPool(Threads("kyo-scheduler-worker", new Worker.WorkerThread(_)))
-    private lazy val defaultClockExecutor  = Executors.newSingleThreadExecutor(Threads("kyo-scheduler-clock"))
-    private lazy val defaultTimerExecutor  = Executors.newScheduledThreadPool(2, Threads("kyo-scheduler-timer"))
+    private lazy val defaultWorkerExecutor =
+        WorkerExecutors.worker(
+            Threads("kyo-scheduler-worker", new Worker.WorkerThread(_)),
+            Config.default.coreWorkers,
+            Config.default.maxWorkers
+        )
+    private lazy val defaultClockExecutor = WorkerExecutors.clock(Threads("kyo-scheduler-clock"))
+    private lazy val defaultTimerExecutor = WorkerExecutors.timer(4, Threads("kyo-scheduler-timer"))
 
     val get = new Scheduler()
 
@@ -552,33 +716,26 @@ object Scheduler {
         timeSliceMs: Int,
         cycleIntervalNs: Int,
         enableTopJMX: Boolean,
-        enableTopConsoleMs: Int
+        enableTopConsoleMs: Int,
+        topStatusFile: String,
+        topStatusFileMs: Int
     )
     object Config {
         val default: Config = {
-            val cores             = Runtime.getRuntime().availableProcessors()
-            val coreWorkers       = Math.max(1, Flag("coreWorkers", cores))
-            val minWorkers        = Math.max(1, Flag("minWorkers", coreWorkers.toDouble / 2).intValue())
-            val maxWorkers        = Math.max(minWorkers, Flag("maxWorkers", coreWorkers * 100))
-            val scheduleStride    = Math.max(1, Flag("scheduleStride", cores))
-            val stealStride       = Math.max(1, Flag("stealStride", cores * 8))
-            val virtualizeWorkers = Flag("virtualizeWorkers", false)
-            val timeSliceMs       = Flag("timeSliceMs", 10)
-            val cycleIntervalNs   = Flag("cycleIntervalNs", 100000)
-            val enableTopJMX      = Flag("enableTopJMX", false)
-            val enableTopConsole  = Flag("enableTopConsoleMs", 0)
             Config(
-                cores,
-                coreWorkers,
-                minWorkers,
-                maxWorkers,
-                scheduleStride,
-                stealStride,
-                virtualizeWorkers,
-                timeSliceMs,
-                cycleIntervalNs,
-                enableTopJMX,
-                enableTopConsole
+                Runtime.getRuntime().availableProcessors(),
+                coreWorkers(),
+                minWorkers(),
+                maxWorkers(),
+                scheduleStride(),
+                stealStride(),
+                virtualizeWorkers(),
+                timeSliceMs(),
+                cycleIntervalNs(),
+                enableTopJMX(),
+                enableTopConsoleMs(),
+                topStatusFile(),
+                topStatusFileMs()
             )
         }
     }

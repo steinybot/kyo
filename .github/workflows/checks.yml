@@ -1,0 +1,260 @@
+name: checks
+# Workflow lint, formatting, and README doctests in one job.
+#
+# One job rather than three because a runner slot costs far more than this work: scalafmt
+# needs ~3 minutes behind a p90 queue wait of ~86 minutes on the x64 pool. Sharing a slot
+# also shares one checkout, one JDK and sbt install, and one coursier cache.
+#
+# Steps run cheapest first, so a formatting or lint error surfaces in ~3 minutes instead of
+# after the doctest step (~36 minutes on main, where it compiles every module). The cost is that those cheap checks are serial with
+# each other, which only pays while the queue wait dominates the work. On an uncontended
+# pool, three parallel jobs would be the better shape.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# A pull request keys on the PR number, so a new commit supersedes the run validating the previous
+# one. A push to main keys on the commit, so every main commit is validated rather than only the
+# newest.
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # arm64: nothing here is architecture-specific. scalafmt and actionlint are pure
+    # source analysis, and `sbt doctest` validates that README blocks compile and run,
+    # with the staged natives below built for whichever host runs the job. The x64 pool
+    # carries most of the repo's jobs and has roughly twice the p90 queue wait.
+    runs-on: ubuntu-24.04-arm
+    # Measured with the class-name check on all four platforms: 108 to 112 minutes on main with a warm
+    # doctest cache, and about 131 on a run whose classpath change misses every cached block. The JS,
+    # Native and Wasm rows took 67 to 74 of those minutes, so the job should now take about 40 warm and
+    # 60 cold. The cap leaves room for the cold run. Uncapped, a hang would hold a slot for GitHub's
+    # 360-minute default, which is the resource this job is shaped to conserve.
+    timeout-minutes: 90
+    steps:
+      # Full history is required by `sbt doctest` and by the workflow-change gate below, which
+      # resolves a base commit a shallow clone does not carry. Shallowing this fails quietly:
+      # the base lookup misses and the gate lints every run instead of skipping.
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      # --- cheapest first: workflow lint (~30s) ---
+      # Gated on the changed-file set rather than a `paths:` trigger, since the other steps in
+      # this job must run regardless of whether a workflow changed.
+      - name: Detect workflow changes
+        id: workflow-changes
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then
+            # push to main: compare against the previous commit
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            # No usable base (first push, force push, shallow). Lint rather than skip:
+            # a false negative here means a broken workflow lands unchecked.
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base" HEAD -- .github/workflows | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lint workflows
+        if: steps.workflow-changes.outputs.changed == 'true'
+        uses: rhysd/actionlint@v1.7.12
+
+      # A pull request runs on its merge ref, whose first parent is the main commit the change merges onto. The doctest and scaladoc
+      # steps validate only what the diff against it reaches (`testKyo --phase`), so a pull request compiles the modules it can
+      # affect rather than the whole build. A push to main validates everything.
+      - name: Merge base
+        id: base
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+
+      # --- then formatting (~3m) ---
+      # Same key namespace as .github/actions/setup, rather than coursier/cache-action's own. That action
+      # mints a cache entry per job name, each around 1.6 GB and each holding the same coursier tree the
+      # deps-<os>- entries already hold. Three of them resident at once take roughly half of GitHub's 10 GB
+      # per-repo budget, and eviction is what pushed the deps and kyo-browser entries out: a run on
+      # 2026-09-19 missed even the bare deps-windows-x64- and kyo-browser-windows-x64- prefixes, so the leg
+      # refetched every dependency and redownloaded chrome-headless-shell inside a test with a 60s timeout.
+      # Sharing the namespace both removes that pressure and warms this job from the far more frequent ci runs.
+      # This job runs on ubuntu-24.04-arm, which is the linux-arm64 pole.
+      #
+      # restore, not the full cache action: a key is immutable once written, so a job that saves first owns
+      # it. This job resolves scalafmt, actionlint and the doctest set, which is not the whole dependency
+      # tree a ci leg on this pole pulls, and minting the key from it would lock out the fuller save for
+      # that hash. The ci legs are the writers; every consumer here restores.
+      - uses: ./.github/actions/caches
+        with:
+          os: linux-arm64
+          mode: restore
+          browser: false
+      - uses: coursier/setup-action@v3.0.3
+        with:
+          jvm: corretto:25
+          apps: sbt
+
+      # Every sbt driver heap comes from scripts/sbt-heap-lib.sh; the check fails on a heap flag set
+      # anywhere else and on an sbt started without it.
+      - name: sbt driver heaps
+        run: |
+          scripts/sbt-heap-check.sh --self-test
+          scripts/sbt-heap-lib-test.sh
+          scripts/sbt-heap-check.sh
+
+      - name: Self-test the build scripts
+        run: |
+          scripts/ci-test.sh --self-test
+          scripts/fixture-images.sh --self-test
+          scripts/build-selftest.sh
+          scripts/ci-monitor-selftest.sh
+
+      - name: Self-test the format script
+        run: scripts/format.sh --self-test
+
+      # The same script the pre-push hook and contributors run, over the whole tree: all four platform
+      # aggregates (a bare scalafmtAll reaches only the JVM set), the build definition, and every README's
+      # scala blocks, so what passes locally passes here.
+      - name: Check formatting
+        run: |
+          scripts/format.sh --check || {
+            echo "::error::Files are not formatted. Run 'scripts/format.sh' locally."
+            exit 1
+          }
+
+      # --- then the expensive one (~36m on main) ---
+      # liburing (build-time only): `sbt doctest` compiles kyo-net's io_uring FFI shim (kyo_uring.c), which
+      # statically links -luring. This workflow does not use .github/actions/setup, so install it here too.
+      - name: Install liburing (Linux)
+        run: bash scripts/apt-install.sh liburing-dev
+
+      # libaeron, SQLite and DoltLite (build-time only): `sbt doctest` compiles kyo-aeron's C shim
+      # (kyo_aeron.c), which statically links -laeron_driver_static, and kyo-sql's shims together with
+      # their vendored engines, all from gitignored staged trees. Same reason as liburing above: this
+      # workflow does not use .github/actions/setup, so the staging is repeated here.
+      - uses: ./.github/actions/stage-natives
+        with:
+          boringssl: 'false'
+
+      # Doctest result cache. Entries are keyed by SHA-256 over the block body, the scope closure
+      # (preceding blocks and the predef), the classpath fingerprint, the Scala version and the
+      # scalac options, so a restored entry is reused only when all of those match. It holds result
+      # files alone, never compiled classes: each entry is an empty file whose name is the key, so
+      # ~1500 blocks fit well under 1 MB.
+      #
+      # The run id in the key never matches, so every run restores through restore-keys from the
+      # newest previous generation. That is deliberate: it gives each run its own entry and lets
+      # GitHub's LRU and 7-day eviction bound the store.
+      - name: Restore doctest cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .doctest-cache
+          key: doctest-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: |
+            doctest-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: README doctests
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            scripts/sbt.sh docs "testKyo --phase doctest ${{ steps.base.outputs.sha }} JVM"
+          else
+            scripts/sbt.sh docs doctest
+          fi
+
+      # main writes, PRs only restore. A cache written on a PR run is scoped to that PR's merge
+      # ref, readable by nothing but re-runs of the same PR, so it would cost upload time for no
+      # reuse. A PR gets its hits from the default branch's cache.
+      #
+      # `always()` because every block's result is its own file, written as it compiles: a doctest
+      # step that fails or times out part-way still leaves the blocks it finished, and the next main
+      # run reuses them instead of recompiling the whole build's READMEs.
+      - name: Save doctest cache
+        if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .doctest-cache
+          key: doctest-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+
+      # Last, and after the cache save, because doctest has already compiled every module: the step pays
+      # for scaladoc alone (~6 min) rather than a second full build, and a broken link cannot cost the
+      # next run its doctest hits.
+      #
+      # JVM covers every shared source. JS and Wasm render no scaladoc at all. Native does, but
+      # `kyoNative / update` cannot resolve the aggregate's own dependencies, so a Native row would fail
+      # on that rather than on a link.
+      - name: Scaladoc links
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            scripts/sbt.sh docs "testKyo --phase scaladoc ${{ steps.base.outputs.sha }} JVM"
+          else
+            scripts/sbt.sh docs kyoJVM/doc
+          fi
+
+      # Two modules declaring one fully qualified name is silent everywhere else: the JVM classloader and
+      # both the Scala.js and Scala Native linkers keep the first class on the classpath and drop the rest.
+      #
+      # JVM only. It reuses what doctest compiled (~2 min) and also covers the sbt plugins. The JS, Native
+      # and Wasm rows compile every module of their platform from nothing, 67 to 74 min together on
+      # ubuntu-24.04-arm, more than half of this job. A name declared only in `js`, `js-wasm`, `native` or
+      # `wasm` sources is therefore not checked in CI.
+      #
+      # Main checks every project and records each one's classes in an index keyed by its commit. A pull
+      # request restores the newest index and compiles only the projects that differ between that index's
+      # commit and this tree, reading every other project's classes from the index. Planning against the
+      # index's commit rather than the merge base keeps that exact whichever main commit the index is from.
+      # With no index, or a commit this clone cannot fetch, the check compiles everything.
+      - name: Restore class-name index
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            target/classnames-index.tsv
+            target/classnames-index.sha
+          key: classnames-index-${{ runner.os }}-${{ runner.arch }}-${{ steps.base.outputs.sha }}
+          restore-keys: |
+            classnames-index-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Class names
+        shell: bash
+        run: |
+          scripts/sbt.sh tool 'checkClassNames --self-test'
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            scripts/sbt.sh classnames 'checkClassNames JVM --write-index target/classnames-index.tsv'
+            git rev-parse HEAD > target/classnames-index.sha
+            exit 0
+          fi
+          indexed="$(cat target/classnames-index.sha 2>/dev/null || true)"
+          if [ -n "$indexed" ] && { git cat-file -e "$indexed^{commit}" 2>/dev/null || git fetch -q origin "$indexed"; }; then
+            scripts/sbt.sh tool "testKyo --dry-run --plan-file target/classnames-plan $indexed JVM"
+            if [ ! -s target/classnames-plan ]; then
+              echo "No JVM project differs from $indexed; no class can have changed."
+              exit 0
+            fi
+            scripts/sbt.sh classnames "checkClassNames JVM --modules $(paste -sd, target/classnames-plan) --index target/classnames-index.tsv"
+          else
+            echo "No usable class-name index; checking every project."
+            scripts/sbt.sh classnames 'checkClassNames JVM'
+          fi
+
+      - name: Save class-name index
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            target/classnames-index.tsv
+            target/classnames-index.sha
+          key: classnames-index-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}

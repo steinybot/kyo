@@ -1,0 +1,720 @@
+package kyo
+
+import kyo.*
+import scala.annotation.tailrec
+
+/** Immutable HTTP header collection with zero-copy parsing and case-insensitive name lookups.
+  *
+  * Any `Seq[(String, String)]` of name-value pairs is an `HttpHeaders`, so a `List`, `Vector` or `Chunk` of pairs can be passed wherever
+  * headers are expected and is read in place, without conversion. Headers parsed from the wire stay in the bytes they were received as and
+  * decode a value only when `get` or `getAll` asks for it. `add`, `set`, `remove` and `concat` return new headers and never change the
+  * receiver.
+  *
+  * All name lookups are case-insensitive per RFC 9110. Header names preserve their original case for wire serialization. `add` appends
+  * without deduplication (multi-value semantics, as required for `Set-Cookie`). `set` removes all existing headers with the same name
+  * before appending the new value.
+  *
+  * Cookie methods vary by message direction: `cookie` and `cookies` parse the request `Cookie` header; `responseCookie` and `addCookie`
+  * operate on `Set-Cookie` headers for responses. The `strict` parameter enables RFC 6265 validation of cookie names and values.
+  *
+  * Headers have no structural equality: two values holding the same fields may be held in different forms, and comparing them means
+  * comparing what `foldLeft` yields.
+  *
+  * @see
+  *   [[kyo.HttpRequest]] Carries request headers
+  * @see
+  *   [[kyo.HttpResponse]] Carries response headers
+  * @see
+  *   [[kyo.HttpCookie]] Typed cookie values with serialization attributes
+  */
+opaque type HttpHeaders >: Seq[(String, String)] = Chunk[String] | Array[Byte] | Seq[(String, String)]
+
+object HttpHeaders:
+
+    private val ColonSpace = ": ".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+    private val CrLf       = "\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII)
+    private val Utf8       = java.nio.charset.StandardCharsets.UTF_8
+
+    /** The `tchar` symbols of RFC 9110 section 5.6.2, alongside DIGIT and ALPHA. */
+    private val TokenSymbols = "!#$%&'*+-.^_`|~"
+
+    val empty: HttpHeaders = Chunk.empty[String]
+
+    /** Constructs HttpHeaders from name-value tuple pairs. */
+    def init(headers: Seq[(String, String)]): HttpHeaders = headers
+
+    /** Headers parsed from the wire: `count` fields whose names and values are slices of `raw`.
+      *
+      * Field `i` is described by `fields(4 * i)` to `fields(4 * i + 3)`: name offset, name length, value offset and value length, each
+      * offset counted from `rawStart`. The `rawLength` bytes from `rawStart` are copied, so the caller may reuse both arrays. Every offset
+      * and length must fit in 16 bits, the width the packed index stores them in.
+      */
+    private[kyo] def parsed(raw: Array[Byte], rawStart: Int, rawLength: Int, fields: Array[Int], count: Int): HttpHeaders =
+        val indexSize = 2 + count * 8
+        val packed    = new Array[Byte](indexSize + rawLength)
+        packedWriteShort(packed, 0, count)
+        @tailrec def loop(i: Int): Unit =
+            if i < count * 4 then
+                packedWriteShort(packed, 2 + i * 2, fields(i))
+                loop(i + 1)
+        loop(0)
+        java.lang.System.arraycopy(raw, rawStart, packed, indexSize, rawLength)
+        packed
+    end parsed
+
+    /** Runs the branch for the form `h` is held in.
+      *
+      * Three forms share the type: packed `Array[Byte]` from [[parsed]], built `Chunk[String]` holding names and values interleaved, and
+      * any `Seq[(String, String)]` of pairs, which is an `HttpHeaders` by subtyping. Erasure leaves a type test unable to tell a built
+      * `Chunk` from a `Chunk` of pairs, so the first element decides, which holds because built headers store only `String`s and a pair is
+      * a `Tuple2`. An empty `Chunk` or `Seq` holds no headers under either reading. This is the only place the representation is tested;
+      * every operation goes through it.
+      */
+    private inline def dispatch[A](h: HttpHeaders)(
+        inline packed: Array[Byte] => A,
+        inline built: Chunk[String] => A,
+        inline pairs: Seq[(String, String)] => A
+    ): A =
+        h match
+            case p: Array[?]                                           => packed(p.asInstanceOf[Array[Byte]])
+            case c: Chunk[?] if c.isEmpty || c(0).isInstanceOf[String] => built(c.asInstanceOf[Chunk[String]])
+            case s                                                     => pairs(s.asInstanceOf[Seq[(String, String)]])
+    end dispatch
+
+    // --- Packed array helpers ---
+
+    private def packedHeaderCount(packed: Array[Byte]): Int = ((packed(0) & 0xff) << 8) | (packed(1) & 0xff)
+
+    private def packedRawOffset(packed: Array[Byte]): Int =
+        2 + packedHeaderCount(packed) * 8
+
+    private def packedReadShort(packed: Array[Byte], pos: Int): Int = ((packed(pos) & 0xff) << 8) | (packed(pos + 1) & 0xff)
+
+    private def packedWriteShort(packed: Array[Byte], pos: Int, value: Int): Unit =
+        packed(pos) = ((value >> 8) & 0xff).toByte
+        packed(pos + 1) = (value & 0xff).toByte
+
+    private def packedHeaderNameOff(packed: Array[Byte], i: Int): Int = packedReadShort(packed, 2 + i * 8)
+    private def packedHeaderNameLen(packed: Array[Byte], i: Int): Int = packedReadShort(packed, 2 + i * 8 + 2)
+    private def packedHeaderValOff(packed: Array[Byte], i: Int): Int  = packedReadShort(packed, 2 + i * 8 + 4)
+    private def packedHeaderValLen(packed: Array[Byte], i: Int): Int  = packedReadShort(packed, 2 + i * 8 + 6)
+
+    /** Case-insensitive byte comparison for header name lookup. */
+    private def bytesEqualIgnoreCase(packed: Array[Byte], off: Int, len: Int, name: String): Boolean =
+        if len != name.length then false
+        else
+            @tailrec def loop(i: Int): Boolean =
+                if i >= len then true
+                else
+                    val a = (packed(off + i) & 0xff).toChar.toLower
+                    val b = name.charAt(i).toLower
+                    if a != b then false
+                    else loop(i + 1)
+            loop(0)
+
+    /** Decodes a slice of the packed array to a String. */
+    private def decodeString(packed: Array[Byte], off: Int, len: Int): String =
+        new String(packed, off, len, java.nio.charset.StandardCharsets.UTF_8)
+
+    /** The built form of `h`, the form every modification produces. */
+    private def toChunk(h: HttpHeaders): Chunk[String] =
+        dispatch(h)(
+            packed =>
+                val count                       = packedHeaderCount(packed)
+                val rawOff                      = packedRawOffset(packed)
+                val builder                     = ChunkBuilder.init[String]
+                @tailrec def loop(i: Int): Unit =
+                    if i < count then
+                        val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                        val nameLen = packedHeaderNameLen(packed, i)
+                        val valOff  = packedHeaderValOff(packed, i) + rawOff
+                        val valLen  = packedHeaderValLen(packed, i)
+                        discard(builder += decodeString(packed, nameOff, nameLen))
+                        discard(builder += decodeString(packed, valOff, valLen))
+                        loop(i + 1)
+                loop(0)
+                builder.result()
+            ,
+            built => built,
+            pairs =>
+                val builder = ChunkBuilder.init[String]
+                pairs.foreach { kv =>
+                    discard(builder += kv._1)
+                    discard(builder += kv._2)
+                }
+                builder.result()
+        )
+
+    /** Writes one built or pairs field as `name: value\r\n`: the name char by char, since a token is ASCII, and the value as UTF-8 octets. */
+    private def writeField(buf: kyo.net.internal.util.GrowableByteBuffer, name: String, value: String): Unit =
+        buf.writeAscii(name)
+        buf.writeBytes(ColonSpace, 0, ColonSpace.length)
+        val bytes = value.getBytes(Utf8)
+        buf.writeBytes(bytes, 0, bytes.length)
+        buf.writeBytes(CrLf, 0, CrLf.length)
+    end writeField
+
+    /** Describes why the field at `index` is not writable, testing the name first so the description quotes only a token. */
+    private def fieldDefect(index: Int, name: String, value: String): Maybe[String] =
+        if !isToken(name) then Present(s"the name of the header at index $index")
+        else if !isControlFree(value) then Present(s"the value of header '$name'")
+        else Absent
+
+    extension (self: HttpHeaders)
+
+        def size: Int =
+            dispatch(self)(packedHeaderCount, _.length / 2, _.size)
+
+        def isEmpty: Boolean =
+            dispatch(self)(packedHeaderCount(_) == 0, _.isEmpty, _.isEmpty)
+
+        def nonEmpty: Boolean = !isEmpty
+
+        // --- Lookup ---
+
+        /** Returns the value of the first header matching `name` (case-insensitive). */
+        def get(name: String): Maybe[String] =
+            dispatch(self)(
+                packed =>
+                    val count                                = packedHeaderCount(packed)
+                    val rawOff                               = packedRawOffset(packed)
+                    @tailrec def loop(i: Int): Maybe[String] =
+                        if i >= count then Absent
+                        else
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            if bytesEqualIgnoreCase(packed, nameOff, nameLen, name) then
+                                val valOff = packedHeaderValOff(packed, i) + rawOff
+                                val valLen = packedHeaderValLen(packed, i)
+                                Present(decodeString(packed, valOff, valLen))
+                            else loop(i + 1)
+                            end if
+                    loop(0)
+                ,
+                built =>
+                    @tailrec def loop(i: Int): Maybe[String] =
+                        if i >= built.length then Absent
+                        else if built(i).equalsIgnoreCase(name) then Present(built(i + 1))
+                        else loop(i + 2)
+                    loop(0)
+                ,
+                pairs =>
+                    @tailrec def loop(it: Iterator[(String, String)]): Maybe[String] =
+                        if !it.hasNext then Absent
+                        else
+                            val kv = it.next()
+                            if kv._1.equalsIgnoreCase(name) then Present(kv._2)
+                            else loop(it)
+                    loop(pairs.iterator)
+            )
+        end get
+
+        /** Returns all values for headers matching `name` (case-insensitive). */
+        def getAll(name: String): Seq[String] =
+            val builder = Chunk.newBuilder[String]
+            dispatch(self)(
+                packed =>
+                    val count                       = packedHeaderCount(packed)
+                    val rawOff                      = packedRawOffset(packed)
+                    @tailrec def loop(i: Int): Unit =
+                        if i < count then
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            if bytesEqualIgnoreCase(packed, nameOff, nameLen, name) then
+                                val valOff = packedHeaderValOff(packed, i) + rawOff
+                                val valLen = packedHeaderValLen(packed, i)
+                                discard(builder += decodeString(packed, valOff, valLen))
+                            end if
+                            loop(i + 1)
+                    loop(0)
+                ,
+                built =>
+                    @tailrec def loop(i: Int): Unit =
+                        if i < built.length then
+                            if built(i).equalsIgnoreCase(name) then
+                                discard(builder += built(i + 1))
+                            loop(i + 2)
+                    loop(0)
+                ,
+                pairs =>
+                    pairs.foreach { kv =>
+                        if kv._1.equalsIgnoreCase(name) then
+                            discard(builder += kv._2)
+                    }
+            )
+            builder.result()
+        end getAll
+
+        /** Whether a header with the given name exists (case-insensitive). */
+        def contains(name: String): Boolean =
+            dispatch(self)(
+                packed =>
+                    val count                          = packedHeaderCount(packed)
+                    val rawOff                         = packedRawOffset(packed)
+                    @tailrec def loop(i: Int): Boolean =
+                        if i >= count then false
+                        else
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            if bytesEqualIgnoreCase(packed, nameOff, nameLen, name) then true
+                            else loop(i + 1)
+                    loop(0)
+                ,
+                built =>
+                    @tailrec def loop(i: Int): Boolean =
+                        if i >= built.length then false
+                        else if built(i).equalsIgnoreCase(name) then true
+                        else loop(i + 2)
+                    loop(0)
+                ,
+                pairs => pairs.exists(_._1.equalsIgnoreCase(name))
+            )
+        end contains
+
+        // --- Modification (always produces Chunk[String]) ---
+
+        /** Appends a header without replacing existing ones (multi-value semantics). */
+        def add(name: String, value: String): HttpHeaders =
+            toChunk(self).append(name).append(value)
+
+        /** Appends a header with an integer value, avoiding Int.toString allocation. */
+        def add(name: String, value: Int): HttpHeaders =
+            self.add(name, HttpHeaders.intToString(value))
+
+        /** Replaces any existing header with the same name, then appends. */
+        def set(name: String, value: String): HttpHeaders =
+            val chunk                       = toChunk(self)
+            val builder                     = ChunkBuilder.init[String]
+            @tailrec def loop(i: Int): Unit =
+                if i < chunk.length then
+                    if !chunk(i).equalsIgnoreCase(name) then
+                        discard(builder += chunk(i))
+                        discard(builder += chunk(i + 1))
+                    loop(i + 2)
+            loop(0)
+            discard(builder += name)
+            discard(builder += value)
+            builder.result()
+        end set
+
+        /** Concatenates two header collections. */
+        def concat(other: HttpHeaders): HttpHeaders =
+            val selfChunk  = toChunk(self)
+            val otherChunk = toChunk(other)
+            if selfChunk.isEmpty then otherChunk
+            else if otherChunk.isEmpty then selfChunk
+            else selfChunk ++ otherChunk
+        end concat
+
+        /** Removes all headers with the given name (case-insensitive). */
+        def remove(name: String): HttpHeaders =
+            val chunk                       = toChunk(self)
+            val builder                     = ChunkBuilder.init[String]
+            @tailrec def loop(i: Int): Unit =
+                if i < chunk.length then
+                    if !chunk(i).equalsIgnoreCase(name) then
+                        discard(builder += chunk(i))
+                        discard(builder += chunk(i + 1))
+                    loop(i + 2)
+            loop(0)
+            builder.result()
+        end remove
+
+        /** Iterates over all headers as name-value pairs. */
+        def foreach(f: (String, String) => Unit): Unit =
+            dispatch(self)(
+                packed =>
+                    val count                       = packedHeaderCount(packed)
+                    val rawOff                      = packedRawOffset(packed)
+                    @tailrec def loop(i: Int): Unit =
+                        if i < count then
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            val valOff  = packedHeaderValOff(packed, i) + rawOff
+                            val valLen  = packedHeaderValLen(packed, i)
+                            f(decodeString(packed, nameOff, nameLen), decodeString(packed, valOff, valLen))
+                            loop(i + 1)
+                    loop(0)
+                ,
+                built =>
+                    @tailrec def loop(i: Int): Unit =
+                        if i < built.length then
+                            f(built(i), built(i + 1))
+                            loop(i + 2)
+                    loop(0)
+                ,
+                pairs => pairs.foreach(kv => f(kv._1, kv._2))
+            )
+        end foreach
+
+        /** Writes all headers to a GrowableByteBuffer in HTTP/1.1 wire format (name: value\r\n per header). Zero allocation for parsed
+          * headers, which go out as the raw octets they were received as. Any other header has its name written char-by-char (a name is a
+          * token, so it is ASCII) and its value written as UTF-8 octets, since a field value may carry obs-text (RFC 9110 section 5.5).
+          *
+          * The caller tests [[invalidField]] first: a name that is not a token breaches `writeAscii`'s precondition, and a value carrying a
+          * control character would put a header line on the wire that a recipient could re-frame.
+          */
+        def writeToBuffer(buf: kyo.net.internal.util.GrowableByteBuffer): Unit =
+            dispatch(self)(
+                packed =>
+                    val count                       = packedHeaderCount(packed)
+                    val rawOff                      = packedRawOffset(packed)
+                    @tailrec def loop(i: Int): Unit =
+                        if i < count then
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            val valOff  = packedHeaderValOff(packed, i) + rawOff
+                            val valLen  = packedHeaderValLen(packed, i)
+                            buf.writeBytes(packed, nameOff, nameLen)
+                            buf.writeBytes(ColonSpace, 0, ColonSpace.length)
+                            buf.writeBytes(packed, valOff, valLen)
+                            buf.writeBytes(CrLf, 0, CrLf.length)
+                            loop(i + 1)
+                    loop(0)
+                ,
+                built =>
+                    @tailrec def loop(i: Int): Unit =
+                        if i < built.length then
+                            writeField(buf, built(i), built(i + 1))
+                            loop(i + 2)
+                    loop(0)
+                ,
+                pairs => pairs.foreach(kv => writeField(buf, kv._1, kv._2))
+            )
+        end writeToBuffer
+
+        /** Names the first header `writeToBuffer` must refuse to write, or `Absent` when it can write them all.
+          *
+          * A field name must be a token and a field value must carry no control character other than HTAB, so that no header line this
+          * writes can be read as two. A value above 0x7F is legal obs-text (RFC 9110 section 5.5) and is never reported: it goes on the wire
+          * as its UTF-8 octets.
+          *
+          * Parsed headers are not walked. They are written as the raw octets they were received as, and both parsers reject CR, LF and NUL
+          * and require a token name, so a parsed header is writable by construction and its write path stays allocation-free.
+          *
+          * The returned description names the offending header but never its value, which can hold a credential. It quotes a name only after
+          * that name is known to be a token, so the description can carry no line break of its own into a log.
+          */
+        private[kyo] def invalidField: Maybe[String] =
+            dispatch(self)(
+                _ => Absent,
+                built =>
+                    @tailrec def loop(i: Int): Maybe[String] =
+                        if i >= built.length then Absent
+                        else
+                            val defect = fieldDefect(i / 2, built(i), built(i + 1))
+                            if defect.isDefined then defect else loop(i + 2)
+                    loop(0)
+                ,
+                pairs =>
+                    @tailrec def loop(it: Iterator[(String, String)], i: Int): Maybe[String] =
+                        if !it.hasNext then Absent
+                        else
+                            val kv     = it.next()
+                            val defect = fieldDefect(i, kv._1, kv._2)
+                            if defect.isDefined then defect else loop(it, i + 1)
+                    loop(pairs.iterator, 0)
+            )
+        end invalidField
+
+        /** Folds over all headers as name-value pairs. */
+        def foldLeft[A](init: A)(f: (A, String, String) => A): A =
+            dispatch(self)(
+                packed =>
+                    val count                            = packedHeaderCount(packed)
+                    val rawOff                           = packedRawOffset(packed)
+                    @tailrec def loop(i: Int, acc: A): A =
+                        if i >= count then acc
+                        else
+                            val nameOff = packedHeaderNameOff(packed, i) + rawOff
+                            val nameLen = packedHeaderNameLen(packed, i)
+                            val valOff  = packedHeaderValOff(packed, i) + rawOff
+                            val valLen  = packedHeaderValLen(packed, i)
+                            loop(i + 1, f(acc, decodeString(packed, nameOff, nameLen), decodeString(packed, valOff, valLen)))
+                    loop(0, init)
+                ,
+                built =>
+                    @tailrec def loop(i: Int, acc: A): A =
+                        if i >= built.length then acc
+                        else loop(i + 2, f(acc, built(i), built(i + 1)))
+                    loop(0, init)
+                ,
+                pairs => pairs.foldLeft(init)((acc, kv) => f(acc, kv._1, kv._2))
+            )
+        end foldLeft
+
+        // --- Cookies ---
+
+        /** Returns the value of a request cookie by name, parsed from the Cookie header (lax mode). */
+        def cookie(name: String): Maybe[String] =
+            self.get("Cookie") match
+                case Absent     => Absent
+                case Present(v) => HttpHeaders.findCookieValue(v, name, strict = false)
+
+        /** Returns the value of a request cookie by name, parsed from the Cookie header.
+          * @param strict
+          *   when true, validates cookie names/values against RFC 6265 and skips non-compliant cookies
+          */
+        def cookie(name: String, strict: Boolean): Maybe[String] =
+            self.get("Cookie") match
+                case Absent     => Absent
+                case Present(v) => HttpHeaders.findCookieValue(v, name, strict)
+
+        /** Returns all request cookies as name-value pairs, parsed from the Cookie header (lax mode). */
+        def cookies: Seq[(String, String)] =
+            self.get("Cookie") match
+                case Absent     => Seq.empty
+                case Present(v) => HttpHeaders.parseCookieHeader(v, strict = false)
+
+        /** Returns all request cookies as name-value pairs, parsed from the Cookie header.
+          * @param strict
+          *   when true, validates cookie names/values against RFC 6265 and skips non-compliant cookies
+          */
+        def cookies(strict: Boolean): Seq[(String, String)] =
+            self.get("Cookie") match
+                case Absent     => Seq.empty
+                case Present(v) => HttpHeaders.parseCookieHeader(v, strict)
+
+        /** Returns the value of a response cookie by name, parsed from Set-Cookie headers. */
+        def responseCookie(name: String): Maybe[String] =
+            val setCookies                           = self.getAll("Set-Cookie")
+            @tailrec def loop(i: Int): Maybe[String] =
+                if i >= setCookies.size then Absent
+                else
+                    val header = setCookies(i)
+                    val eqIdx  = header.indexOf('=')
+                    if eqIdx > 0 then
+                        val cookieName = header.substring(0, eqIdx).trim
+                        if cookieName == name then
+                            val semIdx = header.indexOf(';', eqIdx + 1)
+                            val end    = if semIdx < 0 then header.length else semIdx
+                            Present(header.substring(eqIdx + 1, end).trim)
+                        else loop(i + 1)
+                        end if
+                    else loop(i + 1)
+                    end if
+            loop(0)
+        end responseCookie
+
+        /** Adds a Set-Cookie header for a response cookie.
+          *
+          * Raises an `IllegalArgumentException` when the name, the encoded value, or the Domain or Path attribute violates the RFC 6265
+          * section 4.1.1 grammar, since a value carrying a ';' would write cookie ATTRIBUTES rather than data and the grammar offers no
+          * escape to encode it as data instead. A caller holding content that may not qualify (anything user-derived) tests it first with
+          * [[HttpHeaders.isValidCookieName]], [[HttpHeaders.isValidCookieValue]] and [[HttpHeaders.isValidCookieAttribute]], or encodes it
+          * into an opaque token, base64 being the usual choice.
+          */
+        def addCookie[A](name: String, cookie: HttpCookie[A]): HttpHeaders =
+            self.add("Set-Cookie", HttpHeaders.serializeCookie(name, cookie))
+
+        /** Adds a Set-Cookie header with a simple string value.
+          *
+          * Raises on a name or value outside the RFC 6265 section 4.1.1 grammar; see the overload above.
+          */
+        def addCookie(name: String, value: String)(using HttpCodec[String]): HttpHeaders =
+            addCookie(name, HttpCookie(value))
+
+    end extension
+
+    // --- Field syntax (RFC 9110 sections 5.1, 5.5, 5.6.2) ---
+
+    /** Whether `c` is a `tchar`: DIGIT, ALPHA, or one of the symbols RFC 9110 section 5.6.2 lists.
+      *
+      * Takes a char rather than a String so a parser can test raw bytes against it without decoding them.
+      */
+    private[kyo] def isTokenChar(c: Char): Boolean =
+        (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || TokenSymbols.indexOf(c) >= 0
+
+    /** Whether `s` is a `token`, the grammar a field name must satisfy: `token = 1*tchar` (RFC 9110 sections 5.1 and 5.6.2).
+      *
+      * Strictly stronger than an ASCII test: SP, colon and CR are all ASCII, and a name carrying any of them
+      * puts a line on the wire that a recipient reads differently than the sender meant it ("X Foo: bar" parses as the name "X" with the
+      * value "Foo: bar"). An empty name is not a token either.
+      */
+    private[kyo] def isToken(s: String): Boolean =
+        @tailrec def loop(i: Int): Boolean =
+            if i >= s.length then true
+            else if isTokenChar(s.charAt(i)) then loop(i + 1)
+            else false
+        s.nonEmpty && loop(0)
+    end isToken
+
+    /** Whether `s` is free of the ASCII control characters an HTTP/1.1 message cannot carry inline: `%x00-%x1F` other than HTAB (`%x09`),
+      * and DEL (`%x7F`).
+      *
+      * This is the character rule a field value must satisfy. RFC 9110 section 5.5 admits SP, HTAB, visible characters and obs-text
+      * (`%x80-FF`) and nothing else, so a char above 0x7F passes: it is legal and is written as its UTF-8 octets. What the rule keeps out is
+      * a CR or an LF, which would end a header line or a request line early and let a recipient read one line as two. That is where response
+      * splitting and request smuggling both start (RFC 9112 section 11), and it is why an ASCII test is no substitute: CR, LF and NUL are
+      * themselves ASCII.
+      */
+    private[kyo] def isControlFree(s: String): Boolean =
+        @tailrec def loop(i: Int): Boolean =
+            if i >= s.length then true
+            else
+                val c = s.charAt(i)
+                if c == '\t' || (c >= 0x20 && c != 0x7f) then loop(i + 1)
+                else false
+        loop(0)
+    end isControlFree
+
+    // --- Cookie parsing ---
+
+    private def findCookieValue(header: String, name: String, strict: Boolean): Maybe[String] =
+        @tailrec def loop(pos: Int): Maybe[String] =
+            if pos >= header.length then Absent
+            else
+                val start = skipWhitespace(header, pos)
+                val eqIdx = header.indexOf('=', start)
+                if eqIdx < 0 then Absent
+                else
+                    val key    = header.substring(start, eqIdx).trim
+                    val semIdx = header.indexOf(';', eqIdx + 1)
+                    val end    = if semIdx < 0 then header.length else semIdx
+                    val value  = header.substring(eqIdx + 1, end).trim
+                    if key == name then
+                        if strict && !isValidCookieValue(value) then Absent
+                        else Present(value)
+                    else loop(if semIdx < 0 then header.length else semIdx + 1)
+                    end if
+                end if
+        loop(0)
+    end findCookieValue
+
+    private def parseCookieHeader(header: String, strict: Boolean): Seq[(String, String)] =
+        val builder                                        = Seq.newBuilder[(String, String)]
+        @tailrec def loop(pos: Int): Seq[(String, String)] =
+            if pos >= header.length then builder.result()
+            else
+                val start = skipWhitespace(header, pos)
+                val eqIdx = header.indexOf('=', start)
+                if eqIdx < 0 then builder.result()
+                else
+                    val key    = header.substring(start, eqIdx).trim
+                    val semIdx = header.indexOf(';', eqIdx + 1)
+                    val end    = if semIdx < 0 then header.length else semIdx
+                    val value  = header.substring(eqIdx + 1, end).trim
+                    if !strict || (isValidCookieName(key) && isValidCookieValue(value)) then
+                        builder += ((key, value))
+                    loop(if semIdx < 0 then header.length else semIdx + 1)
+                end if
+        loop(0)
+    end parseCookieHeader
+
+    /** RFC 6265 cookie-name: token characters (RFC 2616 Section 2.2) */
+    def isValidCookieName(name: String): Boolean =
+        @tailrec def loop(i: Int): Boolean =
+            if i >= name.length then true
+            else
+                val c = name.charAt(i)
+                if c <= 0x20 || c >= 0x7f || "\"(),/:;<=>?@[\\]{}".indexOf(c) >= 0 then false
+                else loop(i + 1)
+        name.nonEmpty && loop(0)
+    end isValidCookieName
+
+    /** RFC 6265 cookie-value: *cookie-octet / ( DQUOTE *cookie-octet DQUOTE ) cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+      */
+    def isValidCookieValue(value: String): Boolean =
+        val len = value.length
+        // Value may optionally be wrapped in DQUOTE
+        val (start, end) =
+            if len >= 2 && value.charAt(0) == '"' && value.charAt(len - 1) == '"' then (1, len - 1)
+            else (0, len)
+        @tailrec def loop(i: Int): Boolean =
+            if i >= end then true
+            else
+                val c = value.charAt(i)
+                if c < 0x21 || c > 0x7e || c == '"' || c == ',' || c == ';' || c == '\\' then false
+                else loop(i + 1)
+        loop(start)
+    end isValidCookieValue
+
+    /** Whether `value` may be used as a Set-Cookie attribute value such as `Domain` or `Path`.
+      *
+      * RFC 6265 section 4.1.1 defines both as any CHAR except CTLs and ';'. The ';' is what matters: it is the delimiter BETWEEN attributes,
+      * so a value carrying one does not extend an attribute, it starts another.
+      */
+    def isValidCookieAttribute(value: String): Boolean =
+        @tailrec def loop(i: Int): Boolean =
+            if i >= value.length then true
+            else
+                val c = value.charAt(i)
+                if c < 0x20 || c == 0x7f || c == ';' then false
+                else loop(i + 1)
+        loop(0)
+    end isValidCookieAttribute
+
+    /** Renders a cookie as a Set-Cookie field value, refusing any part that would change the header's structure.
+      *
+      * Every part is checked against its RFC 6265 section 4.1.1 grammar and a violation raises, because there is no correct alternative:
+      * the grammar defines no escape mechanism, so a ';' in a value cannot be represented as data. Encoding one anyway would invent a
+      * convention no client undoes, trading an injection for silent corruption of the value. Rejecting is the same answer, for the same
+      * reason, that `GrowableByteBuffer.writeAscii` gives to a char it cannot encode.
+      *
+      * A raise rather than a typed failure because reaching it is a defect in the calling code, not a bad message from a peer: a cookie
+      * value is an opaque token the application chooses. An application that needs to carry arbitrary text (a display name, anything
+      * user-supplied) encodes it deliberately, base64 being the usual choice, so that both ends agree on how to read it back. Callers
+      * holding content that may not qualify can test it first with [[isValidCookieName]], [[isValidCookieValue]] and
+      * [[isValidCookieAttribute]] and take their own path.
+      */
+    private[kyo] def serializeCookie[A](name: String, cookie: HttpCookie[A]): String =
+        require(
+            isValidCookieName(name),
+            s"cookie name must be a token per RFC 6265 section 4.1.1 (no controls, whitespace, or separators); got: $name"
+        )
+        val encoded = cookie.codec.encode(cookie.value)
+        require(
+            isValidCookieValue(encoded),
+            s"cookie value must be cookie-octets per RFC 6265 section 4.1.1 (no controls, whitespace, ';', ',', '\"' or '\\\\'); got: $encoded"
+        )
+        val sb = new StringBuilder(name.size + 80)
+        discard(sb.append(name).append('=').append(encoded))
+        cookie.maxAge match
+            case Present(d) => discard(sb.append("; Max-Age=").append(d.toSeconds))
+            case Absent     =>
+        cookie.domain match
+            case Present(d) =>
+                require(isValidCookieAttribute(d), s"cookie Domain must not carry a control character or ';'; got: $d")
+                discard(sb.append("; Domain=").append(d))
+            case Absent =>
+        end match
+        cookie.path match
+            case Present(p) =>
+                require(isValidCookieAttribute(p), s"cookie Path must not carry a control character or ';'; got: $p")
+                discard(sb.append("; Path=").append(p))
+            case Absent =>
+        end match
+        if cookie.secure then discard(sb.append("; Secure"))
+        if cookie.httpOnly then discard(sb.append("; HttpOnly"))
+        cookie.sameSite match
+            case Present(s) => discard(sb.append("; SameSite=").append(s))
+            case Absent     =>
+        sb.toString
+    end serializeCookie
+
+    @tailrec private def skipWhitespace(s: String, pos: Int): Int =
+        if pos < s.length && s.charAt(pos) == ' ' then skipWhitespace(s, pos + 1)
+        else pos
+
+    /** Converts a non-negative integer to a String using direct ASCII digit extraction, avoiding boxing that occurs with Int.toString.
+      * Intended for small non-negative values such as Content-Length.
+      */
+    private[kyo] def intToString(value: Int): String =
+        if value == 0 then "0"
+        else
+            // Determine the number of digits
+            val digits = new Array[Byte](20) // max digits for Int is 10
+            var n      = value
+            var pos    = 19
+            while n > 0 do
+                digits(pos) = ('0' + (n % 10)).toByte
+                n = n / 10
+                pos -= 1
+            end while
+            new String(digits, pos + 1, 19 - pos, java.nio.charset.StandardCharsets.US_ASCII)
+        end if
+    end intToString
+
+end HttpHeaders

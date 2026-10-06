@@ -1,0 +1,196 @@
+package kyo
+
+class HostPathLockTest extends kyo.test.Test[Any]:
+
+    "Path lock operations dispatch through PathRead" in {
+        Scope.acquireRelease(FileSystem.host.tempDir("kyo-path-lock-dispatch"))(handle => Sync.Unsafe.defer(handle.remove())).map {
+            handle =>
+                val path = handle.path / "path-lock-target.bin"
+                Scope.run {
+                    Path.runReadOnlyWith(FileSystem.host) {
+                        path.lock(Path.LockMode.Shared, Path.LockWait.Immediate).map { lock =>
+                            path.tryLock(Path.LockMode.Exclusive).map { conflicting =>
+                                assert(lock.mode == Path.LockMode.Shared)
+                                assert(conflicting.isEmpty)
+                            }
+                        }
+                    }
+                }
+        }
+    }
+
+    "an interrupt delivered once the lock is held still releases it" in {
+        // The acquisition interrupts its own fiber from inside the claim node, via the hook
+        // HostFileSystem exposes for exactly this. The request is made with the OS lock already
+        // held, and delivery happens at the next safepoint, so the interrupt lands after the
+        // acquisition produced the lock rather than before it started. That instant is the whole
+        // defect: a release registered in a step after the claim does not exist yet when the
+        // interrupt lands, and the path stays unacquirable for the life of the process.
+        //
+        // Mutation-checked rather than assumed: registering the release with a `map` after the
+        // claim, instead of in the step the claim arrives, fails this case on the retry below. An
+        // interrupt from outside the fiber passes under both orderings, because it is delivered
+        // before the claim is ever made.
+        Scope.acquireRelease(FileSystem.host.tempDir("kyo-lock-window"))(h => Sync.Unsafe.defer(h.remove())).map { handle =>
+            val target = handle.path / "windowed.bin"
+            Scope.ensure(Sync.defer(HostFileSystem.afterClaimHook = () => ())).andThen {
+                Fiber.Promise.init[Fiber[Unit, Sync], Any].map { handoff =>
+                    Fiber.initUnscoped {
+                        handoff.get.map { self =>
+                            Sync.defer {
+                                import AllowUnsafe.embrace.danger
+                                HostFileSystem.afterClaimHook = () => discard(self.unsafe.interrupt())
+                            }.andThen {
+                                Abort.run[FileReadException | FileLockException](
+                                    Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive).unit)
+                                ).unit
+                            }
+                        }
+                    }.map { fiber =>
+                        handoff.complete(Result.succeed(fiber)).andThen(fiber.getResult)
+                    }
+                }.andThen {
+                    Sync.defer(HostFileSystem.afterClaimHook = () => ())
+                }.andThen {
+                    // Retried rather than attempted once. Interrupting a fiber starts its finalizer
+                    // but does not wait for it, so a correct release may still be in flight; that is
+                    // a lock briefly held, not a stranded one. A stranded lock never becomes
+                    // available, so only the retry distinguishes the two.
+                    assertEventually {
+                        Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map(_.isDefined))
+                    }
+                }
+            }
+        }
+    }
+
+    "repeated interrupted acquisitions leave the path acquirable" in {
+        // Interrupting from outside the fiber, so the interrupt lands wherever it lands rather than at a chosen
+        // point in the claim. Each round waits for its own claim first: interrupting at the spawn lands before
+        // the fiber runs, and a round that claimed nothing strands nothing. `afterClaimHook` fires with the OS
+        // claim held, so completing a promise there says the round had something to lose.
+        AtomicInt.init(0).map { claims =>
+            Scope.acquireRelease(FileSystem.host.tempDir("kyo-lock-interrupt"))(h => Sync.Unsafe.defer(h.remove())).map { handle =>
+                val target = handle.path / "contended.bin"
+                Scope.ensure(Sync.defer(HostFileSystem.afterClaimHook = () => ())).andThen {
+                    Loop.indexed { i =>
+                        if i >= 50 then Loop.done
+                        else
+                            Promise.init[Unit, Any].map { claimed =>
+                                Sync.defer {
+                                    // Unsafe: the hook is a plain `() => Unit` the file system calls with the
+                                    // claim held, so neither the count nor the signal can go through an effect.
+                                    import AllowUnsafe.embrace.danger
+                                    HostFileSystem.afterClaimHook = () =>
+                                        discard(claims.unsafe.incrementAndGet())
+                                        discard(claimed.unsafe.complete(Result.succeed(())))
+                                }.andThen {
+                                    Fiber.initUnscoped(
+                                        Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map(_ => ()))
+                                    ).map { fiber =>
+                                        // A round that finds the path still held by the previous round's
+                                        // in-flight release never fires the hook, so the fiber ending is
+                                        // raced against the claim.
+                                        Async.race(claimed.get, fiber.getResult.unit).andThen(fiber.interrupt)
+                                    }
+                                }.andThen(Loop.continue)
+                            }
+                    }.andThen {
+                        assertEventually {
+                            Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map(_.isDefined))
+                        }.andThen {
+                            claims.get.map { c =>
+                                assert(c > 0, s"no round reached the claim, so no interrupt landed on one that was held: claims=$c")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "data path I/O while holding the lock does not disturb the claim" in {
+        // The scenario from review: on POSIX, an fcntl lock on the data file itself is released
+        // the moment the same process closes any other handle to that file, so a read of the
+        // locked path would silently destroy cross-process exclusion. The claim lives on a
+        // sentinel sibling that data I/O never opens, so reads and writes of the data path leave
+        // it standing.
+        Scope.acquireRelease(FileSystem.host.tempDir("kyo-lock-sentinel"))(h => Sync.Unsafe.defer(h.remove())).map { handle =>
+            val target = handle.path / "state.bin"
+            Scope.run {
+                FileSystem.host.lock(target, Path.LockMode.Exclusive, Path.LockWait.Immediate).map { lock =>
+                    FileSystem.host.write(target, "first", Path.WriteOptions()).andThen {
+                        FileSystem.host.read(target).map { value =>
+                            assert(value == "first")
+                            FileSystem.host.write(target, "second", Path.WriteOptions()).andThen {
+                                lock.check.andThen {
+                                    FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map { conflicting =>
+                                        assert(conflicting.isEmpty, "the claim was lost after data path I/O")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }.andThen {
+                Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map(released => assert(released.isDefined)))
+            }
+        }
+    }
+
+    "claims under different sentinel suffixes are independent" in {
+        // The suffix names the sentinel sibling and is part of the lock's identity: two exclusive
+        // claims on one data path under different suffixes contend on different files, so both are
+        // granted, while a second claim under the same suffix still conflicts.
+        Scope.acquireRelease(FileSystem.host.tempDir("kyo-lock-suffix"))(h => Sync.Unsafe.defer(h.remove())).map { handle =>
+            val target = handle.path / "state.bin"
+            Scope.run {
+                FileSystem.host.lock(target, Path.LockMode.Exclusive, Path.LockWait.Immediate).map { _ =>
+                    FileSystem.host.tryLock(target, Path.LockMode.Exclusive).map { sameSuffix =>
+                        assert(sameSuffix.isEmpty, "a same-suffix claim did not conflict")
+                        FileSystem.host.tryLock(target, Path.LockMode.Exclusive, sentinelSuffix = ".other-lock").map { otherSuffix =>
+                            assert(otherSuffix.isDefined, "a claim under a different suffix was refused")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "an invalid sentinel suffix is refused with a typed failure" in {
+        // Empty would put the claim on the data file itself, resurrecting the POSIX
+        // unlock-on-close hazard; a separator would move the sentinel into another directory.
+        Scope.acquireRelease(FileSystem.host.tempDir("kyo-lock-suffix-invalid"))(h => Sync.Unsafe.defer(h.remove())).map { handle =>
+            val target = handle.path / "state.bin"
+            Abort.run[FileReadException | FileLockException](
+                Scope.run(FileSystem.host.tryLock(target, Path.LockMode.Exclusive, sentinelSuffix = "").unit)
+            ).map { empty =>
+                assert(empty.failure.exists(_.isInstanceOf[FileInvalidPathException]))
+                Abort.run[FileReadException | FileLockException](
+                    Scope.run(FileSystem.host.lock(target, Path.LockMode.Exclusive, Path.LockWait.Immediate, "bad/suffix").unit)
+                ).map { separator =>
+                    assert(separator.failure.exists(_.isInstanceOf[FileInvalidPathException]))
+                }
+            }
+        }
+    }
+
+    "failed raw release remains retryable" in {
+        AtomicInt.init(0).map { releases =>
+            val raw = new Path.RawLock:
+                def isExclusive: Boolean                                                 = true
+                def check()(using AllowUnsafe, Frame): Result[FileLockException, Unit]   = Result.unit
+                def release()(using AllowUnsafe, Frame): Result[FileLockException, Unit] =
+                    if releases.unsafe.incrementAndGet() == 1 then Result.fail(FileLockOwnershipLostException(Path("retry-lock")))
+                    else Result.unit
+            AtomicInt.init(0).map { state =>
+                val service = new HostFileSystem.HostFileSystem
+                val lock    = service.lockFrom(Path("retry-lock"), raw, Path.LockMode.Exclusive, state)
+                Abort.run[FileLockException](lock.release(lock.ownership)).map { first =>
+                    assert(first.isFailure)
+                    lock.release(lock.ownership).andThen(releases.get.map(count => assert(count == 2)))
+                }
+            }
+        }
+    }
+end HostPathLockTest

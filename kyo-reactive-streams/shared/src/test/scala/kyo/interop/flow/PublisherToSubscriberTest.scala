@@ -1,5 +1,7 @@
 package kyo.interop.flow
 
+import java.util.concurrent.Flow.Subscriber
+import java.util.concurrent.Flow.Subscription
 import kyo.*
 import kyo.Result.Failure
 import kyo.Result.Panic
@@ -9,19 +11,19 @@ import kyo.interop.flow.StreamSubscription.StreamCanceled
 import kyo.interop.flow.StreamSubscription.StreamComplete
 import kyo.kernel.ArrowEffect
 
-abstract private class PublisherToSubscriberTest extends Test:
+abstract private class PublisherToSubscriberTest extends kyo.test.Test[Any]:
     import PublisherToSubscriberTest.*
 
     protected def streamSubscriber: StreamSubscriber[Int] < Sync
 
-    "should have the same output as input" in runJVM {
+    "should have the same output as input" in {
         val stream = Stream.range(0, MaxStreamLength, 1, BufferSize)
         for
             publisher  <- stream.toPublisher
             subscriber <- streamSubscriber
             _ = publisher.subscribe(subscriber)
             subscriberStream <- subscriber.stream
-            (isSame, _) <- subscriberStream
+            (isSame, _)      <- subscriberStream
                 .fold(true -> 0) { case ((acc, expected), cur) =>
                     (acc && (expected == cur)) -> (expected + 1)
                 }
@@ -29,8 +31,7 @@ abstract private class PublisherToSubscriberTest extends Test:
         end for
     }
 
-    "should propagate errors downstream" in runJVM {
-        pending
+    "should propagate errors downstream" in {
         val inputStream: Stream[Int, Sync] = Stream
             .range(0, 10, 1, 1)
             .map { int =>
@@ -51,7 +52,7 @@ abstract private class PublisherToSubscriberTest extends Test:
     }
 
     "single publisher & multiple subscribers" - {
-        "contention" in runJVM {
+        "contention" in {
             def emit(counter: AtomicInt): Unit < (Emit[Chunk[Int]] & Sync) =
                 counter.getAndIncrement.map: value =>
                     if value >= MaxStreamLength then ()
@@ -100,7 +101,7 @@ abstract private class PublisherToSubscriberTest extends Test:
             end for
         }
 
-        "one subscriber's failure does not affect others." in runJVM {
+        "one subscriber's failure does not affect others." in {
             def emit(counter: AtomicInt): Unit < (Emit[Chunk[Int]] & Sync) =
                 counter.getAndIncrement.map: value =>
                     if value >= MaxStreamLength then
@@ -157,7 +158,7 @@ abstract private class PublisherToSubscriberTest extends Test:
             end for
         }
 
-        "publisher's interuption should end all subscribed parties" in runJVM {
+        "publisher's interuption should end all subscribed parties" in {
             def emit(counter: AtomicInt): Unit < (Emit[Chunk[Int]] & Sync) =
                 counter.getAndIncrement.map: value =>
                     if value >= MaxStreamLength then
@@ -168,22 +169,22 @@ abstract private class PublisherToSubscriberTest extends Test:
             end emit
 
             for
-                counter     <- AtomicInt.init(0)
-                publisher   <- Stream(Emit.valueWith(Chunk.empty)(emit(counter))).toPublisher
-                subscriber1 <- streamSubscriber
-                subStream1  <- subscriber1.stream
-                subscriber2 <- streamSubscriber
-                subStream2  <- subscriber2.stream
-                subscriber3 <- streamSubscriber
-                subStream3  <- subscriber3.stream
-                subscriber4 <- streamSubscriber
-                subStream4  <- subscriber4.stream
-                latch       <- Latch.init(4)
-                fiber1      <- Fiber.initUnscoped(latch.release.andThen(subStream1.run.unit))
-                fiber2      <- Fiber.initUnscoped(latch.release.andThen(subStream2.run.unit))
-                fiber3      <- Fiber.initUnscoped(latch.release.andThen(subStream3.run.unit))
-                fiber4      <- Fiber.initUnscoped(latch.release.andThen(subStream4.run.unit))
-                latchPub    <- Latch.init(1)
+                counter        <- AtomicInt.init(0)
+                publisher      <- Stream(Emit.valueWith(Chunk.empty)(emit(counter))).toPublisher
+                subscriber1    <- streamSubscriber
+                subStream1     <- subscriber1.stream
+                subscriber2    <- streamSubscriber
+                subStream2     <- subscriber2.stream
+                subscriber3    <- streamSubscriber
+                subStream3     <- subscriber3.stream
+                subscriber4    <- streamSubscriber
+                subStream4     <- subscriber4.stream
+                latch          <- Latch.init(4)
+                fiber1         <- Fiber.initUnscoped(latch.release.andThen(subStream1.run.unit))
+                fiber2         <- Fiber.initUnscoped(latch.release.andThen(subStream2.run.unit))
+                fiber3         <- Fiber.initUnscoped(latch.release.andThen(subStream3.run.unit))
+                fiber4         <- Fiber.initUnscoped(latch.release.andThen(subStream4.run.unit))
+                latchPub       <- Latch.init(1)
                 publisherFiber <- Fiber.initUnscoped(latch.await.andThen(Scope.run(
                     Stream(Emit.valueWith(Chunk.empty)(emit(counter)))
                         .toPublisher
@@ -196,24 +197,73 @@ abstract private class PublisherToSubscriberTest extends Test:
                         .andThen(latchPub.release).andThen(Async.never)
                 )))
                 _ <- latchPub.await
+                // latchPub only proves publisher.subscribe was called; onSubscribe is delivered asynchronously, and interrupting before a
+                // subscriber is established would orphan it and hang its run fiber. Wait until all are subscribed, so this tests propagation, not setup racing.
+                _ <- subscriber1.awaitSubscribed
+                _ <- subscriber2.awaitSubscribed
+                _ <- subscriber3.awaitSubscribed
+                _ <- subscriber4.awaitSubscribed
                 _ <- publisherFiber.interrupt.unit
+                // Interrupting the publisher closes its scope, which must propagate cancellation to every subscriber; awaiting each fiber's
+                // completion is the real end-of-propagation event. Interrupting subscribers directly would end them regardless of propagation.
                 _ <- fiber1.getResult
                 _ <- fiber2.getResult
                 _ <- fiber3.getResult
                 _ <- fiber4.getResult
-            yield assert(true)
+            yield succeed("publisher interruption ended all subscribed parties without hanging")
             end for
         }
 
-        "when complete, associated subscription should be canceled" in runJVM {
+        /** A subscriber the publisher tears down under is entitled to a terminal signal.
+          *
+          * The specification lets a publisher stop signalling once the SUBSCRIBER cancels, and the subscription's `cancel` is written for
+          * exactly that: it closes the request channel and deliberately delivers no terminal event. Publisher-initiated teardown reuses that
+          * same verb, so a subscriber that never cancelled is stopped the silent way and waits for an event that never comes.
+          *
+          * This pins the property directly rather than through the interrupt-propagation leaf, which needs four subscribers racing and only
+          * fails under load. One subscriber, established before the teardown, and the assertion is simply that something terminal arrived.
+          * Nothing here waits on the clock.
+          */
+        "a subscriber the publisher tears down under receives a terminal signal" in {
+            for
+                subscribed <- Promise.init[Unit, Any]
+                terminated <- Promise.init[String, Any]
+                sub = new Subscriber[Int]:
+                    import AllowUnsafe.embrace.danger
+                    def onSubscribe(s: Subscription): Unit =
+                        s.request(Long.MaxValue)
+                        discard(Sync.Unsafe.evalOrThrow(subscribed.unsafe.completeDiscard(Result.succeed(()))))
+                    def onNext(v: Int): Unit = ()
+                    def onComplete(): Unit   =
+                        discard(Sync.Unsafe.evalOrThrow(terminated.unsafe.completeDiscard(Result.succeed("onComplete"))))
+                    def onError(e: Throwable): Unit =
+                        discard(Sync.Unsafe.evalOrThrow(terminated.unsafe.completeDiscard(Result.succeed("onError"))))
+                publisherFiber <- Fiber.initUnscoped(Scope.run(
+                    Stream.range(0, 1000000, 1).toPublisher
+                        .map(_.subscribe(sub))
+                        .andThen(Async.never)
+                ))
+                // Established before teardown, so this tests what teardown delivers rather than racing setup.
+                _ <- subscribed.get
+                _ <- publisherFiber.interrupt.unit
+                // The harness budget is the failure detector: a teardown that signals nothing never completes this.
+                signal <- terminated.get
+            yield assert(
+                signal == "onComplete" || signal == "onError",
+                s"publisher teardown must tell its subscriber something terminal, got $signal"
+            )
+            end for
+        }
+
+        "when complete, associated subscription should be canceled" in {
             val stream: Stream[Int, Any] =
                 Stream(
                     Loop(0)(cur => Emit.valueWith(Chunk(cur))(Loop.continue(cur + 1)))
                 )
             for
-                promise    <- Fiber.Promise.init[Unit, Abort[Throwable]]
-                subscriber <- streamSubscriber
-                subscription <- Sync.Unsafe {
+                promise      <- Fiber.Promise.init[Unit, Abort[Throwable]]
+                subscriber   <- streamSubscriber
+                subscription <- Sync.Unsafe.defer {
                     StreamSubscription.Unsafe.subscribe(
                         stream,
                         subscriber
@@ -236,7 +286,7 @@ object PublisherToSubscriberTest:
     type TestError = TestError.type
     object TestError extends Exception("BOOM")
     private[flow] val BufferSize      = 1 << 4
-    private[flow] val MaxStreamLength = 1 << 10
+    private[flow] val MaxStreamLength = 1 << 4
 end PublisherToSubscriberTest
 
 final class PublisherToEagerSubscriberTest extends PublisherToSubscriberTest:

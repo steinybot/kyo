@@ -2,7 +2,17 @@ package kyo
 
 import scala.util.Try
 
-class AbortCombinatorsTest extends Test:
+// kyo-test's leaf-decorator `.retry(n)` (inherited from kyo.test.Test) outranks kyo-combinators' computation
+// `.retry` extension inside the suite body: an inherited member shadows a package-level extension, and Scala's
+// reference precedence does not let an import or package-level definition override it. Re-expose the combinator
+// here at top level, outside the suite, where no TestBase member is in scope, so the tests below exercise the
+// real AbortCombinators.retry. (The `effect.forAbort[E].retry(...)` sites are unaffected: forAbort's result type
+// carries its own `retry` member.)
+extension [A, S, E](effect: A < (Abort[E] & S))
+    private def retryCombinator(n: Int)(using ConcreteTag[E], Frame): A < (S & Abort[E]) =
+        effect.retry(n)
+
+class AbortCombinatorsTest extends kyo.test.Test[Any]:
 
     given ce[A, B]: CanEqual[A, B] = CanEqual.canEqualAny
 
@@ -234,7 +244,7 @@ class AbortCombinatorsTest extends Test:
             }
 
             "should map union abort" in {
-                val effect1 = Abort.fail[String | Int | Boolean]("failure")
+                val effect1       = Abort.fail[String | Int | Boolean]("failure")
                 val effect1Mapped = effect1.mapAbort:
                     case str: String => 0
                     case _           => -1
@@ -336,7 +346,7 @@ class AbortCombinatorsTest extends Test:
                     }.orThrow
                 assert(handledFailure.eval == 100)
                 val success: Int < Abort[String] = 23
-                val handledSuccess: Int < Any =
+                val handledSuccess: Int < Any    =
                     success.recover {
                         case "wrong"   => 99
                         case "failure" => 100
@@ -366,7 +376,7 @@ class AbortCombinatorsTest extends Test:
                 val handledFailure: Result[String, Int] < Any =
                     Abort.run[String](caughtFailure)
                 assert(handledFailure.eval == Result.succeed(100))
-                val success: Int < Abort[String] = 23
+                val success: Int < Abort[String]       = 23
                 val caughtSuccess: Int < Abort[String] =
                     success.recoverSome {
                         case "failure" => 100
@@ -391,7 +401,7 @@ class AbortCombinatorsTest extends Test:
 
         "foldAbort" - {
             "should handle success and fail case, leaving panics unhandled, when two handlers provided" in {
-                val success: Int < Abort[String] = 23
+                val success: Int < Abort[String]            = 23
                 val handledSuccess: String < Abort[Nothing] =
                     success.foldAbort(
                         i => i.toString,
@@ -406,8 +416,8 @@ class AbortCombinatorsTest extends Test:
                         identity
                     )
                 assert(handledFailure.orThrow.eval == "failure")
-                val exc                        = Exception("message")
-                val panic: Int < Abort[String] = Abort.panic(exc)
+                val exc                                   = Exception("message")
+                val panic: Int < Abort[String]            = Abort.panic(exc)
                 val handledPanic: String < Abort[Nothing] = panic.foldAbort(
                     i => i.toString,
                     identity
@@ -499,7 +509,7 @@ class AbortCombinatorsTest extends Test:
 
         "retry" - {
             "retry n times" - {
-                "succeeding" in run {
+                "succeeding" in {
                     val effect =
                         for
                             _ <- Var.update[Int](_ + 1)
@@ -507,13 +517,13 @@ class AbortCombinatorsTest extends Test:
                         yield i
 
                     Var.run(0) {
-                        effect.retry(5).map: i =>
+                        effect.retryCombinator(5).map: i =>
                             Var.get[Int].map: i2 =>
                                 assert(i == 1 && i2 == 1)
                     }
                 }
 
-                "failing" in run {
+                "failing" in {
                     val effect =
                         for
                             _ <- Var.update[Int](_ + 1)
@@ -522,13 +532,13 @@ class AbortCombinatorsTest extends Test:
                         yield ()
 
                     Var.run(0) {
-                        Abort.run(effect.retry(5)).map: result =>
+                        Abort.run(effect.retryCombinator(5)).map: result =>
                             Var.get[Int].map: i =>
                                 assert(result == Result.Failure(6) && i == 6)
                     }
                 }
 
-                "failing then succeeeding" in run {
+                "failing then succeeeding" in {
                     val effect =
                         for
                             _ <- Var.update[Int](_ + 1)
@@ -537,7 +547,7 @@ class AbortCombinatorsTest extends Test:
                         yield i
 
                     Var.run(0) {
-                        effect.retry(5).map: i =>
+                        effect.retryCombinator(5).map: i =>
                             Var.get[Int].map: i2 =>
                                 assert(i == 5 && i2 == 5)
                     }
@@ -634,19 +644,19 @@ class AbortCombinatorsTest extends Test:
             "recoverSome" - {
                 "should catch some abort with partial function" in {
                     val effect: Int < Abort[String | Boolean] = Abort.fail("error")
-                    val caught = effect.forAbort[String].recoverSome {
+                    val caught                                = effect.forAbort[String].recoverSome {
                         case "error" => 99
                     }
                     assert(Abort.run[Any](caught).eval == Result.succeed(99))
 
                     val effect2: Int < Abort[String | Boolean] = Abort.fail("other")
-                    val caught2 = effect2.forAbort[String].recoverSome {
+                    val caught2                                = effect2.forAbort[String].recoverSome {
                         case "error" => 99
                     }
                     assert(Abort.run[Any](caught2).eval == Result.fail("other"))
 
                     val effect3: Int < Abort[String | Boolean] = 42
-                    val caught3 = effect3.forAbort[String].recoverSome {
+                    val caught3                                = effect3.forAbort[String].recoverSome {
                         case "error" => 99
                     }
                     assert(Abort.run[Any](caught3).eval == Result.succeed(42))
@@ -685,7 +695,7 @@ class AbortCombinatorsTest extends Test:
 
             "fold" - {
                 "should handle success and fail case, throwing panics, when two handlers provided" in {
-                    val success: Int < Abort[String | Boolean] = 23
+                    val success: Int < Abort[String | Boolean]  = 23
                     val handledSuccess: String < Abort[Boolean] =
                         success.forAbort[String].fold(
                             i => i.toString,
@@ -706,7 +716,7 @@ class AbortCombinatorsTest extends Test:
                             i => i.toString,
                             identity
                         )
-                        succeed
+                        ()
                     catch
                         case e: Exception => assert(e.getMessage == "message")
                     end try
@@ -743,7 +753,7 @@ class AbortCombinatorsTest extends Test:
 
             "retry" - {
                 "retry n times" - {
-                    "succeeding" in run {
+                    "succeeding" in {
                         val effect: Int < (Var[Int] & Abort[String | Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -757,7 +767,7 @@ class AbortCombinatorsTest extends Test:
                         }
                     }
 
-                    "failing" in run {
+                    "failing" in {
                         val effect: Unit < (Var[Int] & Abort[String | Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -766,13 +776,13 @@ class AbortCombinatorsTest extends Test:
                             yield ()
 
                         Var.run(0) {
-                            Abort.run(effect.retry(5)).map: result =>
+                            Abort.run(effect.retryCombinator(5)).map: result =>
                                 Var.get[Int].map: i =>
                                     assert(result == Result.Failure(6) && i == 6)
                         }
                     }
 
-                    "failing retried type" in run {
+                    "failing retried type" in {
                         val effect: Unit < (Var[Int] & Abort[String | Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -787,7 +797,7 @@ class AbortCombinatorsTest extends Test:
                         }
                     }
 
-                    "failing non-retried type" in run {
+                    "failing non-retried type" in {
                         val effect: Unit < (Var[Int] & Abort[String | Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -803,8 +813,8 @@ class AbortCombinatorsTest extends Test:
                         }
                     }
 
-                    "failing panic without forAbort" in run {
-                        val exception = Exception("failure")
+                    "failing panic without forAbort" in {
+                        val exception                                  = Exception("failure")
                         val effect: Unit < (Var[Int] & Abort[Nothing]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -813,14 +823,14 @@ class AbortCombinatorsTest extends Test:
                             yield ()
 
                         Var.run(0) {
-                            Abort.run(effect.retry(5)).map: result =>
+                            Abort.run(effect.retryCombinator(5)).map: result =>
                                 Var.get[Int].map: i =>
                                     assert(result == Result.Panic(exception) && i == 6)
                         }
                     }
 
-                    "failing panic with forAbort" in run {
-                        val exception = Exception("failure")
+                    "failing panic with forAbort" in {
+                        val exception                              = Exception("failure")
                         val effect: Unit < (Var[Int] & Abort[Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -836,7 +846,7 @@ class AbortCombinatorsTest extends Test:
                         }
                     }
 
-                    "failing then succeeeding" in run {
+                    "failing then succeeeding" in {
                         val effect: Int < (Var[Int] & Abort[String | Int]) =
                             for
                                 _ <- Var.update[Int](_ + 1)
@@ -845,7 +855,7 @@ class AbortCombinatorsTest extends Test:
                             yield i
 
                         Var.run(0) {
-                            effect.retry(5).map: i =>
+                            effect.retryCombinator(5).map: i =>
                                 Var.get[Int].map: i2 =>
                                     assert(i == 5 && i2 == 5)
                         }

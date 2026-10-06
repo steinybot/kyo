@@ -13,6 +13,7 @@ import kyo.kernel.*
   * occurred. This rich error context makes debugging easier by providing precise information about what failed and where.
   *
   * Three handling strategies give flexibility in how validation failures are processed:
+  *
   *   - Collecting all failures for later inspection
   *   - Converting failures to the `Abort` effect for immediate error propagation
   *   - Discarding failures for non-critical validations
@@ -73,9 +74,7 @@ object Check:
       *   A computation that may abort with CheckFailed if any checks fail
       */
     def runAbort[A, S](v: A < (Check & S))(using Frame): A < (Abort[CheckFailed] & S) =
-        ArrowEffect.handle(Tag[Check], v)(
-            [C] => (input, cont) => Abort.fail(input)
-        )
+        ArrowEffect.handleCont(Tag[Check], v)([C] => (input, cont) => Abort.fail(input))
 
     /** Runs a computation with Check effect, collecting all failures.
       *
@@ -85,11 +84,9 @@ object Check:
       *   A tuple of collected failures and the computation result
       */
     def runChunk[A, S](v: A < (Check & S))(using Frame): (Chunk[CheckFailed], A) < S =
-        ArrowEffect.handleLoop(Tag[Check], Chunk.empty[CheckFailed], v)(
-            handle = [C] =>
-                (input, state, cont) =>
-                    Loop.continue(state.append(input), cont(())),
-            done = (state, result) => (state, result)
+        ArrowEffect.handleLoopState(Tag[Check], Chunk.empty[CheckFailed], v)(
+            [C] => (state, input) => Loop.continue(state.append(input), ()),
+            (state, result) => (state, result)
         )
 
     /** Runs a computation with Check effect, discarding any failures.
@@ -100,16 +97,14 @@ object Check:
       *   The result of the computation, ignoring any check failures
       */
     def runDiscard[A, S](v: A < (Check & S))(using Frame): A < S =
-        ArrowEffect.handle(Tag[Check], v)(
-            [C] => (_, cont) => cont(())
-        )
+        ArrowEffect.handleLoop(Tag[Check], v)([C] => _ => Loop.continue(()))
 
     /** Default isolate that accumulates and re-emits failures.
       *
       * When the isolation ends, accumulates any check failures that occurred during the isolated computation with failures from the outer
       * context. This allows building up a complete set of failed checks.
       *
-      * Important: Note that `Check.runAbort(Async.parallel(computation1, computation2))` will only short circuit once both computations
+      * Important: Note that `Check.runAbort(Async.foreach(computation1, computation2))` will only short circuit once both computations
       * finish and the isolate re-emits values to restore its state.
       */
     given isolate: Isolate[Check, Any, Check] with

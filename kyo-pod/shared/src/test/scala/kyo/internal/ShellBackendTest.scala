@@ -1,0 +1,363 @@
+package kyo.internal
+
+import kyo.*
+
+class ShellBackendTest extends kyo.BasePodTest:
+
+    "probeUsable" - {
+
+        // The decision table behind detect's CLI fall-through. The non-zero leaf reproduces a live failure: with the
+        // podman machine VM stopped, `podman version` exits 125 with empty stdout, and the earlier guarded match in
+        // detect escaped as `scala.MatchError: (,Failure(125))` instead of falling through to docker.
+        "a zero exit is usable" in {
+            assert(ShellBackend.probeUsable(Result.Success(("podman version 5.0", Process.ExitCode.Success))))
+        }
+
+        "a non-zero exit is not usable" in {
+            assert(!ShellBackend.probeUsable(Result.Success(("", Process.ExitCode.Failure(125)))))
+        }
+
+        "a signal exit is not usable" in {
+            assert(!ShellBackend.probeUsable(Result.Success(("", Process.ExitCode.Signaled(9)))))
+        }
+
+        "a spawn failure is not usable" in {
+            assert(!ShellBackend.probeUsable(Result.Failure(ProgramNotFoundException("podman"))))
+        }
+
+        "a panic is not usable" in {
+            assert(!ShellBackend.probeUsable(Result.Panic(new RuntimeException("boom"))))
+        }
+    }
+
+    "lastLine" - {
+
+        "empty input returns empty" in {
+            assert(ShellBackend.lastLine("") == "")
+        }
+
+        "whitespace-only input returns empty" in {
+            assert(ShellBackend.lastLine("   \n  \n\t\n") == "")
+        }
+
+        "single line returns the line trimmed" in {
+            assert(
+                ShellBackend.lastLine("66451f24177d4ba33ecf6aa2c7270c2ee8dc90d61e180fae085332f380b1f5e2") ==
+                    "66451f24177d4ba33ecf6aa2c7270c2ee8dc90d61e180fae085332f380b1f5e2"
+            )
+            ()
+        }
+
+        "trailing newline is stripped" in {
+            assert(ShellBackend.lastLine("abc123\n") == "abc123")
+        }
+
+        // Reproduces the CI failure: rootless podman without a systemd user session emits cgroupv2
+        // fallback warnings to stderr, which run() merges into stdout via 2>&1. Without lastLine,
+        // the entire blob would be passed to `podman start` as the container ID.
+        "podman cgroupv2 warnings before container ID" in {
+            val output =
+                """time="2026-04-25T21:13:13Z" level=warning msg="The cgroupv2 manager is set to systemd but there is no systemd user session available"
+                  |time="2026-04-25T21:13:13Z" level=warning msg="For using systemd, you may need to log in using a user session"
+                  |time="2026-04-25T21:13:13Z" level=warning msg="Alternatively, you can enable lingering with: `loginctl enable-linger 1001` (possibly as root)"
+                  |time="2026-04-25T21:13:13Z" level=warning msg="Falling back to --cgroup-manager=cgroupfs"
+                  |Resolved "alpine" as an alias (/etc/containers/registries.conf.d/shortnames.conf)
+                  |Trying to pull docker.io/library/alpine:latest...
+                  |Getting image source signatures
+                  |Copying blob sha256:6a0ac1617861a677b045b7ff88545213ec31c0ff08763195a70a4a5adda577bb
+                  |Copying config sha256:3cb067eab609612d81b4d82ff8ad71d73482bb3059a87b642d7e14f0ed659cde
+                  |Writing manifest to image destination
+                  |66451f24177d4ba33ecf6aa2c7270c2ee8dc90d61e180fae085332f380b1f5e2""".stripMargin
+            assert(
+                ShellBackend.lastLine(output) ==
+                    "66451f24177d4ba33ecf6aa2c7270c2ee8dc90d61e180fae085332f380b1f5e2"
+            )
+            ()
+        }
+
+        // Reproduces the CI failure: docker auto-pulls when the image is not local on `docker create`,
+        // emitting pull progress to stdout before the container ID.
+        "docker auto-pull progress before container ID" in {
+            val output =
+                """Unable to find image 'alpine:latest' locally
+                  |latest: Pulling from library/alpine
+                  |6a0ac1617861: Pulling fs layer
+                  |6a0ac1617861: Download complete
+                  |6a0ac1617861: Pull complete
+                  |Digest: sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+                  |Status: Downloaded newer image for alpine:latest
+                  |4aecf173944311ec19d8f8cdb5659c1ca2a64873d1c40c240a76ee9a38c5f743""".stripMargin
+            assert(
+                ShellBackend.lastLine(output) ==
+                    "4aecf173944311ec19d8f8cdb5659c1ca2a64873d1c40c240a76ee9a38c5f743"
+            )
+            ()
+        }
+
+        "blank lines between content are skipped" in {
+            assert(ShellBackend.lastLine("first\n\n\nlast\n") == "last")
+        }
+
+        "trailing whitespace lines are skipped" in {
+            assert(ShellBackend.lastLine("the-id\n   \n\t\n") == "the-id")
+        }
+
+        "windows CRLF line endings" in {
+            assert(ShellBackend.lastLine("warning\r\nthe-id\r\n") == "the-id")
+        }
+    }
+    // =========================================================================
+    // tar exit code primitive
+    // =========================================================================
+
+    "tar exit code primitive" - {
+        "tar with missing source path produces non-zero exit code" in {
+            // Reproduce the primitive: spawn `tar -cf - /nonexistent`, drain stdout, observe exitValue.
+            // Production code at HttpContainerBackend.scala (copyTo and imageBuildFromPath)
+            // calls proc.stdout.run WITHOUT proc.waitFor — this test pins the primitive that must be checked.
+            Scope.run {
+                Command("tar", "-cf", "-", "/tmp/kyo-no-such-dir-" + java.util.UUID.randomUUID).spawn.map { proc =>
+                    for
+                        _    <- proc.stdout.run
+                        exit <- proc.waitFor
+                    yield assert(
+                        exit != ExitCode.Success,
+                        s"tar with missing path must exit non-zero so production code can detect; got $exit"
+                    )
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // parseLogTimestamp boundary cases
+    // =========================================================================
+
+    "parseLogTimestamp" - {
+        import kyo.internal.ShellBackend.parseLogLines
+
+        "Docker zulu format" in {
+            val raw   = "2024-04-29T12:00:00.000Z hello world"
+            val lines = parseLogLines(raw, kyo.Container.LogEntry.Source.Stdout, hasTimestamps = true)
+            assert(lines.head.content == "hello world")
+            assert(lines.head.timestamp.nonEmpty)
+        }
+
+        "Podman offset format" in {
+            val raw   = "2024-04-29T05:00:00-07:00 line content"
+            val lines = parseLogLines(raw, kyo.Container.LogEntry.Source.Stdout, hasTimestamps = true)
+            assert(lines.head.content == "line content")
+            assert(lines.head.timestamp.nonEmpty)
+        }
+
+        "first space < index 20 falls through to no-timestamp form" in {
+            val raw   = "short bla"
+            val lines = parseLogLines(raw, kyo.Container.LogEntry.Source.Stdout, hasTimestamps = true)
+            assert(lines.size == 1)
+        }
+
+        "no-space line returns LogEntry with raw content" in {
+            val raw   = "noseparators"
+            val lines = parseLogLines(raw, kyo.Container.LogEntry.Source.Stdout, hasTimestamps = true)
+            assert(lines.head.content == "noseparators")
+            assert(lines.head.timestamp == Absent)
+        }
+    }
+
+    // =========================================================================
+    // parseTopOutput
+    // =========================================================================
+
+    "top output parsing" - {
+
+        "empty output yields empty TopResult (titles, processes both empty)" in {
+            import kyo.internal.ShellBackend.parseTopOutput
+            val r = parseTopOutput("")
+            assert(r.titles.isEmpty, s"empty output produced titles=${r.titles}; expected empty")
+            assert(r.processes.isEmpty)
+        }
+
+        "blank-only output yields empty TopResult" in {
+            import kyo.internal.ShellBackend.parseTopOutput
+            val r = parseTopOutput("   \n  \n")
+            assert(r.titles.isEmpty)
+            assert(r.processes.isEmpty)
+        }
+
+        "single header line yields titles only, no processes" in {
+            import kyo.internal.ShellBackend.parseTopOutput
+            val r = parseTopOutput("UID PID PPID")
+            assert(r.titles.length == 3)
+            assert(r.processes.isEmpty)
+        }
+    }
+
+    // =========================================================================
+    // classifyLoginError — auth-error classification for docker login failures
+    // =========================================================================
+
+    "classifyLoginError" - {
+        import kyo.internal.ShellBackend.classifyLoginError
+
+        "denied → ContainerAuthException" in {
+            val ex = classifyLoginError("ghcr.io", "unauthorized: denied")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "unauthorized → ContainerAuthException" in {
+            val ex = classifyLoginError("ghcr.io", "Error response: unauthorized: incorrect username or password")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "forbidden → ContainerAuthException" in {
+            val ex = classifyLoginError("registry.example.com", "403 Forbidden from server")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "no basic auth credentials → ContainerAuthException" in {
+            val ex = classifyLoginError("docker.io", "no basic auth credentials")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "invalid username or password → ContainerAuthException" in {
+            val ex = classifyLoginError("docker.io", "invalid username or password")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "incorrect username or password → ContainerAuthException" in {
+            val ex = classifyLoginError("docker.io", "incorrect username or password")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "access denied → ContainerAuthException" in {
+            val ex = classifyLoginError("ghcr.io", "access denied")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "authentication required → ContainerAuthException" in {
+            val ex = classifyLoginError("ghcr.io", "authentication required")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "case-insensitive matching → ContainerAuthException" in {
+            val ex = classifyLoginError("ghcr.io", "UNAUTHORIZED: Access Denied")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException])
+        }
+
+        "non-auth stderr → ContainerOperationException with 'auth' in message" in {
+            val ex = classifyLoginError("ghcr.io", "tag does not exist")
+            assert(ex.isInstanceOf[kyo.ContainerOperationException])
+            val msg = Option(ex.getMessage).getOrElse("").toLowerCase
+            assert(msg.contains("auth"), s"expected 'auth' in fallback message, got: $msg")
+        }
+
+        "empty output → ContainerOperationException with 'auth' in message" in {
+            val ex = classifyLoginError("ghcr.io", "")
+            assert(ex.isInstanceOf[kyo.ContainerOperationException])
+            val msg = Option(ex.getMessage).getOrElse("").toLowerCase
+            assert(msg.contains("auth"), s"expected 'auth' in fallback message, got: $msg")
+        }
+
+        "ContainerAuthException carries registry as first field" in {
+            val ex = classifyLoginError("ghcr.io", "unauthorized: denied")
+            ex match
+                case kyo.ContainerAuthException(registry, _) =>
+                    assert(registry == "ghcr.io")
+                case _ => fail(s"expected ContainerAuthException, got $ex")
+            end match
+        }
+    }
+
+    /** A pull that reached the registry and got a server error is not a pull that found nothing.
+      *
+      * Everything podman prints about a failed pull opens with `initializing source docker://<ref>`, whether the manifest was absent or the
+      * registry could not answer. Classifying the whole family as a missing image gives a transient outage the one label callers treat as
+      * permanent, and `Container.init` then fails a container that a second attempt would have started. Only the status podman quotes back
+      * separates the two.
+      */
+    "mapError on a failed pull" - {
+        val backend = new ShellBackend("podman")
+        val ctx     = ResourceContext.Image("alpine:3.20")
+
+        def classify(output: String)(using Frame): kyo.ContainerException =
+            backend.mapError(output, ctx, Seq("pull", "alpine:3.20"))
+
+        // The shape podman printed on main run 35491732864, with the reference it was asked for.
+        "a quoted gateway status is a registry fault" in {
+            val ex = classify(
+                "Error: initializing source docker://alpine:3.20: reading manifest 3.20 in docker.io/library/alpine: " +
+                    "received unexpected HTTP status: 502 Bad Gateway"
+            )
+            assert(ex.isInstanceOf[kyo.ContainerRegistryUnavailableException], s"expected a registry-unavailable failure, got $ex")
+        }
+
+        "every quoted server status is a registry fault" in {
+            val statuses = Seq("500 Internal Server Error", "502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout")
+            val classes  =
+                statuses.map(s => classify(s"Error: initializing source docker://alpine:3.20: received unexpected HTTP status: $s"))
+            assert(
+                classes.forall(_.isInstanceOf[kyo.ContainerRegistryUnavailableException]),
+                s"expected every quoted server status to read as a registry fault, got $classes"
+            )
+        }
+
+        // The other half of the contract: an absent image must still read as absent, or the retry above would
+        // spend its whole schedule on an image that is never going to appear.
+        "a manifest the registry answered for is still a missing image" in {
+            val ex = classify(
+                "Error: initializing source docker://alpine:nope: reading manifest nope in docker.io/library/alpine: manifest unknown"
+            )
+            assert(ex.isInstanceOf[kyo.ContainerImageMissingException], s"expected a missing image, got $ex")
+        }
+
+        "a registry denial is still an auth failure" in {
+            val ex = classify("Error: initializing source docker://private/app:1: unauthorized: authentication required")
+            assert(ex.isInstanceOf[kyo.ContainerAuthException], s"expected an auth failure, got $ex")
+        }
+
+        "a connection to the registry that failed is a registry fault, not a missing image" in {
+            val transport = Seq(
+                "read tcp 10.1.0.4:51234->104.18.123.25:443: read: connection reset by peer",
+                "dial tcp 104.18.123.25:443: i/o timeout",
+                "net/http: TLS handshake timeout",
+                "dial tcp: lookup registry-1.docker.io on 127.0.0.53:53: no such host"
+            )
+            val classes = transport.map { cause =>
+                classify(
+                    "Error: initializing source docker://alpine:latest: pinging container registry registry-1.docker.io: " +
+                        s"Get \"https://registry-1.docker.io/v2/\": $cause"
+                )
+            }
+            assert(
+                classes.forall(_.isInstanceOf[kyo.ContainerRegistryUnavailableException]),
+                s"expected every failed connection to read as a registry fault, got $classes"
+            )
+        }
+    }
+
+    /** The docker CLI prints a failed pull as the daemon's own message, with no status of its own; the HTTP backend types the same
+      * failure from the daemon's 5xx, so both backends must agree that a registry connection that failed is the transient case.
+      */
+    "mapError on a failed docker pull" - {
+        val backend = new ShellBackend("docker")
+        val ctx     = ResourceContext.Image("alpine:latest")
+
+        def classify(output: String)(using Frame): kyo.ContainerException =
+            backend.mapError(output, ctx, Seq("pull", "alpine:latest"))
+
+        // The shape the daemon gave on PR #2064's linux-x64 JVM run, through the docker CLI.
+        "a reset connection to the token service is a registry fault" in {
+            val ex = classify(
+                "Error response from daemon: Get \"https://auth.docker.io/token?scope=repository%3Alibrary%2Falpine%3Apull" +
+                    "&service=registry.docker.io\": read tcp 172.17.0.2:41234->3.94.224.37:443: read: connection reset by peer"
+            )
+            assert(ex.isInstanceOf[kyo.ContainerRegistryUnavailableException], s"expected a registry-unavailable failure, got $ex")
+        }
+
+        "an image the registry answered for is still a missing image" in {
+            val ex = classify("Error response from daemon: manifest for alpine:nope not found: manifest unknown: manifest unknown")
+            assert(ex.isInstanceOf[kyo.ContainerImageMissingException], s"expected a missing image, got $ex")
+        }
+    }
+
+end ShellBackendTest

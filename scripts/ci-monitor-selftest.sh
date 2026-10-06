@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exercise ci-monitor.sh's proc_top attribution against stubbed process listings, on both the Windows
+# and the posix branch, with no real processes and no monitor loop.
+#
+# proc_top parses text whose shape only appears on a CI runner, so the parsing has broken where it
+# cannot be seen: first by having no Windows branch at all (MSYS `ps` reports its own accounting, so a
+# JVM holding gigabytes printed as single-digit MB), then by reading `tasklist` image names that carry
+# spaces as separate CSV columns. Both are parse bugs in an awk pipeline that nothing else covers.
+#
+# The function is extracted from ci-monitor.sh rather than copied, so a change to the real pipeline is
+# what this exercises. Sourcing the script whole is not an option: it is a monitor loop that runs on
+# load.
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+test_dir=$(mktemp -d)
+trap 'rm -rf "$test_dir"' EXIT
+mkdir "$test_dir/bin"
+
+fail() {
+    printf 'ci-monitor-selftest: %s\n' "$1" >&2
+    exit 1
+}
+
+expect_eq() {
+    [ "$2" = "$3" ] || fail "$1: expected [$3], got [$2]"
+}
+
+# Windows: image names with spaces, thousands separators, an "N/A" memory column, and two rows of one
+# image that have to aggregate.
+cat > "$test_dir/bin/tasklist" <<'STUB'
+#!/usr/bin/env bash
+cat <<'ROWS'
+"java.exe","1234","Console","1","4,194,304 K"
+"java.exe","1235","Console","1","2,097,152 K"
+"Memory Compression","999","Services","0","1,048,576 K"
+"System Idle Process","0","Services","0","8 K"
+"svchost.exe","500","Services","0","N/A"
+ROWS
+STUB
+chmod +x "$test_dir/bin/tasklist"
+
+windows_out=$(
+    PATH="$test_dir/bin:$PATH" OS=MINGW64_NT-10.0 bash -c "
+        $(sed -n '/^proc_top()/,/^}/p' "$script_dir/ci-monitor.sh")
+        proc_top
+    "
+)
+
+# java aggregates both rows (4194304 + 2097152 KB = 6144 MB, count 2) and sorts first. The two
+# space-carrying names survive as single fields. svchost's non-numeric memory drops the row rather
+# than parsing as 0 and displacing a real one.
+expect_eq "windows attribution" "$windows_out" \
+    'top=[java:6144M/2 Memory_Compression:1024M/1 System_Idle_Process:0M/1]'
+
+case "$windows_out" in
+    *'Memory Compression'*) fail "windows: an image name with a space leaked an unjoined field" ;;
+    *'","'*) fail "windows: a raw CSV separator reached the output" ;;
+esac
+
+rm "$test_dir/bin/tasklist"
+
+# Posix: the same aggregation over `ps axo rss=,comm=`, including a path-qualified command and one
+# carrying a space, which the branch joins the same way.
+cat > "$test_dir/bin/ps" <<'STUB'
+#!/usr/bin/env bash
+cat <<'ROWS'
+  4096 /usr/bin/java
+  2048 /usr/bin/java
+  1024 /opt/My App/helper
+     0 /bin/zombie
+ROWS
+STUB
+chmod +x "$test_dir/bin/ps"
+
+posix_out=$(
+    PATH="$test_dir/bin:$PATH" OS=Linux bash -c "
+        $(sed -n '/^proc_top()/,/^}/p' "$script_dir/ci-monitor.sh")
+        proc_top
+    "
+)
+
+# java aggregates to 6144 KB over two rows; the leading path is stripped; the zero-RSS row is dropped.
+expect_eq "posix attribution" "$posix_out" 'top=[java:6M/2 helper:1M/1]'
+
+# A listing tool that is absent must yield nothing at all rather than a partial line or an error, since
+# proc_top runs on every monitor interval and must never disrupt the build. bash is invoked by absolute
+# path so emptying PATH removes only the lookup proc_top performs, not the shell running it.
+bash_bin=$(command -v bash)
+mkdir -p "$test_dir/empty"
+absent_out=$(
+    PATH="$test_dir/empty" OS=Linux "$bash_bin" -c "
+        $(sed -n '/^proc_top()/,/^}/p' "$script_dir/ci-monitor.sh")
+        proc_top
+    " || fail "a missing ps made proc_top exit non-zero"
+)
+expect_eq "missing ps" "$absent_out" ""
+
+# Sockets: `netstat -ano -p tcp` rows are indented and carry a state column only for TCP; the count that
+# matters is TIME_WAIT against the dynamic range `netsh` reports. Same parse-bug exposure as proc_top,
+# and it decides whether a WSAENOBUFS leg ran out of ports or out of something else.
+# The v6 rows are the reason both families are counted: a JVM opens dual-stack sockets and localhost
+# resolves to ::1, so an IPv4-only count misses exactly the churn the headline exists to show.
+cat > "$test_dir/bin/netstat" <<'STUB'
+#!/usr/bin/env bash
+if [ "${3:-}" = tcpv6 ]; then
+cat <<'ROWS'
+
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    [::1]:49200            [::1]:9222             TIME_WAIT       0
+  TCP    [::]:135               [::]:0                 LISTENING       900
+ROWS
+else
+cat <<'ROWS'
+
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:49152        127.0.0.1:9222         ESTABLISHED     1234
+  TCP    127.0.0.1:49153        127.0.0.1:9222         TIME_WAIT       0
+  TCP    127.0.0.1:49154        127.0.0.1:9222         TIME_WAIT       0
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       900
+ROWS
+fi
+STUB
+chmod +x "$test_dir/bin/netstat"
+
+cat > "$test_dir/bin/netsh" <<'STUB'
+#!/usr/bin/env bash
+cat <<'ROWS'
+
+Protocol tcp Dynamic Port Range
+---------------------------------
+Start Port      : 49152
+Number of Ports : 16384
+ROWS
+STUB
+chmod +x "$test_dir/bin/netsh"
+
+sockets_out=$(
+    PATH="$test_dir/bin:$PATH" OS=MINGW64_NT-10.0 bash -c "
+        $(sed -n '/^sockets_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        sockets_headline
+    "
+)
+
+# Four IPv4 rows plus two IPv6 ones; three of the six are TIME_WAIT. The banner lines carry no leading TCP
+# token and must not inflate the total. Both families report the same range, so it prints once.
+expect_eq "windows sockets" "$sockets_out" 'tcp=6 timeWait=3 ephemeral=16384'
+
+# The posix branch has no port range small enough to exhaust, so the headline is absent entirely rather
+# than reporting a partial line.
+posix_sockets_out=$(
+    PATH="$test_dir/bin:$PATH" OS=Linux bash -c "
+        $(sed -n '/^sockets_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        sockets_headline
+    "
+)
+expect_eq "posix sockets" "$posix_sockets_out" ""
+
+# A netstat that runs but yields no TCP rows (it errored, or printed only a banner) must read as
+# unsampled. Counting it as zero would report healthy sockets on exactly the leg that cannot be sampled.
+cat > "$test_dir/bin/netstat" <<'STUB'
+#!/usr/bin/env bash
+echo "netstat: something went wrong" >&2
+exit 1
+STUB
+chmod +x "$test_dir/bin/netstat"
+
+unsampled_out=$(
+    PATH="$test_dir/bin:$PATH" OS=MINGW64_NT-10.0 bash -c "
+        $(sed -n '/^sockets_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        sockets_headline
+    " || fail "a failing netstat made sockets_headline exit non-zero"
+)
+expect_eq "unsampled sockets" "$unsampled_out" 'tcp=? timeWait=? ephemeral=16384'
+
+case "$unsampled_out" in
+    *'tcp=0'*) fail "a failing netstat reported zero sockets instead of an unsampled field" ;;
+esac
+
+# Absent netstat must print nothing and exit zero, for the same reason proc_top must.
+absent_sockets_out=$(
+    PATH="$test_dir/empty" OS=MINGW64_NT-10.0 "$bash_bin" -c "
+        $(sed -n '/^sockets_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        sockets_headline
+    " || fail "a missing netstat made sockets_headline exit non-zero"
+)
+expect_eq "missing netstat" "$absent_sockets_out" ""
+
+# Commit pressure: `typeperf` prints a CSV header naming the counters, then one row per sample with a quoted
+# timestamp and the values in bytes, then its status lines. The header starts with a quote too, so the parse
+# must key on numeric values rather than on the leading quote.
+cat > "$test_dir/bin/typeperf" <<'STUB'
+#!/usr/bin/env bash
+printf '"(PDH-CSV 4.0)","\\\\RUNNER\\Memory\\Committed Bytes","\\\\RUNNER\\Memory\\Commit Limit","\\\\RUNNER\\Memory\\Pool Nonpaged Bytes"\r\n'
+printf '"09/27/2026 14:02:10.123","8589934592.000000","17179869184.000000","209715200.000000"\r\n'
+printf 'Exiting, please wait...\r\nThe command completed successfully.\r\n'
+STUB
+chmod +x "$test_dir/bin/typeperf"
+
+commit_out=$(
+    PATH="$test_dir/bin:$PATH" OS=MINGW64_NT-10.0 "$bash_bin" -c "
+        $(sed -n '/^commit_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        commit_headline
+    "
+)
+expect_eq "windows commit" "$commit_out" 'commitMB=8192 commitLimitMB=16384 nonpagedMB=200'
+
+# A typeperf that printed its header and then failed must read as unsampled: the header's counter names would
+# otherwise parse as zero, which says the commit charge is fine on exactly the leg that cannot be sampled.
+cat > "$test_dir/bin/typeperf" <<'STUB'
+#!/usr/bin/env bash
+printf '"(PDH-CSV 4.0)","\\\\RUNNER\\Memory\\Committed Bytes","\\\\RUNNER\\Memory\\Commit Limit","\\\\RUNNER\\Memory\\Pool Nonpaged Bytes"\r\n'
+echo "Error: The specified object was not found on the computer." >&2
+exit 1
+STUB
+chmod +x "$test_dir/bin/typeperf"
+
+unsampled_commit_out=$(
+    PATH="$test_dir/bin:$PATH" OS=MINGW64_NT-10.0 "$bash_bin" -c "
+        $(sed -n '/^commit_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        commit_headline
+    " || fail "a failing typeperf made commit_headline exit non-zero"
+)
+expect_eq "unsampled commit" "$unsampled_commit_out" 'commitMB=? commitLimitMB=? nonpagedMB=?'
+case "$unsampled_commit_out" in
+    *'commitMB=0'*) fail "a failing typeperf reported a zero commit charge instead of an unsampled field" ;;
+esac
+
+# Absent typeperf must print nothing and exit zero, like the other Windows-only headlines.
+absent_commit_out=$(
+    PATH="$test_dir/empty" OS=MINGW64_NT-10.0 "$bash_bin" -c "
+        $(sed -n '/^commit_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        commit_headline
+    " || fail "a missing typeperf made commit_headline exit non-zero"
+)
+expect_eq "missing typeperf" "$absent_commit_out" ""
+
+# Off Windows the headline is empty whatever is on the PATH.
+posix_commit_out=$(
+    PATH="$test_dir/bin:$PATH" OS=Linux "$bash_bin" -c "
+        $(sed -n '/^commit_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        commit_headline
+    "
+)
+expect_eq "posix commit" "$posix_commit_out" ""
+
+# The scheduler snapshot carries its write time as ts= (epoch millis). The age is what exposes a writer
+# that stopped: on JS the writer is a timer on the event loop, so a blocked loop stops refreshing the file.
+cat > "$test_dir/bin/date" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = "+%s" ] && { echo 1005; exit 0; }
+exec /bin/date "$@"
+STUB
+chmod +x "$test_dir/bin/date"
+
+sched_run() {
+    PATH="$test_dir/bin:$PATH" SCHED_FILE="$1" bash -c "
+        $(sed -n '/^sched_snapshot()/,/^}/p' "$script_dir/ci-monitor.sh")
+        sched_snapshot
+    " || fail "sched_snapshot exited non-zero for [$1]"
+}
+
+printf 'kyo.sched ts=1000000 platform=js pending=0' > "$test_dir/sched-ts"
+expect_eq "sched snapshot age" "$(sched_run "$test_dir/sched-ts")" 'kyo.sched ts=1000000 platform=js pending=0 age=5s'
+
+printf 'kyo.sched cur=4' > "$test_dir/sched-nots"
+expect_eq "sched snapshot without ts" "$(sched_run "$test_dir/sched-nots")" 'kyo.sched cur=4'
+
+expect_eq "sched snapshot missing file" "$(sched_run "$test_dir/absent")" ""
+
+# Runner liveness: the two runner processes with pid and state, the path stripped, everything else ignored. A stuck runner
+# shows as state D; a vanished one as none.
+cat > "$test_dir/bin/ps" <<'STUB'
+#!/usr/bin/env bash
+cat <<'ROWS'
+  812 Ssl  /home/runner/actions-runner/cached/bin/Runner.Listener
+ 2290 Dl   Runner.Worker
+ 3001 S    java
+ROWS
+STUB
+chmod +x "$test_dir/bin/ps"
+
+runner_run() {
+    PATH="$test_dir/bin:$PATH" GITHUB_ACTIONS="$1" OS="$2" "$bash_bin" -c "
+        $(sed -n '/^runner_headline()/,/^}/p' "$script_dir/ci-monitor.sh")
+        runner_headline
+    " || fail "runner_headline exited non-zero"
+}
+
+expect_eq "runner liveness" "$(runner_run true Linux)" 'runner=[Runner.Listener:812/Ssl Runner.Worker:2290/Dl]'
+expect_eq "runner liveness off Actions" "$(runner_run "" Linux)" ""
+expect_eq "runner liveness on Windows" "$(runner_run true MINGW64_NT-10.0)" ""
+
+cat > "$test_dir/bin/ps" <<'STUB'
+#!/usr/bin/env bash
+echo "  3001 S    java"
+STUB
+expect_eq "runner gone" "$(runner_run true Linux)" 'runner=[none]'
+
+# Kernel filter: a hung-task report and the trace lines after it pass, prefixed; container churn before it does not.
+kern_run() {
+    "$bash_bin" -c "
+        $(sed -n '/^kern_filter()/,/^}/p' "$script_dir/ci-monitor.sh")
+        kern_filter
+    " || fail "kern_filter exited non-zero"
+}
+
+kern_out=$(printf '%s\n' \
+    '2026-10-03T14:07:10 docker0: port 2(veth1) entered forwarding state' \
+    '2026-10-03T14:07:11 INFO: task node:4242 blocked for more than 120 seconds.' \
+    '2026-10-03T14:07:11 Call trace:' \
+    '2026-10-03T14:07:11  io_uring_cancel_generic+0x1a0/0x2c0' | kern_run)
+expect_eq "kernel hung task" "$kern_out" "$(printf '%s\n' \
+    '[ci-mon-kern] 2026-10-03T14:07:11 INFO: task node:4242 blocked for more than 120 seconds.' \
+    '[ci-mon-kern] 2026-10-03T14:07:11 Call trace:' \
+    '[ci-mon-kern] 2026-10-03T14:07:11  io_uring_cancel_generic+0x1a0/0x2c0')"
+
+# Upper-case kernel markers match although the match is on a lowercased copy; a debug line does not match "bug:".
+expect_eq "kernel BUG" "$(printf '%s\n' 'x kernel BUG: scheduling while atomic' | kern_run)" '[ci-mon-kern] x kernel BUG: scheduling while atomic'
+expect_eq "kernel debug noise" "$(printf '%s\n' 'x usb 1-1: debug message' | kern_run)" ""
+
+# The context window closes 40 lines after the last hit.
+kern_window=$( { echo 'x Out of memory: Killed process 1 (java)'; for i in $(seq 1 45); do echo "x trace $i"; done; } | kern_run)
+expect_eq "kernel context window" "$(printf '%s\n' "$kern_window" | wc -l | tr -d ' ')" "41"
+
+# A flood stops at the cap with one note.
+kern_flood=$(for i in $(seq 1 600); do echo "x oom-kill $i"; done | kern_run)
+expect_eq "kernel cap" "$(printf '%s\n' "$kern_flood" | wc -l | tr -d ' ')" "501"
+expect_eq "kernel cap note" "$(printf '%s\n' "$kern_flood" | tail -1)" '[ci-mon-kern] 500-line cap reached, later kernel lines dropped'
+
+# Disk abort target: the build's group when ci-test.sh names one, the monitor's own otherwise. A value that is not a pid
+# above 1 must never become `kill -- -1`, which signals every process the user owns.
+abort_run() {
+    CI_MON_KILL_PGID="$1" "$bash_bin" -c "
+        kill() { printf 'kill %s' \"\$*\"; }
+        $(sed -n '/^abort_build()/,/^}/p' "$script_dir/ci-monitor.sh")
+        abort_build
+    " || fail "abort_build exited non-zero for [$1]"
+}
+
+expect_eq "abort named group" "$(abort_run 4242)" 'kill -TERM -- -4242'
+expect_eq "abort own group" "$(abort_run '')" 'kill -TERM 0'
+expect_eq "abort never all processes" "$(abort_run 1)" 'kill -TERM 0'
+expect_eq "abort non-numeric" "$(abort_run '-1')" 'kill -TERM 0'
+
+# Process ids: the monitor's own entry opens the ancestry and the self-test's shell appears further up, each with its
+# real process group and session. Off Linux the line is absent.
+ids_run() {
+    OS="$1" "$bash_bin" -c "
+        $(sed -n '/^proc_ids()/,/^}/p' "$script_dir/ci-monitor.sh")
+        $(sed -n '/^process_ids()/,/^}/p' "$script_dir/ci-monitor.sh")
+        printf '%s ' \"\$\$\"
+        process_ids
+    " || fail "process_ids exited non-zero"
+}
+
+expect_eq "process ids off Linux" "$(ids_run Darwin | cut -d' ' -f2-)" ""
+
+if [ -r /proc/self/stat ]; then
+    ids_out=$(ids_run Linux)
+    ids_pid=${ids_out%% *}
+    self_stat=$(cat "/proc/$$/stat")
+    # shellcheck disable=SC2086
+    set -- ${self_stat##*) }
+    self_entry="$(cat "/proc/$$/comm"):$$/$3/$4"
+    case "$ids_out" in
+        "$ids_pid process ids (comm:pid/pgid/sid) ancestry=[bash:$ids_pid/"*) ;;
+        *) fail "process ids: the monitor's own entry does not open the ancestry: [$ids_out]" ;;
+    esac
+    case "$ids_out" in
+        *" $self_entry "* | *" $self_entry]"*) ;;
+        *) fail "process ids: the ancestry lacks the self-test shell [$self_entry]: [$ids_out]" ;;
+    esac
+    case "$ids_out" in
+        *" runner=["*"]") ;;
+        *) fail "process ids: no runner field: [$ids_out]" ;;
+    esac
+fi
+
+printf 'ci-monitor-selftest: ok\n'

@@ -1,6 +1,5 @@
 package kyo
 
-import Tagged.*
 import kyo.kernel.*
 import scala.annotation.nowarn
 import scala.annotation.tailrec
@@ -15,7 +14,7 @@ class KyoTest extends Test:
             ArrowEffect.suspend[Any](Tag[TestEffect1], i)
 
         def run[A, S](v: A < (TestEffect1 & S)): A < S =
-            ArrowEffect.handle(Tag[TestEffect1], v)([C] => (input, cont) => cont(input + 1))
+            ArrowEffect.handleCont(Tag[TestEffect1], v)([C] => (input, cont) => cont(input + 1))
     end TestEffect1
 
     sealed trait TestEffect2 extends ArrowEffect[Const[String], Const[String]]
@@ -24,17 +23,21 @@ class KyoTest extends Test:
             ArrowEffect.suspend[Any](Tag[TestEffect2], s)
 
         def run[A, S](v: A < (TestEffect2 & S)): A < S =
-            ArrowEffect.handle(Tag[TestEffect2], v)([C] => (input, cont) => cont(input.toUpperCase))
+            ArrowEffect.handleCont(Tag[TestEffect2], v)([C] => (input, cont) => cont(input.toUpperCase))
     end TestEffect2
 
-    def widen[A](v: A): A < Any = v
+    // Inline because Kyo.lift's match on the lifted type cannot reduce for an abstract A.
+    inline def widen[A](inline v: A): A < Any = Kyo.lift(v)
 
-    "toString" in run {
+    // The sites
+    // embed file:line:col, so adding or removing a line anywhere above breaks these strings and they have to
+    // be re-read from the failure rather than recomputed.
+    "toString" in {
         assert(TestEffect1(1).map(_ + 1).toString ==
-            "Kyo(kyo.KyoTest.TestEffect1, Input(1), KyoTest.scala:33:41, assert(TestEffect1(1).map(_ + 1))")
+            "Defer(Kyo(kyo.KyoTest.TestEffect1, apply.suspend(KyoTest.scala:14:37)), this(?.map(KyoTest.scala:36:41)), Id)")
         assert(
             TestEffect1(1).map(_ + 1).map(_ + 2).toString ==
-                "Kyo(kyo.KyoTest.TestEffect1, Input(1), KyoTest.scala:36:49, TestEffect1(1).map(_ + 1).map(_ + 2))"
+                "Defer(Defer(Kyo(kyo.KyoTest.TestEffect1, apply.suspend(KyoTest.scala:14:37)), this(?.map(KyoTest.scala:39:38)), Id), this(?.map(KyoTest.scala:39:49)), Id)"
         )
     }
 
@@ -95,7 +98,7 @@ class KyoTest extends Test:
     }
 
     "nested" - {
-        def lift[A](v: A): A < Any                                          = widen(v)
+        inline def lift[A](inline v: A): A < Any                            = widen(v)
         def add(v: Int < TestEffect1)                                       = v.map(_ + 1)
         def transform[A, B](v: A < TestEffect1, f: A => B): B < TestEffect1 = v.map(f(_))
         val io: Int < TestEffect1 < TestEffect1                             = lift(TestEffect1(1))
@@ -157,9 +160,9 @@ class KyoTest extends Test:
                 assert(incr(0, n).eval == n)
             }
 
-            "suspension at the start" taggedAs notNative in pendingUntilFixed {
+            "suspension at the start" in {
                 try
-                    assert(TestEffect1.run(incr(TestEffect1(n), n)).eval == 0)
+                    assert(TestEffect1.run(incr(TestEffect1(n), n)).eval == 2 * n + 1)
                 catch
                     case ex: StackOverflowError => fail()
                 end try
@@ -170,7 +173,7 @@ class KyoTest extends Test:
                 assert(TestEffect1.run(incr(n, n).map(n => TestEffect1(n + n))).eval == n * 4 + 1)
             }
 
-            "multiple effects" taggedAs notNative in pendingUntilFixed {
+            "multiple effects" in {
                 @tailrec def incr(v: Int < TestEffect1, n: Int): Int < TestEffect1 =
                     n match
                         case 0 => v
@@ -178,7 +181,7 @@ class KyoTest extends Test:
                             incr(v.map(v => TestEffect1(v + 1)), n - 1)
                         case n => incr(v.map(_ + 1), n - 1)
 
-                try assert(TestEffect1.run(incr(0, n)).eval == 0)
+                try assert(TestEffect1.run(incr(0, n)).eval == n + n / 32)
                 catch
                     case ex: StackOverflowError => fail()
                 end try
@@ -418,6 +421,45 @@ class KyoTest extends Test:
             // Test with a larger sequence
             val largeSeq = Seq.tabulate(100)(identity)
             assert(Kyo.foreachIndexed(largeSeq)((idx, v) => idx == v).eval == Chunk.fill(100)(true))
+        }
+
+        "foreachIndexedDiscard" in {
+            var acc                         = Seq.empty[(Int, Int)]
+            def run(source: Seq[Int]): Unit =
+                acc = Seq.empty
+                TestEffect1.run(Kyo.foreachIndexedDiscard(source)((idx, v) => TestEffect1(v).map(i => acc :+= ((idx, i))))).eval
+                ()
+            end run
+
+            run(Seq.empty[Int])
+            assert(acc == Seq.empty)
+            run(Seq(1))
+            assert(acc == Seq((0, 2)))
+            run(Seq(1, 2))
+            assert(acc == Seq((0, 2), (1, 3)))
+
+            // The List, Chunk and Set overloads have their own loops rather than delegating, so each is
+            // exercised through its own static type.
+            acc = Seq.empty
+            TestEffect1.run(Kyo.foreachIndexedDiscard(List(1, 2, 3))((idx, v) => TestEffect1(v).map(i => acc :+= ((idx, i))))).eval
+            assert(acc == Seq((0, 2), (1, 3), (2, 4)))
+            acc = Seq.empty
+            TestEffect1.run(Kyo.foreachIndexedDiscard(Chunk(1, 2, 3))((idx, v) => TestEffect1(v).map(i => acc :+= ((idx, i))))).eval
+            assert(acc == Seq((0, 2), (1, 3), (2, 4)))
+            acc = Seq.empty
+            TestEffect1.run(Kyo.foreachIndexedDiscard(Vector(1, 2))((idx, v) => TestEffect1(v).map(i => acc :+= ((idx, i))))).eval
+            assert(acc == Seq((0, 2), (1, 3)))
+            acc = Seq.empty
+            TestEffect1.run(Kyo.foreachIndexedDiscard(Set(1, 2, 3))((idx, v) => TestEffect1(v).map(i => acc :+= ((idx, i))))).eval
+            assert(acc.map(_._1) == Seq(0, 1, 2))
+            assert(acc.map(_._2).toSet == Set(2, 3, 4))
+
+            // Indices stay aligned over a long run, past the single-element special case.
+            acc = Seq.empty
+            TestEffect1.run(Kyo.foreachIndexedDiscard(Seq.tabulate(100)(identity))((idx, v) =>
+                TestEffect1(v).map(_ => acc :+= ((idx, v)))
+            )).eval
+            assert(acc == Seq.tabulate(100)(i => (i, i)))
         }
 
         def collectionTests[Coll[X] <: Iterable[X] & IterableOps[X, Coll, Coll[X]]](
@@ -707,7 +749,7 @@ class KyoTest extends Test:
         }
 
         "works with effects" in {
-            var count = 0
+            var count  = 0
             val result = TestEffect1.run(
                 Kyo.findFirst(Seq(1, 2, 3)) { v =>
                     TestEffect1(41).map { r =>
@@ -721,7 +763,7 @@ class KyoTest extends Test:
         }
 
         "short circuits" in {
-            var count = 0
+            var count  = 0
             val result = Kyo.findFirst(Seq(1, 2, 3, 4, 5)) { v =>
                 count += 1
                 if v == 2 then Maybe(v) else Maybe.empty

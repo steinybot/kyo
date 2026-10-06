@@ -1,7 +1,6 @@
 package kyo
 
 import kyo.Result.Panic
-import kyo.Tag
 import kyo.internal.AsyncPlatformSpecific
 import kyo.kernel.*
 import kyo.scheduler.*
@@ -47,6 +46,10 @@ import scala.util.control.NonFatal
   */
 opaque type Async <: (Sync & Async.Join) = Async.Join & Sync
 
+private[kyo] object async:
+    object concurrency:
+        object default extends StaticFlag[Int](Runtime.getRuntime().availableProcessors() * 2)
+
 object Async extends AsyncPlatformSpecific:
 
     /** Default concurrency level for collection operations.
@@ -54,27 +57,37 @@ object Async extends AsyncPlatformSpecific:
       * This value determines the maximum number of concurrent operations that can run in parallel for collection processing methods like
       * foreach, collect, and their variants. It defaults to twice the number of available processors.
       *
-      * This default can be overridden in two ways:
+      * This default can be overridden in three ways:
+      *
       *   1. Per operation by passing an explicit concurrency parameter
       *   2. Globally by setting the "kyo.async.concurrency.default" system property
+      *   3. Globally by setting the "KYO_ASYNC_CONCURRENCY_DEFAULT" environment variable
+      *
+      * Resolution checks the system property first, then the environment variable, then falls back to the
+      * default. On Scala.js, Wasm, and Scala Native, the system property is not readable from the command line,
+      * so the environment variable is the only channel that reaches this value on those platforms.
       *
       * Example of setting the system property:
-      * ```
+      *
+      * ```sh
       * java -Dkyo.async.concurrency.default=4 MyApp
       * ```
       *
+      * Example of setting the environment variable:
+      *
+      * ```sh
+      * KYO_ASYNC_CONCURRENCY_DEFAULT=4 MyApp
+      * ```
+      *
       * Consider adjusting this based on:
+      *
       *   - Nature of operations (CPU vs Sync bound)
       *   - Available system resources
       *   - Specific performance requirements
       *
       * Note: This only affects collection processing methods. Operations like race and gather run with unbounded concurrency.
       */
-    val defaultConcurrency =
-        import AllowUnsafe.embrace.danger
-        given Frame = Frame.internal
-        Sync.Unsafe.evalOrThrow(System.property[Int]("kyo.async.concurrency.default", Runtime.getRuntime().availableProcessors() * 2))
-    end defaultConcurrency
+    val defaultConcurrency: Int = async.concurrency.default()
 
     /** Convenience method for suspending side effects in an Async effect.
       *
@@ -83,7 +96,7 @@ object Async extends AsyncPlatformSpecific:
       * method allows users to work with a single unified effect that handles both concerns.
       *
       * Note that this method only suspends the computation - it does not fork execution into a new fiber. For concurrent execution, use
-      * Fiber.init or combinators like Async.parallel instead.
+      * Fiber.init or combinators like Async.foreach instead.
       *
       * This is particularly useful in application code where the distinction between pure side effects and asynchronous execution is less
       * important than having a simple, consistent way to handle effects. The underlying effects are typically managed together at the
@@ -103,25 +116,23 @@ object Async extends AsyncPlatformSpecific:
     inline def defer[A, S](inline v: => A < S)(using inline frame: Frame): A < (Async & S) =
         Sync.defer(v)
 
-    /** Runs an asynchronous computation with interrupt masking.
+    /** Runs an asynchronous computation that interrupts cannot reach.
       *
       * This method executes the given computation in a context where interrupts are not propagated to previous "steps" of the computation.
-      * The returned computation can still be interrupted, but the interruption won't affect the masked portion. This is useful for ensuring
-      * that cleanup operations or critical sections complete even if an interrupt occurs.
+      * The returned computation can still be interrupted, but the interruption won't affect the protected portion. This is useful for
+      * ensuring that cleanup operations or critical sections complete even if an interrupt occurs.
       *
       * @param v
-      *   The computation to run with interrupt masking
+      *   The computation to protect from interrupts
       * @return
       *   The result of the computation, which can still be interrupted
       */
-    def mask[E, A, S](
+    def uninterruptible[E, A, S](
         using isolate: Isolate[S, Abort[E] & Async, S]
     )(v: => A < (Abort[E] & Async & S))(
         using frame: Frame
     ): A < (Abort[E] & Async & S) =
-        isolate.capture { state =>
-            Fiber.initUnscoped(isolate.isolate(state, v)).map(_.mask.map(fiber => isolate.restore(fiber.get)))
-        }
+        Fiber.internal.initUnscoped(v).map(_.uninterruptible.map(_.get))
 
     /** Creates a computation that never completes.
       *
@@ -163,27 +174,54 @@ object Async extends AsyncPlatformSpecific:
     def timeout[E, A, S](
         using isolate: Isolate[S, Abort[E] & Async, S]
     )(after: Duration)(v: => A < (Abort[E] & Async & S))(using frame: Frame): A < (Abort[E | Timeout] & Async & S) =
+        _timeout(after, Result.Failure(Timeout(Present(after))))(v)
+
+    /** Runs a computation with a timeout, aborting with a custom error on expiry.
+      *
+      * @param after
+      *   The timeout duration
+      * @param error
+      *   The error to use on timeout
+      * @param v
+      *   The computation to run
+      * @return
+      *   The result of the computation, or the custom error on timeout
+      */
+    inline def timeoutWithError[E, A, S](
+        using isolate: Isolate[S, Abort[E] & Async, S]
+    )(after: Duration, inline error: => Result.Error[E])(v: => A < (Abort[E] & Async & S))(using frame: Frame): A < (Abort[E] & Async & S) =
+        _timeout(after, error)(v)
+
+    private inline def _timeout[E, A, S](
+        using isolate: Isolate[S, Abort[E] & Async, S]
+    )(after: Duration, inline error: => Result.Error[E])(v: => A < (Abort[E] & Async & S))(using frame: Frame): A < (Abort[E] & Async & S) =
         if !after.isFinite then v
         else
-            isolate.capture { state =>
-                Fiber.initUnscoped(isolate.isolate(state, v)).map { task =>
-                    Clock.use { clock =>
-                        Sync.Unsafe {
-                            val sleepFiber = clock.unsafe.sleep(after)
-                            sleepFiber.onComplete(_ => discard(task.unsafe.interrupt(Result.Failure(Timeout(Present(after))))))
-                            task.unsafe.onComplete(_ => discard(sleepFiber.interrupt()))
-                            isolate.restore(task.get)
-                        }
+            Clock.use { clock =>
+                Sync.Unsafe.defer {
+                    // Arm the timeout before forking the guarded computation, so the timer is registered before the
+                    // body starts. If the body forked first it could begin (and, under a controlled clock, be
+                    // advanced past the deadline) before the sleep is enqueued, leaving a deadline in the elapsed
+                    // past that never fires. This rests on IOPromise.onComplete firing immediately on an already
+                    // completed promise, so a sleep completing before the wiring below still interrupts at registration.
+                    val sleepFiber = clock.unsafe.sleep(after)
+                    // Not `Fiber.use`: that needs a `Sync` isolate, and here it is `Abort[E] & Async`;
+                    // `internal.initUnscoped` keeps `Abort[E]` in the child so `task.get` resurfaces the body's failure.
+                    Sync.acquireReleaseWith(Fiber.internal.initUnscoped(v))(_.interrupt)[A, Nothing, Abort[E] & Async & S] { task =>
+                        sleepFiber.onComplete(_ => discard(task.unsafe.interrupt(error)))
+                        task.unsafe.onComplete(_ => discard(sleepFiber.interrupt()))
+                        task.get
                     }
                 }
             }
         end if
-    end timeout
+    end _timeout
 
-    def tapFiber[E, A, S, S2](using isolate: Isolate[S, Abort[E] & Async, S])
-                             (v: => A < (Abort[E] & Async & S))
-                             (f: Fiber[Any, Abort[E] & S] => Unit < S2)
-                             (using frame: Frame): A < (kyo.Abort[E] & kyo.Async & S & S2) =
+    def tapFiber[E, A, S, S2](using
+        isolate: Isolate[S, Abort[E] & Async, S]
+    )(v: => A < (Abort[E] & Async & S))(f: Fiber[Any, Abort[E] & S] => Unit < S2)(using
+        frame: Frame
+    ): A < (kyo.Abort[E] & kyo.Async & S & S2) =
         isolate.capture { state =>
             Fiber.initUnscoped(isolate.isolate(state, v)).map { fiber =>
                 f(fiber).andThen {
@@ -213,9 +251,7 @@ object Async extends AsyncPlatformSpecific:
         using frame: Frame
     ): A < (Abort[E] & Async & S) =
         require(iterable.nonEmpty, "Can't race an empty collection.")
-        isolate.capture { state =>
-            Fiber.internal.race(iterable.map(isolate.isolate(state, _))).map(fiber => isolate.restore(fiber.get))
-        }
+        Fiber.internal.race(iterable).map(_.get)
     end race
 
     /** Races two or more computations and returns the result of the first successful computation to complete.
@@ -261,9 +297,7 @@ object Async extends AsyncPlatformSpecific:
         using frame: Frame
     ): A < (Abort[E] & Async & S) =
         require(iterable.nonEmpty, "Can't race an empty collection.")
-        isolate.capture { state =>
-            Fiber.internal.raceFirst(iterable.map(isolate.isolate(state, _))).map(fiber => isolate.restore(fiber.get))
-        }
+        Fiber.internal.raceFirst(iterable).map(_.get)
     end raceFirst
 
     /** Races two or more computations and returns the result of the first to complete. When one computation completes, all other
@@ -371,10 +405,7 @@ object Async extends AsyncPlatformSpecific:
     )(max: Int)(iterable: Iterable[A < (Abort[E] & Async & S)])(
         using frame: Frame
     ): Chunk[A] < (Abort[E] & Async & S) =
-        isolate.capture { state =>
-            Fiber.internal.gather(max)(iterable.map(isolate.isolate(state, _)))
-                .map(_.use(chunk => Kyo.collectAll(chunk.map(isolate.restore))))
-        }
+        Fiber.internal.gather(max)(iterable).map(_.get)
 
     /** Executes a sequence of computations with indexed access, using bounded concurrency.
       *
@@ -396,20 +427,11 @@ object Async extends AsyncPlatformSpecific:
             Kyo.foreachIndexed(Chunk.from(iterable))(f)
         else
             iterable.size match
-                case 0 => Chunk.empty
-                case 1 => f(0, iterable.head).map(Chunk(_))
-                case size if size <= concurrency =>
-                    isolate.capture { state =>
-                        Fiber.internal.foreachIndexed(iterable)((idx, v) => isolate.isolate(state, f(idx, v)))
-                            .map(_.use(r => Kyo.foreach(r)(isolate.restore)))
-                    }
+                case 0    => Chunk.empty
+                case 1    => f(0, iterable.head).map(Chunk(_))
                 case size =>
-                    isolate.capture { state =>
-                        val groupSize = Math.ceil(size.toDouble / Math.max(1, concurrency)).toInt
-                        Fiber.internal.foreachIndexed(Chunk.from(iterable.grouped(groupSize)))((idx, group) =>
-                            Kyo.foreachIndexed(Chunk.from(group))((idx2, v) => isolate.isolate(state, f(idx + idx2, v)))
-                        ).map(_.use(r => Kyo.foreach(r.flattenChunk)(isolate.restore)))
-                    }
+                    val items = Chunk.Indexed.from(iterable)
+                    Fiber.internal.foreachIndexed(items, concurrency)(f).map(_.get)
 
     /** Executes a sequence of computations using bounded concurrency.
       *
@@ -756,23 +778,23 @@ object Async extends AsyncPlatformSpecific:
       *   A nested computation that returns the memoized result
       */
     def memoize[A, S](v: A < S)(using Frame): A < (S & Async) < Sync =
-        Sync.Unsafe {
-            val ref = AtomicRef.Unsafe.init(Maybe.empty[Promise.Unsafe[A, Any]])
+        Sync.Unsafe.defer {
+            val ref                              = AtomicRef.Unsafe.init(Maybe.empty[Promise.Unsafe[A, Any]])
             @tailrec def loop(): A < (S & Async) =
                 ref.get() match
                     case Present(v) => v.safe.get
-                    case Absent =>
+                    case Absent     =>
                         val promise = Promise.Unsafe.init[A, Any]()
                         if ref.compareAndSet(Absent, Present(promise)) then
                             Abort.run(v).map { r =>
-                                Sync.Unsafe {
+                                Sync.Unsafe.defer {
                                     if !r.isSuccess then
                                         ref.set(Absent)
                                     promise.completeDiscard(r.map(Kyo.lift))
                                     Abort.get(r)
                                 }
                             }.handle(Sync.ensure {
-                                Sync.Unsafe {
+                                Sync.Unsafe.defer {
                                     if !promise.done() then
                                         ref.set(Absent)
                                 }
@@ -786,14 +808,14 @@ object Async extends AsyncPlatformSpecific:
     /** Converts a Future to an asynchronous computation.
       *
       * This method allows integration of existing Future-based code with Kyo's asynchronous system. It handles successful completion and
-      * failures, wrapping any exceptions in an Abort effect.
+      * failures. Failed futures result in a panic.
       *
       * @param f
       *   The Future to convert into an asynchronous computation
       * @return
-      *   An asynchronous computation that completes with the result of the Future or aborts with Throwable
+      *   An asynchronous computation that completes with the result of the Future
       */
-    def fromFuture[A](f: Future[A])(using frame: Frame): A < (Async & Abort[Throwable]) =
+    def fromFuture[A](f: Future[A])(using frame: Frame): A < Async =
         Fiber.fromFuture(f).map(_.get)
 
     private[kyo] inline def get[E, A](v: IOPromise[? <: E, ? <: A])(using Frame): A < (Abort[E] & Async) =
@@ -802,12 +824,28 @@ object Async extends AsyncPlatformSpecific:
     private[kyo] inline def use[E, A, B, S](v: IOPromise[? <: E, ? <: A])(f: A => B < S)(using Frame): B < (Abort[E] & Async & S) =
         useResult(v)(_.fold(f, Abort.fail, Abort.panic))
 
-    sealed trait Join extends ArrowEffect[IOPromise[?, *], Result[Nothing, *]]
+    abstract class JoinInput[A]:
+        def apply(task: IOTask[?, ?, ?]): IOPromise[?, A]
+
+        /** The scheduler raises this operation again when the promise is not ready, and
+          * a clause is never handed the frame of what it answers, so without this the raise would carry the
+          * scheduler's internal frame instead of the join site.
+          */
+        def frame: Frame
+    end JoinInput
+    sealed trait Join extends ArrowEffect[JoinInput, Result[Nothing, *]]
 
     private[kyo] inline def getResult[E, A](v: IOPromise[E, A])(using Frame): Result[E, A] < Async =
-        ArrowEffect.suspend[A](Tag[Join], v)
+        useResult(v)(r => r)
 
-    private[kyo] inline def useResult[E, A, B, S](v: IOPromise[E, A])(f: Result[E, A] => B < S)(using Frame): B < (S & Async) =
-        ArrowEffect.suspendWith[A](Tag[Join], v)(f)
+    @scala.annotation.nowarn("msg=anonymous")
+    private[kyo] inline def useResult[E, A, B, S](v: IOPromise[E, A])(f: Result[E, A] => B < S)(using _frame: Frame): B < (S & Async) =
+        val input = new JoinInput[A]:
+            def apply(task: IOTask[?, ?, ?]): IOPromise[?, A] =
+                task.interrupts(v)(using _frame)
+                v
+            def frame = _frame
+        ArrowEffect.suspendWith[A](Tag[Join], input)(f)
+    end useResult
 
 end Async

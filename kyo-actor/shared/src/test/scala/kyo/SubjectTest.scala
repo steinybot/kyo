@@ -1,22 +1,22 @@
 package kyo
 
 import java.util.concurrent.atomic.AtomicInteger
-import org.scalatest.compatible.Assertion
+import kyo.Actor.Subject
 
-class SubjectTest extends Test:
+class SubjectTest extends kyo.test.Test[Any]:
 
     "Subject.noop" - {
-        "discards messages sent via send" in run {
+        "discards messages sent via send" in {
             val subject = Subject.noop[Int]
             for
                 _ <- subject.send(1)
                 _ <- subject.send(2)
                 _ <- subject.send(3)
-            yield succeed
+            yield succeed("runs without error: noop subject discards messages without exception")
             end for
         }
 
-        "trySend always returns false" in run {
+        "trySend always returns false" in {
             val subject = Subject.noop[Int]
             for
                 result <- subject.trySend(42)
@@ -25,7 +25,7 @@ class SubjectTest extends Test:
     }
 
     "Subject.init with Promise" - {
-        "completes promise with message" in run {
+        "completes promise with message" in {
             for
                 promise <- Promise.init[String, Any]
                 subject = Subject.init(promise)
@@ -34,7 +34,7 @@ class SubjectTest extends Test:
             yield assert(result == "test message")
         }
 
-        "can only be completed once" in run {
+        "can only be completed once" in {
             for
                 promise <- Promise.init[String, Any]
                 subject = Subject.init(promise)
@@ -45,7 +45,7 @@ class SubjectTest extends Test:
     }
 
     "Subject.init with Channel" - {
-        "puts messages in the channel" in run {
+        "puts messages in the channel" in {
             for
                 channel <- Channel.init[Int](3)
                 subject = Subject.init(channel)
@@ -56,7 +56,7 @@ class SubjectTest extends Test:
             yield assert(values == List(1, 2, 3))
         }
 
-        "trySend returns true for unbounded channels" in run {
+        "trySend returns true for unbounded channels" in {
             for
                 channel <- Channel.init[Int](1)
                 subject = Subject.init(channel)
@@ -65,7 +65,7 @@ class SubjectTest extends Test:
             yield assert(result && value == 42)
         }
 
-        "trySend returns false for full bounded channels" in run {
+        "trySend returns false for full bounded channels" in {
             for
                 channel <- Channel.init[Int](1)
                 subject = Subject.init(channel)
@@ -76,7 +76,7 @@ class SubjectTest extends Test:
     }
 
     "Subject.init with custom functions" - {
-        "uses provided function for send" in run {
+        "uses provided function for send" in {
             for
                 counter <- AtomicInt.init(0)
                 subject = Subject.init[Int](
@@ -90,7 +90,7 @@ class SubjectTest extends Test:
             yield assert(sum == 6)
         }
 
-        "uses provided function for trySend" in run {
+        "uses provided function for trySend" in {
             for
                 counter <- AtomicInt.init(0)
                 subject = Subject.init[Int](
@@ -105,7 +105,7 @@ class SubjectTest extends Test:
     }
 
     "Subject.ask" - {
-        "implements request-response pattern" in run {
+        "implements request-response pattern" in {
             case class Request(data: String, replyTo: Subject[String])
 
             for
@@ -119,7 +119,7 @@ class SubjectTest extends Test:
             end for
         }
 
-        "handles sequential requests" in run {
+        "handles sequential requests" in {
             case class Request(id: Int, replyTo: Subject[Int])
             val subject = Subject.init[Request](
                 send = req => req.replyTo.send(req.id * 2),
@@ -135,7 +135,7 @@ class SubjectTest extends Test:
     }
 
     "Subject.init with Queue.Unbounded" - {
-        "adds messages to the queue" in run {
+        "adds messages to the queue" in {
             for
                 queue <- Queue.Unbounded.init[Int]()
                 subject = Subject.init(queue)
@@ -146,7 +146,7 @@ class SubjectTest extends Test:
             yield assert(values == Chunk(1, 2, 3))
         }
 
-        "trySend always returns true" in run {
+        "trySend always returns true" in {
             for
                 queue <- Queue.Unbounded.init[Int]()
                 subject = Subject.init(queue)
@@ -156,15 +156,84 @@ class SubjectTest extends Test:
         }
     }
 
+    "Subject.init with Hub" - {
+        "publishes messages to hub listeners" in {
+            for
+                hub      <- Hub.init[Int]
+                listener <- hub.listen
+                subject = Subject.init(hub)
+                _ <- subject.send(1)
+                _ <- subject.send(2)
+                a <- listener.take
+                b <- listener.take
+            yield assert(a == 1 && b == 2)
+        }
+        "trySend offers without blocking and returns true when accepted" in {
+            for
+                hub      <- Hub.init[Int]
+                listener <- hub.listen
+                subject = Subject.init(hub)
+                accepted <- subject.trySend(1)
+                v        <- listener.take
+            yield assert(accepted && v == 1)
+        }
+        "trySend fails with Closed after the hub is closed" in {
+            for
+                hub <- Hub.init[Int]
+                subject = Subject.init(hub)
+                _      <- hub.close
+                result <- Abort.run[Closed](subject.trySend(1))
+            yield assert(result.isFailure)
+        }
+        "send fails with Closed after the hub is closed" in {
+            for
+                hub <- Hub.init[Int]
+                subject = Subject.init(hub)
+                _      <- hub.close
+                result <- Abort.run[Closed](subject.send(1))
+            yield assert(result.isFailure)
+        }
+    }
+
+    "Subject.contramap" - {
+        "adapts the message type via the mapping function" in {
+            for
+                chan <- Channel.init[Int](4)
+                base    = Subject.init(chan)
+                strings = base.contramap[String](_.length)
+                _ <- strings.send("hello")
+                v <- chan.take
+            yield assert(v == 5)
+        }
+        "composes with an actor subject" in {
+            for
+                sum   <- AtomicInt.init(0)
+                actor <- Actor.run(Actor.receiveMax[Int](1)(sum.addAndGet(_).unit))
+                sink = actor.subject.contramap[String](_.length)
+                _ <- sink.send("abcd")
+                _ <- actor.await
+                v <- sum.get
+            yield assert(v == 4)
+        }
+        "adapts trySend as well as send" in {
+            for
+                chan <- Channel.init[Int](4)
+                strings = Subject.init(chan).contramap[String](_.length)
+                accepted <- strings.trySend("hey")
+                v        <- chan.take
+            yield assert(accepted && v == 3)
+        }
+    }
+
     "Multiple Subjects" - {
-        "can coordinate between different subject implementations" in run {
+        "can coordinate between different subject implementations" in {
             for
                 results    <- Queue.Unbounded.init[String]()
                 promiseSub <- Promise.init[String, Any]
                 promise = Subject.init(promiseSub)
                 channel <- Channel.init[String](100)
                 channelSub = Subject.init(channel)
-                customSub = Subject.init[String](
+                customSub  = Subject.init[String](
                     send = msg => results.add(s"Custom: $msg"),
                     trySend = msg => results.add(s"TryCustom: $msg").map(_ => true)
                 )

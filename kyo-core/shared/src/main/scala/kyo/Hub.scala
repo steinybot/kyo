@@ -9,6 +9,7 @@ import java.util.concurrent.CopyOnWriteArraySet
   * messages to a single consumer, Hub enables multiple consumers to receive and process the same messages.
   *
   * Message flow and buffering:
+  *
   *   - Publishers send messages to the Hub's main buffer
   *   - A dedicated fiber distributes messages from the Hub buffer to each listener's individual buffer
   *   - Each listener consumes messages from its own buffer at its own pace
@@ -84,6 +85,7 @@ final class Hub[A] private[kyo] (
     /** Closes the Hub and returns any remaining messages.
       *
       * When closed:
+      *
       *   - The Hub stops accepting new messages
       *   - All listeners are automatically closed
       *   - Any blocked publishers are unblocked with a Closed failure
@@ -93,15 +95,27 @@ final class Hub[A] private[kyo] (
       *   a Maybe containing any messages that were in the Hub's buffer at the time of closing. Returns Absent if the close operation fails
       *   (e.g., if the Hub was already closed).
       */
-    def close(using frame: Frame): Maybe[Seq[A]] < Sync =
+    def close(using frame: Frame): Maybe[Seq[A]] < Async =
         fiber.interruptDiscard(Result.Failure(Closed("Hub", initFrame))).andThen {
             ch.close.map { r =>
-                Sync.defer {
-                    val l = Chunk.fromNoCopy(listeners.toArray()).asInstanceOf[Chunk[Listener[A]]]
-                    discard(listeners.removeIf(_ => true)) // clear is not available in Scala Native
-                    Kyo.foreachDiscard(l)(_.child.close.unit).andThen(r)
-                }
+                detachListeners.andThen(r)
             }
+        }
+
+    /** Closes the Hub, discarding any messages left in its buffer.
+      *
+      * The `Sync`-only counterpart to `close`, for callers that do not read the remaining messages.
+      */
+    def closeDiscard(using frame: Frame): Unit < Sync =
+        fiber.interruptDiscard(Result.Failure(Closed("Hub", initFrame))).andThen {
+            ch.closeDiscard.andThen(detachListeners)
+        }
+
+    private def detachListeners(using Frame): Unit < Sync =
+        Sync.defer {
+            val l = Chunk.fromNoCopy(listeners.toArray()).asInstanceOf[Chunk[Listener[A]]]
+            discard(listeners.removeIf(_ => true)) // clear is not available in Scala Native
+            Kyo.foreachDiscard(l)(_.child.closeDiscard)
         }
 
     /** Creates a new listener for this Hub with the default buffer size.
@@ -155,21 +169,28 @@ final class Hub[A] private[kyo] (
     def listen(bufferSize: Int, filter: A => Boolean)(using frame: Frame): Listener[A] < (Sync & Abort[Closed] & Scope) =
         def fail = Abort.fail(Closed("Hub", initFrame))
         closed.map {
-            case true => fail
+            case true  => fail
             case false =>
-                Sync.Unsafe {
+                Sync.Unsafe.defer {
                     val child    = Channel.Unsafe.init[A](bufferSize, Access.SingleProducerMultiConsumer).safe
                     val listener = new Listener[A](this, child, filter)
-                    discard(listeners.add(listener))
-                    closed.map {
-                        case true =>
-                            // race condition
-                            Sync.defer {
-                                discard(listeners.remove(listener))
-                                fail
-                            }
-                        case false =>
-                            Scope.acquireRelease(listener)(_.close.unit)
+                    // The listener's close is registered on the scope BEFORE it is added to the set, so no poll sits
+                    // between the add and the registration. An interrupt landing on that poll would otherwise abandon a
+                    // listener that is in the set with nothing to close it, and the hub's publisher then parks forever on
+                    // its full buffer. `listener.close` removes it from the set and closes its channel and is idempotent,
+                    // so it is safe both when the closed re-check below removes the listener and when the interrupt lands
+                    // before the add ever ran.
+                    Scope.ensure(listener.close.unit).andThen {
+                        discard(listeners.add(listener))
+                        closed.map {
+                            case true =>
+                                Sync.defer {
+                                    discard(listeners.remove(listener))
+                                    fail
+                                }
+                            case false =>
+                                listener
+                        }
                     }
                 }
         }
@@ -228,17 +249,19 @@ object Hub:
 
     def use[A](capacity: Int)[B, S](f: Hub[A] => B < S)(using Frame): B < (S & Sync) =
         initUnscopedWith[A](capacity): hub =>
-            Sync.ensure(hub.close)(f(hub))
+            Sync.ensure(hub.closeDiscard)(f(hub))
 
     def initUnscoped[A](capacity: Int)(using Frame): Hub[A] < Sync =
         initUnscopedWith[A](capacity)(identity)
 
     def initUnscopedWith[A](capacity: Int)[B, S](f: Hub[A] => B < S)(using Frame): B < (S & Sync) =
-        Sync.Unsafe {
+        Sync.Unsafe.defer {
             val channel          = Channel.Unsafe.init[A](capacity, Access.MultiProducerSingleConsumer).safe
             val listeners        = new CopyOnWriteArraySet[Listener[A]]
             def currentListeners = Chunk.fromNoCopy(listeners.toArray()).asInstanceOf[Chunk[Listener[A]]]
-            Fiber.initUnscoped {
+            // The publisher is live once it is spawned and only the hub built from it can stop it, so the spawn, the hub and
+            // `f` share this block: a suspension between them is a step an interrupt could park on with `f` never applied.
+            val fiber = Fiber.Unsafe.init {
                 Loop.foreach {
                     channel.take.map { value =>
                         Abort.recover { error =>
@@ -246,16 +269,16 @@ object Hub:
                             Loop.continue
                         } {
                             Kyo.foreachDiscard(currentListeners) { listener =>
-                                Abort.recover[Throwable](e => bug(s"Hub fiber failed to publish to listener: $e"))(
-                                    listener.put(value)
-                                )
+                                // A listener closes on its own schedule: `Listener.close` removes it from the set and then closes its
+                                // channel, and this snapshot may still hold it, so its put fails Closed or is failed while parked on
+                                // its full buffer. That is the listener leaving, not a delivery failure.
+                                Abort.recover[Closed](_ => ())(listener.put(value))
                             }.andThen(Loop.continue)
                         }
                     }
                 }
-            }.map { fiber =>
-                f(new Hub(channel, fiber, listeners))
             }
+            f(new Hub(channel, fiber.safe, listeners))
         }
 
     /** A subscriber to a Hub that receives and processes a filtered stream of messages.
@@ -265,6 +288,7 @@ object Hub:
       * receives messages that were published after its creation.
       *
       * Message processing:
+      *
       *   - Messages matching the filter are added to the Listener's buffer
       *   - When the buffer is full, backpressure is applied to the Hub
       *   - The Listener can be closed independently of the Hub
@@ -309,6 +333,7 @@ object Hub:
         /** Takes an element from the Listener's buffer, potentially blocking if the buffer is empty.
           *
           * This operation will block until:
+          *
           *   - A message matching the listener's filter becomes available
           *   - The Hub or this Listener is closed (resulting in a Closed failure)
           *
@@ -319,11 +344,11 @@ object Hub:
           */
         def take(using Frame): A < (Async & Abort[Closed]) = child.take
 
-        /** Takes [[n]] elements from the Listener's buffer, blocking until enough elements are present. Note that if enough elements are
-          * not added to the buffer it can block indefinitely.
+        /** Takes `n` elements from the Listener's buffer, blocking until enough elements are present. Note that if enough elements are not
+          * added to the buffer it can block indefinitely.
           *
           * @return
-          *   Chunk of [[n]] elements
+          *   Chunk of `n` elements
           */
         def takeExactly(n: Int)(using Frame): Chunk[A] < (Abort[Closed] & Async) =
             child.takeExactly(n)
@@ -340,12 +365,13 @@ object Hub:
           * @return
           *   a Maybe containing any remaining elements in the Listener's buffer
           */
-        def close(using Frame): Maybe[Seq[A]] < Sync =
+        def close(using Frame): Maybe[Seq[A]] < Async =
             hub.remove(this).andThen(child.close)
 
         /** Stream elements from listener, optionally specifying a maximum chunk size.
           *
           * This streaming operation:
+          *
           *   - Continues until the Hub or Listener is closed
           *   - Completes normally when closed (use streamFailing for failure behavior)
           *   - Only emits messages that match this listener's filter

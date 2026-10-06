@@ -24,7 +24,7 @@ class GrpcServerManyToOneBench extends ArenaBench2(response):
             cats.effect.IO.async[Response]: cb =>
                 val observer = new StreamObserver[Response]:
                     private var response: Maybe[Response] = Maybe.empty
-                    def onNext(response: Response): Unit =
+                    def onNext(response: Response): Unit  =
                         if this.response.isDefined then throw IllegalStateException("Response already set.")
                         this.response = Maybe(response)
                     def onError(t: Throwable): Unit =
@@ -46,7 +46,7 @@ class GrpcServerManyToOneBench extends ArenaBench2(response):
             Promise.initWith[Response, Abort[Throwable]]: promise =>
                 val observer = new StreamObserver[Response]:
                     private var response: Maybe[Response] = Maybe.empty
-                    def onNext(response: Response): Unit =
+                    def onNext(response: Response): Unit  =
                         if this.response.isDefined then throw IllegalStateException("Response already set.")
                         this.response = Maybe(response)
                     def onError(t: Throwable): Unit =
@@ -73,7 +73,7 @@ class GrpcServerManyToOneBench extends ArenaBench2(response):
             ZIO.async[Any, Throwable, Response]: cb =>
                 val observer = new StreamObserver[Response]:
                     private var response: Option[Response] = None
-                    def onNext(response: Response): Unit =
+                    def onNext(response: Response): Unit   =
                         if this.response.isDefined then throw IllegalStateException("Response already set.")
                         this.response = Some(response)
                     def onError(t: Throwable): Unit = cb(ZIO.fail(t))

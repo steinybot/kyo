@@ -1,0 +1,535 @@
+package kyo
+
+import java.nio.charset.StandardCharsets
+
+/** A serialization format that pairs a [[Codec.Writer]] and [[Codec.Reader]] to encode and decode values.
+  *
+  * Codec is the extension point for adding new wire formats to kyo-schema. Each implementation defines how to produce a fresh Writer for
+  * serialization and a fresh Reader for deserialization, while the Schema-derived traversal logic remains format-agnostic.
+  *
+  *   - Pluggable: implement `newWriter` and `newReader` to support any binary or text format
+  *   - Used by [[kyo.Schema]] encode/decode methods to select the target format at the call site
+  *   - Built-in implementations: `Json` (JSON), `Ion` (Amazon Ion text), `Yaml` (YAML), and `Protobuf` (Protocol Buffers wire format),
+  *     each published in its own `kyo-schema-<format>` artifact
+  *
+  * @see
+  *   [[Codec.Writer]] for the serialization side
+  * @see
+  *   [[Codec.Reader]] for the deserialization side
+  * @see
+  *   [[kyo.Schema]] for the type-driven serialization entry point
+  */
+abstract class Codec:
+    def newWriter()(using Frame): Codec.Writer
+    def newReader(input: Span[Byte])(using Frame): Codec.Reader
+
+    /** Reads one value of `A` from `input` and requires the whole of it to have been consumed.
+      *
+      * Every decode entry point routes through here so the end-of-input requirement cannot be
+      * forgotten by one format while another remembers it. Reading the value and checking what is
+      * left are one operation, not two that a caller is trusted to pair up.
+      */
+    final private[kyo] def decodeFully[A](
+        input: Span[Byte],
+        maxDepth: Int,
+        maxCollectionSize: Int
+    )(using schema: Schema[A], frame: Frame): Result[DecodeException, A] =
+        val reader = newReader(input)
+        reader.resetLimits(maxDepth, maxCollectionSize)
+        Result.catching[DecodeException] {
+            val value = schema.readFrom(reader)
+            reader.requireEndOfInput()
+            value
+        }
+    end decodeFully
+
+    /** Validates that `structure` can be canonically represented by this codec before any bytes are written.
+      *
+      * The default accepts every shape. A built-in codec with format-specific canonicalization rules (Protobuf's proto3 conformance, which rejects
+      * a non-scalar map key) overrides this to reject an unrepresentable shape up front. Every `Schema` encode entry point
+      * (`encode`/`encodeString`) calls this before writing, so the check applies uniformly regardless of which entry point the caller
+      * uses, rather than only the codec's own companion-object encode method.
+      */
+    private[kyo] def validate(structure: Structure.Type)(using Frame): Unit = ()
+end Codec
+
+object Codec:
+
+    /** Default maximum nesting depth for decoding (DoS limit), shared by every built-in codec. */
+    inline val DefaultMaxDepth = 512
+
+    /** Default maximum number of entries in any single collection or object during decoding (DoS limit), shared by every built-in codec. */
+    inline val DefaultMaxCollectionSize = 100000
+
+    /** Reads one value of `A` from an already-built reader and requires the whole input to be consumed.
+      *
+      * The entry points that construct their own reader (a format with a config-dependent reader, or
+      * one decoding from a source other than a byte span) route through here, so reading the value and
+      * checking what is left stay one operation for every format rather than a pairing each decode is
+      * trusted to remember.
+      */
+    private[kyo] def readFully[A](
+        reader: Codec.Reader,
+        maxDepth: Int,
+        maxCollectionSize: Int
+    )(using schema: Schema[A], frame: Frame): Result[DecodeException, A] =
+        reader.resetLimits(maxDepth, maxCollectionSize)
+        Result.catching[DecodeException] {
+            val value = schema.readFrom(reader)
+            reader.requireEndOfInput()
+            value
+        }
+    end readFully
+
+    /** The kind of a value as every reader reports it in a `TypeMismatchException`.
+      *
+      * Each format maps its own tokens onto these (an Ion struct, a MsgPack map and a JSON object are all `Object`), so a value of the
+      * wrong kind fails with the same text whichever format read it, and whether it was read directly or from a captured tree.
+      */
+    private[kyo] enum Kind derives CanEqual:
+        case Object, Array, String, Number, Boolean, Null, Bytes, Timestamp, Duration
+
+        def show: java.lang.String =
+            this match
+                case Object    => "object"
+                case Array     => "array"
+                case String    => "string"
+                case Number    => "number"
+                case Boolean   => "boolean"
+                case Null      => "null"
+                case Bytes     => "bytes"
+                case Timestamp => "timestamp"
+                case Duration  => "duration"
+    end Kind
+
+    /** A value of kind `actual` where one of kind `expected` was required. */
+    private[kyo] def kindMismatch(expected: Kind, actual: Kind)(using Frame): TypeMismatchException =
+        TypeMismatchException(Seq.empty, expected.show, actual.show)
+
+    abstract class Reader:
+        /** The source location where this Reader was constructed.
+          *
+          * Codec implementations use this frame to attach a user-meaningful context to DecodeExceptions thrown during reading. The frame
+          * corresponds to the caller's decode site (where they invoked `Codec.decode`), not the codec's internal synthesis site.
+          */
+        def frame: Frame
+
+        private[kyo] var maxDepth: Int          = DefaultMaxDepth
+        private[kyo] var maxCollectionSize: Int = DefaultMaxCollectionSize
+        private var _depth: Int                 = 0
+
+        private var _schemaTransformOverrides: List[Schema[?]] = Nil
+
+        /** Innermost-first stack of configured schemas active for the current read.
+          *
+          * A schema with structural transforms (discriminator, variant naming, field renames)
+          * registers itself here for the duration of its transformed read, so a raw Product or Sum
+          * schema of the same nominal type reached deeper in the same operation delegates to the
+          * configured schema instead of its raw read. This is what makes fluent configuration apply
+          * to recursive occurrences of the type. Wrapper readers override both accessors to share
+          * the wrapped reader's stack.
+          */
+        private[kyo] def schemaTransformOverrides: List[Schema[?]]               = _schemaTransformOverrides
+        private[kyo] def schemaTransformOverrides_=(next: List[Schema[?]]): Unit =
+            _schemaTransformOverrides = next
+
+        /** Whether the field name this reader last parsed is a Scala field name rather than a wire key. A positional wire (`tupleFlat`)
+          * carries no names, so its reader presents each element under the field's declared name, and the transform layer must take it
+          * as is instead of translating it as a wire key (a renamed field's declared name reads as renamed away).
+          */
+        private[kyo] def presentsSourceFieldNames: Boolean = false
+
+        /** Fails unless everything left after the decoded root value is insignificant.
+          *
+          * Decoding a value is not the same as decoding the input. A reader that stops at the end of
+          * the first value and never looks further reports success on input it only partly consumed,
+          * so a document holding two values back to back yields the first and discards the rest
+          * without a word, and one trailed by anything else is indistinguishable from a clean parse.
+          *
+          * This is abstract rather than defaulted so that every format has to answer it. A default of
+          * "accept" would let a reader inherit silence, which is exactly the state this exists to end;
+          * a format where the question is meaningless, such as one reading an already-parsed value in
+          * memory, says so by implementing it as a no-op.
+          */
+        private[kyo] def requireEndOfInput(): Unit
+
+        /** Reset limits and depth counter. Called on reader reuse. */
+        private[kyo] def resetLimits(maxDepth: Int, maxCollectionSize: Int): Unit =
+            this.maxDepth = maxDepth
+            this.maxCollectionSize = maxCollectionSize
+            _depth = 0
+        end resetLimits
+
+        /** Increment depth and check against limit. */
+        final protected def checkDepth(): Unit =
+            _depth += 1
+            if _depth > maxDepth then
+                throw LimitExceededException("Nesting depth", _depth, maxDepth)(using frame)
+        end checkDepth
+
+        /** Decrement depth. */
+        final protected def decrementDepth(): Unit =
+            _depth -= 1
+
+        /** Check collection size against limit. */
+        final def checkCollectionSize(count: Int): Unit =
+            if count > maxCollectionSize then
+                throw LimitExceededException("Collection size", count, maxCollectionSize)(using frame)
+
+        def objectStart(): Int
+        def objectEnd(): Unit
+        def arrayStart(): Int
+        def arrayEnd(): Unit
+        def field(): String
+        def hasNextField(): Boolean
+        def hasNextElement(): Boolean
+        def string(): String
+        def int(): Int
+        def long(): Long
+        def float(): Float
+        def double(): Double
+        def boolean(): Boolean
+        def short(): Short
+        def byte(): Byte
+        def char(): Char
+        def isNil(): Boolean
+        def skip(): Unit
+        def mapStart(): Int
+        def mapEnd(): Unit
+        def hasNextEntry(): Boolean
+        def bytes(): Span[Byte]
+        def bigInt(): BigInt
+        def bigDecimal(): BigDecimal
+        def instant(): java.time.Instant
+        def duration(): java.time.Duration
+
+        /** Initialize reusable field values array for n fields. Returns the array. Override for pooled implementations (e.g. JsonReader).
+          * Default allocates fresh.
+          */
+        def initFields(n: Int): Array[AnyRef] = new Array[AnyRef](n)
+
+        /** Clear field values to prevent reference leaks. Default is no-op. */
+        def clearFields(n: Int): Unit = ()
+
+        /** Returns a bitmask of fields that should be considered pre-satisfied during required-field validation.
+          *
+          * The macro-generated case-class decoder OR-s this mask into its local `seen` bitmap before checking required fields, so transform
+          * wrappers (e.g. the internal `SchemaSerializer.TransformAwareReader`) can signal that fields dropped by the schema should not
+          * trigger [[MissingFieldException]].
+          *
+          * Default returns `0L`: no fields pre-satisfied. Overrides must return a mask with bit `i` set iff field index `i` is
+          * pre-satisfied by this reader. Field index `i` corresponds to the case class constructor position (0-based). Only the low-order
+          * `n` bits are relevant; bits beyond that are ignored by the caller.
+          */
+        def droppedFieldsMask(n: Int): Long = 0L
+
+        /** Returns a bitmask of absent fields that this reader can materialize from a typed empty seed.
+          *
+          * The macro-generated case-class decoder supplies `defaultableFieldsMask` with bit `i` set when constructor field `i` is a
+          * non-optional collection or map field that has a typed empty seed. A reader can return some or all of those bits when the wire
+          * format defines absence as the empty value for those field shapes, as Protobuf does for repeated and map fields.
+          *
+          * Self-describing codecs keep the default `0L`, so a missing required collection or map field still fails required-field validation.
+          * Only the low-order `n` bits are relevant; bits beyond that are ignored by the caller.
+          */
+        def absentDefaultedFieldsMask(n: Int, defaultableFieldsMask: Long): Long = 0L
+
+        /** Parse the next field name and record it as internal state for [[matchField]] and [[lastFieldName]].
+          *
+          * Implementations should advance the wire stream past the field name (and any delimiters such as JSON's `:`) so subsequent value
+          * reads can proceed. Zero-allocation implementations may store raw byte positions instead of materializing a String.
+          */
+        def fieldParse(): Unit
+
+        /** Compare the last field name parsed via [[fieldParse]] against pre-encoded UTF-8 name bytes.
+          *
+          * Implementations should return `true` iff the field name captured by the most recent [[fieldParse]] call matches `nameBytes`
+          * exactly. Called repeatedly against the schema's known field names to dispatch decoding.
+          */
+        def matchField(nameBytes: Array[Byte]): Boolean
+
+        /** Returns a string representation of the last field parsed via [[fieldParse]].
+          *
+          * Used for error reporting (e.g. [[UnknownVariantException]]) when [[matchField]] has rejected every known candidate and
+          * the decoder needs a human-readable name. Implementations should return the canonical field name when available, or a stable,
+          * identifiable surrogate (e.g. a numeric field ID) when the underlying wire format does not carry names (as in Protobuf).
+          */
+        def lastFieldName(): String
+
+        /** Whether [[matchField]] compares the key [[fieldParse]] last parsed as its own name bytes, allocating nothing, while
+          * [[lastFieldName]] allocates the name. A transform layer then finds which of its names a key is by matching, and leaves a key
+          * that is none of them unnamed. A key reported by number (Protobuf, a MsgPack integer key) is matched through its field id, so
+          * it is not one, nor is a key the reader already holds as a String.
+          */
+        private[kyo] def matchesKeyBytes: Boolean = false
+
+        /** The field number of the key [[fieldParse]] last parsed, for a key reported by number (Protobuf, a MsgPack integer key),
+          * or -1 for a key reported by name. [[matchField]] matches such a key through the schema's field numbers, so a transform layer
+          * takes it by number instead of naming it.
+          */
+        private[kyo] def lastFieldNumber: Int = -1
+
+        /** Whether an optional field missing from the input is absent, whatever its default. True for a format with no null, where
+          * an absent field is written by leaving it out (Protobuf's explicit presence); elsewhere a missing field takes its default,
+          * and an absent one whose default is present is written as null.
+          */
+        private[kyo] def missingOptionalIsAbsent: Boolean = false
+
+        /** Release this reader back to its pool. Default is no-op. */
+        def release(): Unit = ()
+
+        /** Capture the next value into a buffered sub-Reader for deferred reading.
+          *
+          * Used by sum codecs to enable field-order independence: the value field may be read before the discriminator, then dispatched to
+          * the right inner codec once the discriminator is known.
+          *
+          * After this call, the parent Reader's position is advanced past the value (as if `skip()` had been called).
+          */
+        def captureValue(): Reader
+
+        /** Whether this codec addresses record fields by numeric id instead of (or in addition to)
+          * name, as Protobuf does. The schema serialization engine gates on this before computing a
+          * schema's field-id override map, which would otherwise pay rename-resolution cost at every
+          * nesting depth of every encode/decode on codecs that cannot use the result.
+          *
+          * Returning `true` obliges overriding BOTH [[withFieldIdOverrides]] and
+          * [[fieldIdOverridesSnapshot]]: the engine saves the snapshot before installing a nested
+          * schema's overrides and restores it afterwards, so leaving either default in place would
+          * capture an empty map as the prior state and silently wipe an ancestor schema's overrides
+          * on restore.
+          */
+        def supportsFieldIdOverrides: Boolean = false
+
+        /** Installs field-name-to-numeric-id overrides for interoperability with wire formats that
+          * carry numeric field ids (e.g. existing `.proto` definitions). No-op by default; a codec
+          * that returns `true` from [[supportsFieldIdOverrides]] must override this mutably and
+          * return `this` for chaining.
+          */
+        def withFieldIdOverrides(overrides: Map[String, Int]): this.type = this
+
+        /** The currently installed field-id override map, read by a caller that is about to replace
+          * it with a nested schema's own overrides so the prior value can be restored afterwards.
+          */
+        def fieldIdOverridesSnapshot: Map[String, Int] = Map.empty
+
+    end Reader
+
+    /** Reader capability for self-describing wire formats that can materialize a value into [[Structure.Value]]
+      * regardless of its shape.
+      *
+      * Readers that walk a self-describing wire (JSON, YAML) or an in-memory value tree extend this trait;
+      * binary codecs without per-value type tags (e.g. Protobuf) do not. The identity [[Schema]] for
+      * `Structure.Value` requires this capability, so the type system prevents a `Structure.Value` from being
+      * decoded through a non-introspecting codec instead of failing at runtime with a misleading
+      * [[UnknownVariantException]].
+      */
+    trait IntrospectingReader extends Reader:
+        /** Read the next wire value into a [[Structure.Value]] tree, regardless of its shape.
+          *
+          * Walks the next value at the cursor (object, array, scalar, or null) and materializes it as the
+          * corresponding `Value` node. Used by the identity Schema for `Structure.Value` so that plain wire
+          * records round-trip without forcing a tagged-union wrapper.
+          */
+        def readStructure(): Structure.Value
+    end IntrospectingReader
+
+    /** Abstract base for codec-specific serialization output.
+      *
+      * A Writer receives a stream of typed method calls (e.g. `objectStart`, `field`, `string`, `int`) that describe a value's structure,
+      * and encodes them into a target wire format such as JSON or Protocol Buffers. Schema-derived codecs call these methods in a
+      * depth-first traversal of the value being serialized.
+      *
+      *   - Format-agnostic: each concrete subclass (JsonWriter, ProtobufWriter, ReflectValueWriter) decides how to represent objects,
+      *     arrays, maps, and primitives
+      *   - Streaming: the caller drives the traversal; the writer accumulates output incrementally
+      *   - Symmetric with [[Reader]]: every write method has a corresponding read method, enabling round-trip serialization
+      *
+      * @see
+      *   [[Reader]] for the deserialization counterpart
+      * @see
+      *   [[kyo.Codec]] for the factory that pairs a Writer with a Reader
+      */
+    abstract class Writer:
+
+        /** The source location of the encode call this Writer serves, as [[Reader.frame]] is for a decode: a failure raised while
+          * writing, such as a schema's configuration failure, carries it.
+          */
+        def frame: Frame
+
+        private var _schemaTransformOverrides: List[Schema[?]] = Nil
+
+        /** Innermost-first stack of configured schemas active for the current write.
+          *
+          * A schema with structural transforms (discriminator, variant naming, field renames)
+          * registers itself here for the duration of its transformed write, so a raw Product or Sum
+          * schema of the same nominal type reached deeper in the same operation delegates to the
+          * configured schema instead of its raw write. This is what makes fluent configuration apply
+          * to recursive occurrences of the type. Wrapper writers override both accessors to share
+          * the wrapped writer's stack.
+          */
+        private[kyo] def schemaTransformOverrides: List[Schema[?]]               = _schemaTransformOverrides
+        private[kyo] def schemaTransformOverrides_=(next: List[Schema[?]]): Unit =
+            _schemaTransformOverrides = next
+
+        def objectStart(name: String, size: Int): Unit
+        def objectEnd(): Unit
+        def arrayStart(size: Int): Unit
+        def arrayEnd(): Unit
+        def fieldBytes(nameBytes: Array[Byte], fieldId: Int): Unit
+        def field(name: String, fieldId: Int): Unit = fieldBytes(name.getBytes(java.nio.charset.StandardCharsets.UTF_8), fieldId)
+        def string(value: String): Unit
+        def int(value: Int): Unit
+        def long(value: Long): Unit
+        def float(value: Float): Unit
+        def double(value: Double): Unit
+        def boolean(value: Boolean): Unit
+        def short(value: Short): Unit
+        def byte(value: Byte): Unit
+        def char(value: Char): Unit
+        def nil(): Unit
+        def mapStart(size: Int): Unit
+        def mapEnd(): Unit
+
+        /** Starts a map whose keys are not plain strings; each entry is written via [[mapEntryStart]], the key value, [[mapEntryValue]],
+          * the value, and [[mapEntryEnd]], followed by [[mapEntriesEnd]].
+          *
+          * The defaults write the array-of-`{key, value}`-records envelope, so wire codecs represent non-string maps exactly as before. A
+          * writer that models maps natively (StructureValueWriter) overrides these hooks to keep the map identity instead. String-keyed
+          * maps use [[mapStart]]/[[mapEnd]] with each key written as a field.
+          */
+        def mapEntriesStart(size: Int): Unit = arrayStart(size)
+
+        /** Starts one entry of a non-string map; the key value is written next. */
+        def mapEntryStart(): Unit =
+            objectStart("", 2)
+            field("key", 1)
+        end mapEntryStart
+
+        /** Marks the key-to-value transition inside a map entry; the entry's value is written next. */
+        def mapEntryValue(): Unit = field("value", 2)
+
+        /** Ends the entry started by [[mapEntryStart]]. */
+        def mapEntryEnd(): Unit = objectEnd()
+
+        /** Ends the map started by [[mapEntriesStart]]. */
+        def mapEntriesEnd(): Unit = arrayEnd()
+
+        /** Starts the active variant of a sum type; the variant payload is written next, followed by [[variantEnd]].
+          *
+          * The default writes the wrapper-object envelope (`{variantName: payload}`), so wire codecs represent sums exactly as before. A
+          * writer that models sums natively (StructureValueWriter) overrides both hooks to keep the variant identity instead.
+          */
+        def variantStart(name: String, variantName: String, variantNameBytes: Array[Byte], variantFieldId: Int): Unit =
+            objectStart(name, 1)
+            fieldBytes(variantNameBytes, variantFieldId)
+        end variantStart
+
+        /** Ends the variant started by [[variantStart]]. */
+        def variantEnd(): Unit = objectEnd()
+        def bytes(value: Span[Byte]): Unit
+        def bigInt(value: BigInt): Unit
+        def bigDecimal(value: BigDecimal): Unit
+
+        /** Writes an arbitrary-precision numeric scalar.
+          *
+          * The default delegates to [[bigDecimal]] so existing codecs retain their wire representation. Self-describing codecs whose
+          * native number representation differs from their typed `BigDecimal` representation can override this hook.
+          */
+        def bigNumber(value: BigDecimal): Unit = bigDecimal(value)
+
+        def instant(value: java.time.Instant): Unit
+        def duration(value: java.time.Duration): Unit
+        def result(): Span[Byte]
+
+        /** Supplies schema annotation metadata for the next value written.
+          *
+          * Codecs that can represent metadata may override this hook. The default is a no-op, so existing codecs ignore annotations and
+          * keep their wire output unchanged.
+          */
+        def annotations(values: Chunk[Any]): Unit = ()
+
+        /** Whether this writer consumes schema annotation metadata.
+          *
+          * Schema traversal uses this as a positive capability before inspecting structure annotations, so formats that cannot emit
+          * annotations skip annotation handling entirely.
+          */
+        def canWriteAnnotations: Boolean = false
+
+        /** Whether this writer can express a top-level non-object value: a top-level array, a bare
+          * top-level scalar, or a top-level null. Self-describing codecs (Json, Yaml, Ion, MsgPack)
+          * return true; a field-number-driven binary codec (Protobuf) cannot express these shapes and
+          * leaves the default false, so the engine raises a typed error before writing rather than
+          * emitting an invalid stream. Positive opt-in: a writer must declare the capability to gain it.
+          *
+          * Override this in a custom codec whose format can carry a top-level array, scalar, or null to
+          * make the Tuple, TupleFlat, and Untagged sum representations available with that codec.
+          */
+        def canWriteTopLevelNonObject: Boolean = false
+
+        /** Whether this codec's reader can read back any value this writer wrote without the value's schema, because the reader is a
+          * [[Codec.IntrospectingReader]]. Self-describing codecs (Json, Yaml, Ion, MsgPack, Bson) return true. A field-number-driven
+          * binary codec (Protobuf) leaves the default false, so a schema transform that regroups values on decode, such as `flatten`,
+          * raises [[TransformUnsupportedException]] before writing rather than producing bytes it cannot read. Positive opt-in.
+          */
+        def isSelfDescribing: Boolean = false
+
+        /** Whether the record being written must keep every field, because its fields are read back by position (a `tupleFlat`
+          * payload): an absent optional field is written as null and a configured omit policy does not apply, where both would
+          * otherwise leave the field off and shift every later position.
+          */
+        private[kyo] def writesEveryField: Boolean = false
+
+        /** The public codec name, used in user-facing error messages such as [[RepresentationUnsupportedException]].
+          *
+          * Each concrete writer overrides this with the name of the codec the user selected (e.g. "Protobuf", "Json"),
+          * not the writer's internal class name. A custom codec should override this so its error messages name the
+          * codec the user selected rather than the writer's class name.
+          */
+        def codecName: String = getClass.getSimpleName
+
+        /** Materialize the output as a String. Default delegates to `result()` + UTF-8 decode; codecs with char-native or ASCII-fast paths
+          * should override to skip intermediate copies.
+          */
+        def resultString: String =
+            new String(result().toArrayUnsafe, java.nio.charset.StandardCharsets.UTF_8)
+
+        /** Projects this writer's serialization capabilities into a descriptor that drives
+          * representation selection for a chain-bearing sum schema. The default body reads the
+          * existing `canWriteTopLevelNonObject` opt-in, so an external codec participates in
+          * selection with no kyo-schema source change.
+          */
+        def capabilities: Codec.Capabilities = Codec.Capabilities(canWriteTopLevelNonObject)
+
+        /** Whether this codec addresses record fields by numeric id instead of (or in addition to)
+          * name, as Protobuf does. The schema serialization engine gates on this before computing a
+          * schema's field-id override map, which would otherwise pay rename-resolution cost at every
+          * nesting depth of every encode/decode on codecs that cannot use the result.
+          *
+          * Returning `true` obliges overriding BOTH [[withFieldIdOverrides]] and
+          * [[fieldIdOverridesSnapshot]]: the engine saves the snapshot before installing a nested
+          * schema's overrides and restores it afterwards, so leaving either default in place would
+          * capture an empty map as the prior state and silently wipe an ancestor schema's overrides
+          * on restore.
+          */
+        def supportsFieldIdOverrides: Boolean = false
+
+        /** Installs field-name-to-numeric-id overrides for interoperability with wire formats that
+          * carry numeric field ids (e.g. existing `.proto` definitions). No-op by default; a codec
+          * that returns `true` from [[supportsFieldIdOverrides]] must override this mutably and
+          * return `this` for chaining.
+          */
+        def withFieldIdOverrides(overrides: Map[String, Int]): this.type = this
+
+        /** The currently installed field-id override map, read by a caller that is about to replace
+          * it with a nested schema's own overrides so the prior value can be restored afterwards.
+          */
+        def fieldIdOverridesSnapshot: Map[String, Int] = Map.empty
+    end Writer
+
+    /** Describes what wire shapes a codec can express, consulted by `Schema.representationFor`
+      * to select the highest-priority representation a chain admits. A single boolean axis today
+      * (`canWriteTopLevelNonObject`); future axes add fields without changing the selection arity.
+      */
+    final case class Capabilities(canWriteTopLevelNonObject: Boolean) derives CanEqual
+
+end Codec

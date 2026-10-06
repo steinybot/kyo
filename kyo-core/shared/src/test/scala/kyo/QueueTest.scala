@@ -2,14 +2,16 @@ package kyo
 
 import kyo.internal.Platform
 
-class QueueTest extends Test:
+class QueueTest extends kyo.test.Test[Any]:
+
+    override def config = super.config.sequential
 
     val access = Access.values.toList
 
     "bounded" - {
         access.foreach { access =>
             access.toString() - {
-                "initWith" in runNotNative {
+                "initWith" in {
                     val effect = Queue.initWith[Int](2, access) { q =>
                         for
                             b <- q.offer(1)
@@ -24,7 +26,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "use" in runNotNative {
+                "use" in {
                     val effect = Queue.use[Int](2, access) { q =>
                         for
                             b <- q.offer(1)
@@ -39,27 +41,27 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "isEmpty" in runNotNative {
+                "isEmpty" in {
                     for
                         q <- Queue.init[Int](2, access)
                         b <- q.empty
                     yield assert(b && q.capacity == 2)
                 }
-                "offer and poll" in runNotNative {
+                "offer and poll" in {
                     for
                         q <- Queue.init[Int](2, access)
                         b <- q.offer(1)
                         v <- q.poll
                     yield assert(b && v == Maybe(1))
                 }
-                "peek" in runNotNative {
+                "peek" in {
                     for
                         q <- Queue.init[Int](2, access)
                         _ <- q.offer(1)
                         v <- q.peek
                     yield assert(v == Maybe(1))
                 }
-                "full" in runNotNative {
+                "full" in {
                     for
                         q <- Queue.init[Int](2, access)
                         _ <- q.offer(1)
@@ -67,7 +69,7 @@ class QueueTest extends Test:
                         b <- q.offer(3)
                     yield assert(!b)
                 }
-                "full 4" in runNotNative {
+                "full 4" in {
                     for
                         q <- Queue.init[Int](4, access)
                         _ <- q.offer(1)
@@ -77,7 +79,7 @@ class QueueTest extends Test:
                         b <- q.offer(5)
                     yield assert(!b)
                 }
-                "zero capacity" in runNotNative {
+                "zero capacity" in {
                     for
                         q <- Queue.init[Int](0, access)
                         b <- q.offer(1)
@@ -88,46 +90,45 @@ class QueueTest extends Test:
         }
     }
 
-    "close" - {
-        "allowed following ops" in runNotNative {
-            for
-                q  <- Queue.init[Int](2)
-                b  <- q.offer(1)
-                c1 <- q.close
-                v1 <- Abort.run(q.size)
-                v2 <- Abort.run(q.empty)
-                v3 <- Abort.run(q.full)
-                v4 <- Abort.run(q.offer(2))
-                v5 <- Abort.run(q.poll)
-                v6 <- Abort.run(q.peek)
-                v7 <- Abort.run(q.drain)
-                c2 <- q.close
-            yield assert(
-                b && c1 == Maybe(Seq(1)) &&
-                    v1.isFailure &&
-                    v2.isFailure &&
-                    v3.isFailure &&
-                    v4.isFailure &&
-                    v5.isFailure &&
-                    v6.isFailure &&
-                    v7.isFailure &&
-                    c2.isEmpty
-            )
-        }
-        "states" in runNotNative {
-            for
-                q       <- Queue.init[Int](2)
-                closed1 <- q.closed
-                open1   <- q.open
-                _       <- q.offer(1)
-                _       <- q.close
-                closed2 <- q.closed
-                open2   <- q.open
-            yield assert(!closed1 && open1 && closed2 && !open2)
-        }
+    "close" in {
+        for
+            q  <- Queue.init[Int](2)
+            b  <- q.offer(1)
+            c1 <- q.close
+            v1 <- Abort.run(q.size)
+            v2 <- Abort.run(q.empty)
+            v3 <- Abort.run(q.full)
+            v4 <- Abort.run(q.offer(2))
+            v5 <- Abort.run(q.poll)
+            v6 <- Abort.run(q.peek)
+            v7 <- Abort.run(q.drain)
+            c2 <- q.close
+        yield assert(
+            b && c1 == Maybe(Seq(1)) &&
+                v1.isFailure &&
+                v2.isFailure &&
+                v3.isFailure &&
+                v4.isFailure &&
+                v5.isFailure &&
+                v6.isFailure &&
+                v7.isFailure &&
+                c2.isEmpty
+        )
     }
 
-    "drain" in runNotNative {
+    "close states" in {
+        for
+            q       <- Queue.init[Int](2)
+            closed1 <- q.closed
+            open1   <- q.open
+            _       <- q.offer(1)
+            _       <- q.close
+            closed2 <- q.closed
+            open2   <- q.open
+        yield assert(!closed1 && open1 && closed2 && !open2)
+    }
+
+    "drain" in {
         for
             q <- Queue.init[Int](2)
             _ <- q.offer(1)
@@ -136,7 +137,7 @@ class QueueTest extends Test:
         yield assert(v == Seq(1, 2))
     }
 
-    "drainUpTo" in runNotNative {
+    "drainUpTo" in {
         for
             q <- Queue.init[Int](4)
             _ <- Kyo.foreach(1 to 4)(q.offer)
@@ -147,7 +148,7 @@ class QueueTest extends Test:
     "unbounded" - {
         access.foreach { access =>
             access.toString() - {
-                "initWith" in runNotNative {
+                "initWith" in {
                     val effect = Queue.Unbounded.initWith[Int](access) { q =>
                         for
                             b <- q.offer(1)
@@ -162,7 +163,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "use" in runNotNative {
+                "use" in {
                     val effect = Queue.Unbounded.use[Int](access) { q =>
                         for
                             b <- q.offer(1)
@@ -177,27 +178,27 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "isEmpty" in runNotNative {
+                "isEmpty" in {
                     for
                         q <- Queue.Unbounded.init[Int](access)
                         b <- q.empty
                     yield assert(b)
                 }
-                "offer and poll" in runNotNative {
+                "offer and poll" in {
                     for
                         q <- Queue.Unbounded.init[Int](access)
                         b <- q.offer(1)
                         v <- q.poll
                     yield assert(b && v == Maybe(1))
                 }
-                "peek" in runNotNative {
+                "peek" in {
                     for
                         q <- Queue.Unbounded.init[Int](access)
                         _ <- q.offer(1)
                         v <- q.peek
                     yield assert(v == Maybe(1))
                 }
-                "add and poll" in runNotNative {
+                "add and poll" in {
                     for
                         q <- Queue.Unbounded.init[Int](access)
                         _ <- q.add(1)
@@ -211,7 +212,7 @@ class QueueTest extends Test:
     "dropping" - {
         access.foreach { access =>
             access.toString() - {
-                "initWith" in runNotNative {
+                "initWith" in {
                     val effect = Queue.Unbounded.initDropping[Int](2, access).map { q =>
                         for
                             b <- q.offer(1)
@@ -226,7 +227,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "use" in runNotNative {
+                "use" in {
                     val effect = Queue.Unbounded.useDropping[Int](2, access) { q =>
                         for
                             b <- q.offer(1)
@@ -241,7 +242,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "add/poll" in runNotNative {
+                "add/poll" in {
                     for
                         q <- Queue.Unbounded.initDropping[Int](2)
                         _ <- q.add(1)
@@ -260,7 +261,7 @@ class QueueTest extends Test:
     "sliding" - {
         access.foreach { access =>
             access.toString() - {
-                "initWith" in runNotNative {
+                "initWith" in {
                     val effect = Queue.Unbounded.initSliding[Int](2, access).map { q =>
                         for
                             b <- q.offer(1)
@@ -275,7 +276,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "use" in runNotNative {
+                "use" in {
                     val effect = Queue.Unbounded.useSliding[Int](2, access) { q =>
                         for
                             b <- q.offer(1)
@@ -290,7 +291,7 @@ class QueueTest extends Test:
                             q.closed.map: isClosed =>
                                 assert(isClosed && b && v == Maybe(1))
                 }
-                "add/poll" in runNotNative {
+                "add/poll" in {
                     for
                         q <- Queue.Unbounded.initSliding[Int](2, access)
                         _ <- q.add(1)
@@ -311,9 +312,41 @@ class QueueTest extends Test:
         def withQueue[A](f: Queue.Unsafe[Int] => A): A =
             f(Queue.Unsafe.init[Int](2))
 
+        // close hands its backlog over through a fiber, because an offer still committing could not be reported synchronously. These
+        // leaves drive the queue from one thread with nothing in flight, so the handover always settles inside close itself; anything
+        // else is a defect in the handover rather than a slow test, which is why this refuses to wait.
+        def closeNow[A](queue: Queue.Unsafe[A]): Maybe[Seq[A]] =
+            queue.close().poll() match
+                case Present(Result.Success(backlog)) => backlog.eval
+                case other                            => throw AssertionError(s"close did not settle synchronously: $other")
+
         "should offer and poll correctly" in withQueue { testUnsafe =>
             assert(testUnsafe.offer(1).contains(true))
             assert(testUnsafe.poll().contains(Maybe(1)))
+        }
+
+        def closedBy(result: Result[Closed, Any]): Closed =
+            result match
+                case Result.Failure(closed) => closed
+                case other                  => throw AssertionError(s"expected a Closed failure: $other")
+
+        "reads after close share one failure naming the closing call" in withQueue { testUnsafe =>
+            val closedAt = summon[Frame]
+            discard { given Frame = closedAt; testUnsafe.close() }
+            val first  = closedBy(testUnsafe.poll())
+            val second = closedBy(testUnsafe.offer(1))
+            assert(first eq second)
+            assert(first.frame eq closedAt)
+        }
+
+        "a close after closeAwaitEmpty names the close call" in withQueue { testUnsafe =>
+            assert(testUnsafe.offer(1).contains(true))
+            val awaitedAt = summon[Frame]
+            val closedAt  = summon[Frame]
+            discard { given Frame = awaitedAt; testUnsafe.closeAwaitEmpty() }
+            assert(closedBy(testUnsafe.offer(2)).frame eq awaitedAt)
+            discard { given Frame = closedAt; testUnsafe.close() }
+            assert(closedBy(testUnsafe.poll()).frame eq closedAt)
         }
 
         "should peek correctly" in withQueue { testUnsafe =>
@@ -352,9 +385,42 @@ class QueueTest extends Test:
 
         "should close correctly" in withQueue { testUnsafe =>
             testUnsafe.offer(5)
-            val closed = testUnsafe.close()
+            val closed = closeNow(testUnsafe)
             assert(closed == Maybe(Seq(5)))
-            assert(testUnsafe.close().isEmpty)
+            assert(closeNow(testUnsafe).isEmpty)
+        }
+
+        "a hard close aborts a pending closeAwaitEmpty and returns the backlog" in withQueue { testUnsafe =>
+            discard(testUnsafe.offer(1))
+            discard(testUnsafe.offer(2))
+            val await = testUnsafe.closeAwaitEmpty() // HalfOpen: queue non-empty, so the await parks
+            val backlog = closeNow(testUnsafe) // escalate HalfOpen -> Draining -> FullyClosed: abort the await, hand over the backlog
+            val ar      = await.poll()
+            assert(backlog.contains(Seq(1, 2)), s"close must return the undrained backlog=$backlog")
+            assert(ar.exists { case Result.Success(b) => !b.eval; case _ => false }, s"the aborted await must settle false=$ar")
+            assert(testUnsafe.offer(3).isFailure, "offers fail Closed after the hard close")
+            assert(testUnsafe.poll().isFailure, "polls fail Closed after the hard close")
+        }
+
+        "diagnosticState renders the open state, ring size, and emptiness" in withQueue { testUnsafe =>
+            discard(testUnsafe.offer(1))
+            discard(testUnsafe.offer(2))
+            val s = testUnsafe.diagnosticState()
+            assert(s.contains("state=Open"), s)
+            assert(s.contains("ringSize=2"), s)
+            assert(s.contains("ringEmpty=false"), s)
+            assert(s.contains("activeOffers=0"), s)
+        }
+
+        "diagnosticState tracks the HalfOpen then FullyClosed transition, rendering even when closed" in withQueue { testUnsafe =>
+            discard(testUnsafe.offer(1))
+            val await = testUnsafe.closeAwaitEmpty() // HalfOpen: the ring is non-empty, so the await parks
+            assert(testUnsafe.diagnosticState().contains("state=HalfOpen"), testUnsafe.diagnosticState())
+            discard(testUnsafe.poll()) // draining the last element escalates HalfOpen -> FullyClosed via handleHalfOpen
+            discard(await)
+            val s = testUnsafe.diagnosticState()
+            assert(s.contains("state=FullyClosed"), s) // still renders after close, unlike size()
+            assert(s.contains("ringEmpty=true"), s)
         }
     }
 
@@ -362,11 +428,11 @@ class QueueTest extends Test:
 
         val repeats = 100
 
-        "offer and close" in runNotNative {
+        "offer and close" in {
             (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
+                size       <- Choice.eval(0, 1, 2, 10, 100)
+                queue      <- Queue.init[Int](size)
+                latch      <- Latch.init(1)
                 offerFiber <- Fiber.initUnscoped(
                     latch.await.andThen(Async.foreach(1 to 100, 100)(i => Abort.run(queue.offer(i))))
                 )
@@ -385,14 +451,14 @@ class QueueTest extends Test:
                 assert(isClosed)
             )
                 .handle(Choice.run, _.unit, Loop.repeat(repeats))
-                .andThen(succeed)
+                .unit
         }
 
-        "offer and poll" in runNotNative {
+        "offer and poll" in {
             (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
+                size       <- Choice.eval(0, 1, 2, 10, 100)
+                queue      <- Queue.init[Int](size)
+                latch      <- Latch.init(1)
                 offerFiber <- Fiber.initUnscoped(
                     latch.await.andThen(Async.foreach(1 to 100, 100)(i => Abort.run(queue.offer(i))))
                 )
@@ -405,15 +471,15 @@ class QueueTest extends Test:
                 left    <- queue.size
             yield assert(offered.count(_.contains(true)) == polled.count(_.toMaybe.flatten.isDefined) + left))
                 .handle(Choice.run, _.unit, Loop.repeat(repeats))
-                .andThen(succeed)
+                .unit
         }
 
-        "offer to full queue during close" in runNotNative {
+        "offer to full queue during close" in {
             (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                _     <- Kyo.foreach(1 to size)(i => queue.offer(i))
-                latch <- Latch.init(1)
+                size       <- Choice.eval(0, 1, 2, 10, 100)
+                queue      <- Queue.init[Int](size)
+                _          <- Kyo.foreach(1 to size)(i => queue.offer(i))
+                latch      <- Latch.init(1)
                 offerFiber <- Fiber.initUnscoped(
                     latch.await.andThen(Async.foreach(1 to 100)(i => Abort.run(queue.offer(i))))
                 )
@@ -428,14 +494,14 @@ class QueueTest extends Test:
                 assert(isClosed)
             )
                 .handle(Choice.run, _.unit, Loop.repeat(repeats))
-                .andThen(succeed)
+                .unit
         }
 
-        "concurrent close attempts" in runNotNative {
+        "concurrent close attempts" in {
             (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
+                size       <- Choice.eval(0, 1, 2, 10, 100)
+                queue      <- Queue.init[Int](size)
+                latch      <- Latch.init(1)
                 offerFiber <- Fiber.initUnscoped(
                     latch.await.andThen(Async.foreach(1 to 100, 100)(i => Abort.run(queue.offer(i))))
                 )
@@ -452,14 +518,14 @@ class QueueTest extends Test:
                 assert(isClosed)
             )
                 .handle(Choice.run, _.unit, Loop.repeat(repeats))
-                .andThen(succeed)
+                .unit
         }
 
-        "offer, poll and close" in runNotNative {
+        "offer, poll and close" in {
             (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
+                size       <- Choice.eval(0, 1, 2, 10, 100)
+                queue      <- Queue.init[Int](size)
+                latch      <- Latch.init(1)
                 offerFiber <- Fiber.initUnscoped(
                     latch.await.andThen(Async.foreach(1 to 100, 100)(i => Abort.run(queue.offer(i))))
                 )
@@ -478,7 +544,236 @@ class QueueTest extends Test:
                 assert(isClosed)
             )
                 .handle(Choice.run, _.unit, Loop.repeat(repeats))
-                .andThen(succeed)
+                .unit
+        }
+    }
+
+    "close versus in-flight offers" - {
+
+        // Fewer repeats than the plain concurrency group above, because each scenario here drains thousands of elements. Both defects
+        // these guard showed up within the first repeat when they were live, so the count is margin rather than the mechanism.
+        val repeats = 25
+
+        // A close consumes the queue itself, so the closer has to be the only consumer for the whole close. These scenarios put dense
+        // offers against a long drain on every access pattern: each element an offer accepted must reach the closer's backlog exactly
+        // once, with nothing duplicated by a second consumer and nothing stranded in the queue after it is closed.
+        // A hang is caught by the suite's per-leaf cap; there is deliberately no in-test deadline racing the work.
+
+        def producerCount(access: Access) =
+            access match
+                case Access.MultiProducerMultiConsumer | Access.MultiProducerSingleConsumer   => 8
+                case Access.SingleProducerMultiConsumer | Access.SingleProducerSingleConsumer => 1
+
+        def preloadCount(capacity: Int) =
+            if capacity == Int.MaxValue then 4096 else capacity / 2
+
+        // Distinct ids per producer, all above the preloaded range, so the backlog identifies where every element came from. The producer
+        // reports itself running before its first offer, which is what lets the closer land while offers are genuinely in flight; the
+        // iteration cap is only a runaway guard, since the loop ends on the first refusal.
+        def offerUntilClosed(queue: Queue[Int], running: Latch, producer: Int)(using Frame): Chunk[Int] < Async =
+            running.release.andThen {
+                Loop.indexed(Chunk.empty[Int]) { (i, accepted) =>
+                    if i == 20000 then Loop.done(accepted)
+                    else
+                        val id = producer * 1000000 + i
+                        Abort.run(queue.offer(id)).map {
+                            case Result.Success(true)  => Loop.continue(accepted.append(id))
+                            case Result.Success(false) => Loop.continue(accepted)
+                            case _                     => Loop.done(accepted)
+                        }
+                    end if
+                }
+            }
+
+        // Drains rather than polls one at a time: each drain leaves the queue empty, which is the state in which a closing transition
+        // decides it has seen everything, so this is what puts that decision against the offers still in flight.
+        def drainUntilClosed(queue: Queue[Int])(using Frame): Chunk[Int] < Sync =
+            Loop(Chunk.empty[Int]) { polled =>
+                Abort.run(queue.drain).map {
+                    case Result.Success(batch) => Loop.continue(polled.concat(batch))
+                    case _                     => Loop.done(polled)
+                }
+            }
+
+        def closeRace(capacity: Int, access: Access)(using Frame, kyo.test.AssertScope) =
+            val producers = producerCount(access)
+            val preload   = preloadCount(capacity)
+            for
+                queue         <- Queue.initUnscoped[Int](capacity, access)
+                _             <- Kyo.foreachDiscard(1 to preload)(i => Abort.run(queue.offer(i)))
+                running       <- Latch.init(producers)
+                producerFiber <- Fiber.initUnscoped(
+                    Async.foreach(1 to producers, producers)(offerUntilClosed(queue, running, _))
+                )
+                closeFiber <- Fiber.initUnscoped(running.await.andThen(queue.close))
+                accepted   <- producerFiber.get
+                backlog    <- closeFiber.get
+            yield
+                val acceptedIds = accepted.flatten.toSet
+                val expected    = (1 to preload).toSet ++ acceptedIds
+                val drained     = backlog.getOrElse(Seq.empty)
+                val duplicated  = drained.diff(drained.distinct)
+                assert(
+                    duplicated.isEmpty,
+                    s"the backlog repeated ${duplicated.size} element(s) for capacity=$capacity access=$access: ${duplicated.take(5)}"
+                )
+                assert(
+                    drained.toSet == expected,
+                    s"for capacity=$capacity access=$access the backlog stranded ${(expected -- drained.toSet).take(5)} " +
+                        s"and invented ${(drained.toSet -- expected).take(5)}"
+                )
+            end for
+        end closeRace
+
+        def awaitEmptyRace(capacity: Int, access: Access)(using Frame, kyo.test.AssertScope) =
+            val producers = producerCount(access)
+            for
+                queue         <- Queue.initUnscoped[Int](capacity, access)
+                running       <- Latch.init(producers)
+                producerFiber <- Fiber.initUnscoped(
+                    Async.foreach(1 to producers, producers)(offerUntilClosed(queue, running, _))
+                )
+                drainFiber <- Fiber.initUnscoped(drainUntilClosed(queue))
+                closeFiber <- Fiber.initUnscoped(running.await.andThen(queue.closeAwaitEmpty))
+                accepted   <- producerFiber.get
+                reported   <- closeFiber.get
+                polled     <- drainFiber.get
+            yield
+                val acceptedIds = accepted.flatten.toSet
+                assert(reported, s"closeAwaitEmpty must report the queue drained for capacity=$capacity access=$access")
+                assert(
+                    polled.toSet == acceptedIds,
+                    s"for capacity=$capacity access=$access closeAwaitEmpty reported drained while " +
+                        s"${(acceptedIds -- polled.toSet).take(5)} was still in flight"
+                )
+            end for
+        end awaitEmptyRace
+
+        "a close never leaves an accepted element behind and never hands one out twice" - {
+            access.foreach { access =>
+                access.toString in {
+                    (for
+                        capacity <- Choice.eval(4096, Int.MaxValue)
+                        _        <- closeRace(capacity, access)
+                    yield ())
+                        .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                        .unit
+                }
+            }
+        }
+
+        // Small capacities on purpose: the backlog a drain has to clear before the queue looks empty stays near zero, which is what puts
+        // the "everything has been consumed" decision inside the window of an offer that is still in flight.
+        "closeAwaitEmpty never reports drained while an offer is in flight" - {
+            access.foreach { access =>
+                access.toString in {
+                    (for
+                        capacity <- Choice.eval(2, 64)
+                        _        <- awaitEmptyRace(capacity, access)
+                    yield ())
+                        .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                        .unit
+                }
+            }
+        }
+    }
+
+    "sliding while a consumer polls" - {
+
+        val repeats           = 25
+        val offersPerProducer = 2000
+
+        // A sliding queue makes room by removing its oldest element, and that removal runs on whichever thread offered. These scenarios
+        // start the queue full so every offer slides, and keep a consumer polling for the whole run: the offering thread and the consumer
+        // are then removing elements at the same time. No offer may hang, no element may reach the consumer twice, and sliding must stay
+        // sliding, meaning every offer is accepted.
+
+        def producerCount(access: Access) =
+            access match
+                case Access.MultiProducerMultiConsumer | Access.MultiProducerSingleConsumer   => 8
+                case Access.SingleProducerMultiConsumer | Access.SingleProducerSingleConsumer => 1
+
+        def slideUntilDone(queue: Queue.Unbounded[Int], running: Latch, producer: Int)(
+            using Frame
+        ): Chunk[Result[Closed, Boolean]] < Async =
+            running.release.andThen {
+                Loop.indexed(Chunk.empty[Result[Closed, Boolean]]) { (i, results) =>
+                    if i == offersPerProducer then Loop.done(results)
+                    else Abort.run(queue.offer(producer * 1000000 + i)).map(r => Loop.continue(results.append(r)))
+                }
+            }
+
+        // The producers set `finished` only after their last offer has returned, so reading it after a poll came back empty is what tells
+        // the consumer no element can still arrive. Anything offered in between is left in the queue, which the assertions allow: a
+        // sliding queue drops elements by design, so completeness is not one of its invariants.
+        def pollUntilDone(queue: Queue.Unbounded[Int], finished: AtomicBoolean)(using Frame): Chunk[Int] < Sync =
+            Loop(Chunk.empty[Int]) { polled =>
+                Abort.run(queue.poll).map { attempt =>
+                    finished.get.map { done =>
+                        attempt match
+                            case Result.Success(Maybe.Present(v)) => Loop.continue(polled.append(v))
+                            case Result.Success(_) if !done       => Loop.continue(polled)
+                            case _                                => Loop.done(polled)
+                    }
+                }
+            }
+
+        def slideRace(capacity: Int, access: Access)(using Frame, kyo.test.AssertScope) =
+            val producers = producerCount(access)
+            for
+                queue         <- Queue.Unbounded.initSlidingUnscoped[Int](capacity, access)
+                _             <- Kyo.foreachDiscard(1 to capacity)(i => Abort.run(queue.offer(i)))
+                finished      <- AtomicBoolean.init(false)
+                running       <- Latch.init(producers)
+                producerFiber <- Fiber.initUnscoped(
+                    Async.foreach(1 to producers, producers)(slideUntilDone(queue, running, _))
+                        .map(results => finished.set(true).andThen(results))
+                )
+                consumerFiber <- Fiber.initUnscoped(running.await.andThen(pollUntilDone(queue, finished)))
+                offered       <- producerFiber.get
+                polled        <- consumerFiber.get
+            yield
+                val offeredIds = (1 to producers).flatMap(p => (0 until offersPerProducer).map(i => p * 1000000 + i)).toSet
+                val duplicated = polled.diff(polled.distinct)
+                assert(
+                    offered.flatten.forall(_.contains(true)),
+                    s"for capacity=$capacity access=$access a sliding offer was refused: " +
+                        s"${offered.flatten.filterNot(_.contains(true)).take(5)}"
+                )
+                assert(
+                    duplicated.isEmpty,
+                    s"for capacity=$capacity access=$access the consumer received ${duplicated.size} element(s) twice: " +
+                        s"${duplicated.take(5)}"
+                )
+                assert(
+                    polled.toSet.subsetOf((1 to capacity).toSet ++ offeredIds),
+                    s"for capacity=$capacity access=$access the consumer received elements nobody offered: " +
+                        s"${(polled.toSet -- ((1 to capacity).toSet ++ offeredIds)).take(5)}"
+                )
+            end for
+        end slideRace
+
+        // How to read one of these per-access results. Only MultiProducerSingleConsumer turns this leaf red on a queue built without the
+        // access mapping; the two multi-consumer values are sound to begin with, so nothing there is expected to fail.
+        // SingleProducerSingleConsumer breaks the same contract and the mapping is what fixes it, but a green on that leg is not evidence
+        // the mapping is unnecessary. With one producer, the thread taking the illegal second poll is the only producer, so nothing
+        // refills the queue underneath the real consumer while that poll runs, and the interleavings left over are mostly harmless: both
+        // pollers return the same element and the sliding wrapper discards its copy. The damaging one needs the producer descheduled
+        // inside a window of a few instructions, so that its stale consumer-index write lands after the consumer has moved past that slot;
+        // the consumer is then left reading a slot nobody will fill, and the sliding loop alternates forever between an offer that reports
+        // full and a poll that reports empty. The single-consumer half of the mapping is pinned by the contract, not by a red run.
+        // A hang is caught by the suite's per-leaf cap; there is deliberately no in-test deadline racing the work.
+        "a sliding offer never hangs and never hands the consumer the same element twice" - {
+            access.foreach { access =>
+                access.toString in {
+                    (for
+                        capacity <- Choice.eval(4, 64)
+                        _        <- slideRace(capacity, access)
+                    yield ())
+                        .handle(Choice.run, _.unit, Loop.repeat(repeats))
+                        .unit
+                }
+            }
         }
     }
 
@@ -488,7 +783,9 @@ class QueueTest extends Test:
 
             def testCapacity(accessType: Access) =
                 List(3, 7, 15, 31).foreach { requestedCapacity =>
-                    s"$accessType with requested capacity $requestedCapacity" in pendingUntilFixed {
+                    s"$accessType with requested capacity $requestedCapacity".pendingUntilFixed(
+                        "queue capacity is rounded up to the next power of two, so a non-power-of-two requested capacity accepts offers beyond the requested count"
+                    ) in {
                         val queue          = Queue.Unsafe.init[Int](requestedCapacity, accessType)
                         val actualCapacity = queue.capacity
 
@@ -512,14 +809,14 @@ class QueueTest extends Test:
     end if
 
     "Kyo computations" - {
-        "Sync" in runNotNative {
+        "Sync" in {
             for
                 queue  <- Queue.init[Int < Sync](2)
                 _      <- queue.offer(Sync.defer(42))
                 result <- queue.poll.map(_.get)
             yield assert(result == 42)
         }
-        "AtomicBoolean" in runNotNative {
+        "AtomicBoolean" in {
             for
                 flag   <- AtomicBoolean.init(false)
                 queue  <- Queue.init[Int < Sync](2)
@@ -529,7 +826,7 @@ class QueueTest extends Test:
                 after  <- flag.get
             yield assert(!before && result == 42 && after)
         }
-        "Env" in runNotNative {
+        "Env" in {
             for
                 queue  <- Queue.init[Int < Env[Int]](2)
                 _      <- queue.offer(Env.use[Int](_ + 22))
@@ -539,7 +836,7 @@ class QueueTest extends Test:
     }
 
     "closeAwaitEmpty" - {
-        "allowed following ops when empty" in runNotNative {
+        "allowed following ops when empty" in {
             for
                 q  <- Queue.init[Int](2)
                 c1 <- q.closeAwaitEmpty
@@ -564,27 +861,29 @@ class QueueTest extends Test:
             )
         }
 
-        "allowed following ops when not empty" in runNotNative {
+        "allowed following ops when not empty" in {
             for
-                q  <- Queue.init[Int](2)
-                _  <- q.offer(1)
-                _  <- q.offer(1)
-                f1 <- Fiber.initUnscoped(q.closeAwaitEmpty)
-                v1 <- Abort.run(q.size)
-                v2 <- Abort.run(q.empty)
-                v3 <- Abort.run(q.full)
-                v4 <- Abort.run(q.offer(2))
-                v5 <- Abort.run(q.poll)
-                v6 <- Abort.run(q.peek)
-                v7 <- Abort.run(q.drain)
-                c2 <- Abort.run(q.closeAwaitEmpty)
-                c1 <- f1.get
+                gate <- Promise.init[Unit, Any]
+                q    <- Queue.init[Int](2)
+                _    <- q.offer(1)
+                _    <- q.offer(1)
+                f1   <- Fiber.initUnscoped(gate.get.andThen(q.closeAwaitEmpty))
+                v1   <- Abort.run(q.size)
+                v2   <- Abort.run(q.empty)
+                v3   <- Abort.run(q.full)
+                v4   <- Abort.run(q.offer(2))
+                v5   <- Abort.run(q.poll)
+                v6   <- Abort.run(q.peek)
+                v7   <- Abort.run(q.drain)
+                _    <- gate.completeUnit // let closeAwaitEmpty proceed
+                c1   <- f1.get            // wait for fiber's close to complete
+                c2   <- Abort.run(q.closeAwaitEmpty)
             yield assert(
                 c1 &&
                     v1.isSuccess &&
                     v2.isSuccess &&
                     v3.isSuccess &&
-                    v4.isFailure &&
+                    v4.isSuccess &&
                     v5.isSuccess &&
                     v6.isSuccess &&
                     v7.isSuccess &&
@@ -592,7 +891,7 @@ class QueueTest extends Test:
             )
         }
 
-        "returns true when queue is already empty" in runNotNative {
+        "returns true when queue is already empty" in {
             for
                 queue  <- Queue.init[Int](10)
                 result <- queue.closeAwaitEmpty
@@ -600,7 +899,7 @@ class QueueTest extends Test:
             yield assert(result && closed)
         }
 
-        "returns true when queue becomes empty after closing" in runNotNative {
+        "returns true when queue becomes empty after closing" in {
             for
                 queue   <- Queue.init[Int](10)
                 _       <- queue.offer(1)
@@ -614,7 +913,7 @@ class QueueTest extends Test:
             yield assert(!closed1 && result && closed2)
         }
 
-        "returns false if queue is already closed" in runNotNative {
+        "returns false if queue is already closed" in {
             for
                 queue  <- Queue.init[Int](10)
                 _      <- queue.close
@@ -623,14 +922,14 @@ class QueueTest extends Test:
         }
 
         "unbounded queue" - {
-            "returns true when queue is already empty" in runNotNative {
+            "returns true when queue is already empty" in {
                 for
                     queue  <- Queue.Unbounded.init[Int]()
                     result <- queue.closeAwaitEmpty
                 yield assert(result)
             }
 
-            "returns true when queue becomes empty after closing" in runNotNative {
+            "returns true when queue becomes empty after closing" in {
                 for
                     queue  <- Queue.Unbounded.init[Int]()
                     _      <- queue.add(1)
@@ -643,7 +942,7 @@ class QueueTest extends Test:
             }
         }
 
-        "concurrent polling and waiting" in runNotNative {
+        "concurrent polling and waiting" in {
             for
                 queue  <- Queue.init[Int](10)
                 _      <- Kyo.foreach(1 to 5)(i => queue.offer(i))
@@ -653,7 +952,7 @@ class QueueTest extends Test:
             yield assert(result)
         }
 
-        "sliding queue" in runNotNative {
+        "sliding queue" in {
             for
                 queue  <- Queue.Unbounded.initSliding[Int](2)
                 _      <- queue.add(1)
@@ -665,7 +964,7 @@ class QueueTest extends Test:
             yield assert(result)
         }
 
-        "dropping queue" in runNotNative {
+        "dropping queue" in {
             for
                 queue  <- Queue.Unbounded.initDropping[Int](2)
                 _      <- queue.add(1)
@@ -677,21 +976,233 @@ class QueueTest extends Test:
             yield assert(result)
         }
 
-        "zero capacity queue" in runNotNative {
+        "zero capacity queue" in {
             for
                 queue  <- Queue.init[Int](0)
                 result <- queue.closeAwaitEmpty
             yield assert(result)
         }
 
-        "race between closeAwaitEmpty and close" in runNotNative {
+        "race between closeAwaitEmpty and close" in {
+            (for
+                size                 <- Choice.eval(0, 1, 2, 10, 100)
+                queue                <- Queue.init[Int](size)
+                _                    <- Kyo.foreach(1 to (size min 5))(i => queue.offer(i))
+                latch                <- Latch.init(1)
+                closeAwaitEmptyFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(queue.closeAwaitEmpty)
+                )
+                closeFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(queue.close)
+                )
+                _        <- latch.release
+                _        <- Abort.run(queue.drain)
+                result1  <- closeAwaitEmptyFiber.get
+                result2  <- closeFiber.get
+                isClosed <- queue.closed
+            yield
+                assert(isClosed)
+                assert((result1 && result2.isEmpty) || (!result1 && result2.isDefined))
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .unit
+        }
+
+        "two producers calling closeAwaitEmpty" in {
             (for
                 size  <- Choice.eval(0, 1, 2, 10, 100)
                 queue <- Queue.init[Int](size)
-                _     <- Kyo.foreach(1 to (size min 5))(i => queue.offer(i))
                 latch <- Latch.init(1)
+
+                producerFiber1 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmpty)
+                    )
+                )
+                producerFiber2 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmpty)
+                    )
+                )
+
+                consumerFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.fill(100, 10)(assertEventually(queue.poll.map(_.isDefined)))
+                    )
+                )
+
+                _        <- latch.release
+                result1  <- producerFiber1.getResult
+                result2  <- producerFiber2.getResult
+                isClosed <- queue.closed
+                _        <- consumerFiber.getResult
+            yield
+                assert(isClosed)
+                assert(Seq(result1, result2).count(_.contains(true)) == 1)
+                assert(Seq(result1, result2).count(r => r.contains(false) || r.isFailure) == 1)
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .unit
+        }
+
+        "producer calling closeAwaitEmpty and another calling close" in {
+            (for
+                size  <- Choice.eval(0, 1, 2, 10, 100)
+                queue <- Queue.init[Int](size)
+                latch <- Latch.init(1)
+
+                producerFiber1 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmpty)
+                    )
+                )
+                producerFiber2 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.close)
+                    )
+                )
+
+                consumerFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.fill(100, 10)(assertEventually(queue.poll.map(_.isDefined)))
+                    )
+                )
+
+                _        <- latch.release
+                result1  <- producerFiber1.getResult
+                result2  <- producerFiber2.getResult
+                isClosed <- queue.closed
+                _        <- consumerFiber.getResult
+            yield
+                assert(isClosed)
+                assert(
+                    (result1.isFailure || result1.contains(false)) && !result2.contains(Absent) ||
+                        (result1.contains(true)) && result2.contains(Absent)
+                )
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .unit
+        }
+    }
+
+    "closeAwaitEmptyFiber" - {
+        def untilTrue[S](f: => Boolean < S)(using Frame): Boolean < S =
+            Loop(())(_ => f.map(b => if b then Loop.done(true) else Loop.continue(())))
+
+        "returns true when queue is already empty".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+                closed <- queue.closed
+                open   <- queue.open
+            yield assert(result && closed && !open)
+        }
+
+        "returns true when queue becomes empty after closing".notNative in {
+            for
+                queue   <- Queue.init[Int](10)
+                _       <- queue.offer(1)
+                _       <- queue.offer(2)
+                fiber   <- queue.closeAwaitEmptyFiber
+                closed1 <- queue.closed
+                open1   <- queue.open
+                _       <- queue.poll
+                _       <- queue.poll
+                result  <- fiber.get
+                closed2 <- queue.closed
+                open2   <- queue.open
+            yield assert(
+                !closed1 &&
+                    !open1 &&
+                    !open2 &&
+                    result &&
+                    closed2 &&
+                    !open2
+            )
+        }
+
+        "returns false if queue is already closed".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                _      <- queue.close
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+            yield assert(!result)
+        }
+
+        "unbounded queue" - {
+            "returns true when queue is already empty".notNative in {
+                for
+                    queue  <- Queue.Unbounded.init[Int]()
+                    result <- queue.closeAwaitEmptyFiber.map(_.get)
+                yield assert(result)
+            }
+
+            "returns true when queue becomes empty after closing".notNative in {
+                for
+                    queue  <- Queue.Unbounded.init[Int]()
+                    _      <- queue.add(1)
+                    _      <- queue.add(2)
+                    fiber  <- queue.closeAwaitEmptyFiber
+                    _      <- queue.poll
+                    _      <- queue.poll
+                    result <- fiber.get
+                yield assert(result)
+            }
+        }
+
+        "concurrent polling and waiting".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                _      <- Kyo.foreach(1 to 5)(i => queue.offer(i))
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- Async.foreach(1 to 5)(_ => queue.poll)
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "sliding queue".notNative in {
+            for
+                queue  <- Queue.Unbounded.initSliding[Int](2)
+                _      <- queue.add(1)
+                _      <- queue.add(2)
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- queue.poll
+                _      <- queue.poll
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "dropping queue".notNative in {
+            for
+                queue  <- Queue.Unbounded.initDropping[Int](2)
+                _      <- queue.add(1)
+                _      <- queue.add(2)
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- queue.poll
+                _      <- queue.poll
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "zero capacity queue".notNative in {
+            for
+                queue  <- Queue.init[Int](0)
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+            yield assert(result)
+        }
+
+        "race between closeAwaitEmpty and close".notNative in {
+            (for
+                size                 <- Choice.eval(0, 1, 2, 10, 100)
+                queue                <- Queue.init[Int](size)
+                _                    <- Kyo.foreach(1 to (size min 5))(i => queue.offer(i))
+                latch                <- Latch.init(1)
                 closeAwaitEmptyFiber <- Fiber.initUnscoped(
-                    latch.await.andThen(queue.closeAwaitEmpty)
+                    latch.await.andThen(queue.closeAwaitEmptyFiber.map(_.get))
                 )
                 closeFiber <- Fiber.initUnscoped(
                     latch.await.andThen(queue.close)
@@ -709,7 +1220,7 @@ class QueueTest extends Test:
                 .andThen(succeed)
         }
 
-        "two producers calling closeAwaitEmpty" in runNotNative {
+        "two producers calling closeAwaitEmpty".notNative in {
             (for
                 size  <- Choice.eval(0, 1, 2, 10, 100)
                 queue <- Queue.init[Int](size)
@@ -718,13 +1229,13 @@ class QueueTest extends Test:
                 producerFiber1 <- Fiber.initUnscoped(
                     latch.await.andThen(
                         Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmpty)
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
                     )
                 )
                 producerFiber2 <- Fiber.initUnscoped(
                     latch.await.andThen(
                         Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmpty)
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
                     )
                 )
 
@@ -748,7 +1259,7 @@ class QueueTest extends Test:
                 .andThen(succeed)
         }
 
-        "producer calling closeAwaitEmpty and another calling close" in runNotNative {
+        "producer calling closeAwaitEmpty and another calling close".notNative in {
             (for
                 size  <- Choice.eval(0, 1, 2, 10, 100)
                 queue <- Queue.init[Int](size)
@@ -757,7 +1268,7 @@ class QueueTest extends Test:
                 producerFiber1 <- Fiber.initUnscoped(
                     latch.await.andThen(
                         Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmpty)
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
                     )
                 )
                 producerFiber2 <- Fiber.initUnscoped(
@@ -790,213 +1301,18 @@ class QueueTest extends Test:
         }
     }
 
-    "closeAwaitEmptyFiber" - {
-        "returns true when queue is already empty" in runNotNative {
-            for
-                queue  <- Queue.init[Int](10)
-                result <- queue.closeAwaitEmptyFiber.map(_.get)
-                closed <- queue.closed
-                open   <- queue.open
-            yield assert(result && closed && !open)
-        }
-
-        "returns true when queue becomes empty after closing" in runNotNative {
-            for
-                queue   <- Queue.init[Int](10)
-                _       <- queue.offer(1)
-                _       <- queue.offer(2)
-                fiber   <- queue.closeAwaitEmptyFiber
-                closed1 <- queue.closed
-                open1   <- queue.open
-                _       <- queue.poll
-                _       <- queue.poll
-                result  <- fiber.get
-                closed2 <- queue.closed
-                open2   <- queue.open
-            yield assert(
-                !closed1 &&
-                    !open1 &&
-                    !open2 &&
-                    result &&
-                    closed2 &&
-                    !open2
-            )
-        }
-
-        "returns false if queue is already closed" in runNotNative {
-            for
-                queue  <- Queue.init[Int](10)
-                _      <- queue.close
-                result <- queue.closeAwaitEmptyFiber.map(_.get)
-            yield assert(!result)
-        }
-
-        "unbounded queue" - {
-            "returns true when queue is already empty" in runNotNative {
-                for
-                    queue  <- Queue.Unbounded.init[Int]()
-                    result <- queue.closeAwaitEmptyFiber.map(_.get)
-                yield assert(result)
-            }
-
-            "returns true when queue becomes empty after closing" in runNotNative {
-                for
-                    queue  <- Queue.Unbounded.init[Int]()
-                    _      <- queue.add(1)
-                    _      <- queue.add(2)
-                    fiber  <- queue.closeAwaitEmptyFiber
-                    _      <- queue.poll
-                    _      <- queue.poll
-                    result <- fiber.get
-                yield assert(result)
-            }
-        }
-
-        "concurrent polling and waiting" in runNotNative {
-            for
-                queue  <- Queue.init[Int](10)
-                _      <- Kyo.foreach(1 to 5)(i => queue.offer(i))
-                fiber  <- queue.closeAwaitEmptyFiber
-                _      <- Async.foreach(1 to 5)(_ => queue.poll)
-                result <- fiber.get
-            yield assert(result)
-        }
-
-        "sliding queue" in runNotNative {
-            for
-                queue  <- Queue.Unbounded.initSliding[Int](2)
-                _      <- queue.add(1)
-                _      <- queue.add(2)
-                fiber  <- queue.closeAwaitEmptyFiber
-                _      <- queue.poll
-                _      <- queue.poll
-                result <- fiber.get
-            yield assert(result)
-        }
-
-        "dropping queue" in runNotNative {
-            for
-                queue  <- Queue.Unbounded.initDropping[Int](2)
-                _      <- queue.add(1)
-                _      <- queue.add(2)
-                fiber  <- queue.closeAwaitEmptyFiber
-                _      <- queue.poll
-                _      <- queue.poll
-                result <- fiber.get
-            yield assert(result)
-        }
-
-        "zero capacity queue" in runNotNative {
-            for
-                queue  <- Queue.init[Int](0)
-                result <- queue.closeAwaitEmptyFiber.map(_.get)
-            yield assert(result)
-        }
-
-        "race between closeAwaitEmpty and close" in runNotNative {
-            (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                _     <- Kyo.foreach(1 to (size min 5))(i => queue.offer(i))
-                latch <- Latch.init(1)
-                closeAwaitEmptyFiber <- Fiber.initUnscoped(
-                    latch.await.andThen(queue.closeAwaitEmptyFiber.map(_.get))
-                )
-                closeFiber <- Fiber.initUnscoped(
-                    latch.await.andThen(queue.close)
-                )
-                _        <- latch.release
-                _        <- Abort.run(queue.drain)
-                result1  <- closeAwaitEmptyFiber.get
-                result2  <- closeFiber.get
-                isClosed <- queue.closed
-            yield
-                assert(isClosed)
-                assert((result1 && result2.isEmpty) || (!result1 && result2.isDefined))
-            )
-                .handle(Choice.run, _.unit, Loop.repeat(10))
-                .andThen(succeed)
-        }
-
-        "two producers calling closeAwaitEmpty" in runNotNative {
-            (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
-
-                producerFiber1 <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
-                    )
-                )
-                producerFiber2 <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
-                    )
-                )
-
-                consumerFiber <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.fill(100, 10)(untilTrue(queue.poll.map(_.isDefined)))
-                    )
-                )
-
-                _        <- latch.release
-                result1  <- producerFiber1.getResult
-                result2  <- producerFiber2.getResult
-                isClosed <- queue.closed
-                _        <- consumerFiber.getResult
-            yield
-                assert(isClosed)
-                assert(Seq(result1, result2).count(_.contains(true)) == 1)
-                assert(Seq(result1, result2).count(r => r.contains(false) || r.isFailure) == 1)
-            )
-                .handle(Choice.run, _.unit, Loop.repeat(10))
-                .andThen(succeed)
-        }
-
-        "producer calling closeAwaitEmpty and another calling close" in runNotNative {
-            (for
-                size  <- Choice.eval(0, 1, 2, 10, 100)
-                queue <- Queue.init[Int](size)
-                latch <- Latch.init(1)
-
-                producerFiber1 <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
-                    )
-                )
-                producerFiber2 <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
-                            .andThen(queue.close)
-                    )
-                )
-
-                consumerFiber <- Fiber.initUnscoped(
-                    latch.await.andThen(
-                        Async.fill(100, 10)(untilTrue(queue.poll.map(_.isDefined)))
-                    )
-                )
-
-                _        <- latch.release
-                result1  <- producerFiber1.getResult
-                result2  <- producerFiber2.getResult
-                isClosed <- queue.closed
-                _        <- consumerFiber.getResult
-            yield
-                assert(isClosed)
-                assert(
-                    (result1.isFailure || result1.contains(false)) && !result2.contains(Absent) ||
-                        (result1.contains(true)) && result2.contains(Absent)
-                )
-            )
-                .handle(Choice.run, _.unit, Loop.repeat(10))
-                .andThen(succeed)
-        }
+    // `q.closed` only reports true once the close's first instruction landed, so an interrupt requested after it
+    // reaches the drain rather than the commit.
+    "a close interrupted after it committed leaves the queue closed" in {
+        for
+            q      <- Queue.Unbounded.init[Int]()
+            _      <- Kyo.foreachDiscard(1 to 8)(q.add)
+            closer <- Fiber.initUnscoped(q.close)
+            _      <- assertEventually(q.closed)
+            _      <- closer.interrupt
+            _      <- closer.getResult
+            p      <- Abort.run[Closed](q.poll)
+        yield assert(p.isFailure, s"a poll after the committed close was served: $p")
     }
 
 end QueueTest

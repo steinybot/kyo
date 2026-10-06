@@ -1,10 +1,9 @@
 package kyo.scheduler
 
 import kyo.*
-import org.scalatest.compatible.Assertion
 import scala.annotation.tailrec
 
-class IOPromiseBlockingTest extends Test:
+class IOPromiseBlockingTest extends kyo.test.Test[Any]:
 
     def deadline(after: Duration = timeout) =
         import AllowUnsafe.embrace.danger
@@ -18,30 +17,28 @@ class IOPromiseBlockingTest extends Test:
             assert(result == Result.succeed(42))
         }
 
-        "timeout" in runNotJS {
+        "timeout".notJs in {
             val p      = new IOPromise[Nothing, Int]()
             val result = p.block(deadline(10.millis))
             assert(result.isFailure)
         }
 
-        "block with very short timeout" in runNotJS {
+        "block with very short timeout".notJs in {
             val p      = new IOPromise[Nothing, Int]()
             val result = p.block(deadline(10.millis))
             assert(result.isFailure)
         }
 
-        def threadInterruption[E, A](promise: IOPromise[E, A])(assertion: Result[E | Timeout, A] => Assertion) =
-            @volatile var threadStarted = false
+        def threadInterruption[E, A](promise: IOPromise[E, A])(assertion: Result[E | Timeout, A] => Unit) =
             val thread = new Thread:
                 override def run(): Unit =
-                    threadStarted = true
                     discard(promise.block(deadline(Duration.Infinity)))
                 end run
             thread.start()
 
-            // wait for parking
-            while !threadStarted do Thread.sleep(10)
-            Thread.sleep(10)
+            // block() registers its waiter before parking, so a positive waiter count means the thread reached the blocking
+            // call and the interrupt lands on a parked thread.
+            while promise.waiters() == 0 do Thread.sleep(1)
 
             thread.interrupt()
             thread.join(200)
@@ -56,7 +53,7 @@ class IOPromiseBlockingTest extends Test:
                     assert(result.isPanic)
                 }
             }
-            "linked" in runNotJS {
+            "linked".notJs in {
                 val p = new IOPromise[Nothing, Int]()
                 p.becomeDiscard(new IOPromise[Nothing, Int]())
                 threadInterruption(p) { result =>

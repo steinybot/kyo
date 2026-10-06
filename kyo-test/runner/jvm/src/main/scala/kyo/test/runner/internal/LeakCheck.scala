@@ -1,0 +1,546 @@
+package kyo.test.runner.internal
+
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.util.concurrent.locks.LockSupport
+import kyo.Chunk
+import kyo.Maybe
+import kyo.discard
+import kyo.scheduler.Scheduler
+import scala.jdk.CollectionConverters.*
+
+/** JVM end-of-run leak probes, read at the sbt `done()` boundary after every suite in the fork has finished.
+  *
+  * Three process-global resources are sampled, never per-leaf: the open file descriptors, the kyo scheduler, and the JVM's non-daemon
+  * threads. At `done()` the fork is quiescent (all leaves joined), so a descriptor still open, a fiber still runnable, or a non-daemon thread
+  * still alive is one a leaf failed to release. The probes only read existing surfaces (`/proc/self/fd`, `Scheduler.get`,
+  * `Thread.getAllStackTraces`); nothing in the scheduler or core changes.
+  *
+  * Detectable: descriptor leaks (a socket, pipe, or file open at `done()` that was not open at construction and is not a classpath jar or JVM
+  * internal; identified precisely by enumerating and reading the `/proc/self/fd` symlinks, so there is no count tolerance); runnable/spinning
+  * fiber leaks (a fiber pegging or repeatedly rescheduling onto a worker, the class the async-merge spinning-producer bug produced); and
+  * non-daemon thread leaks (a raw `Thread` or un-shutdown executor that keeps the JVM from exiting cleanly; the scheduler's own threads are
+  * daemons, so they never trip this). Not detectable here: a fiber parked on a still-reachable promise/channel is off-scheduler and invisible
+  * to scheduler status; catching that would need a core registry. The descriptor probe is Linux-only (`/proc/self/fd`); a no-op elsewhere.
+  */
+private[runner] object LeakCheck:
+
+    /** Built-in allowlist pattern applied by [[detect]] in addition to each suite's `RunConfig.leakCheckAllowlist`, for process-lifetime infra
+      * that legitimately outlives every test in the fork.
+      *
+      * `processSharedTransport` matches the I/O carriers of kyo-net's one process-lifetime transport, `kyo.net.NetPlatform.transport`, which
+      * every client and server in the process shares and which is never closed by design, so its idle carriers sit armed at every net- or
+      * http-using module's end-of-run check. Each driver routes a cycle through a `processSharedTransport*` frame only when that transport is
+      * the one being built (see `kyo.net.internal.ProcessSharedTransport`); an owned transport a caller is expected to close keeps its plain
+      * cycle frame, so a genuinely leaked owned transport is still reported.
+      *
+      * There was formerly a second entry, the bare driver name `NioIoDriver`, from when that driver ran its selector loop outside this marker
+      * scheme. It matched on driver identity rather than on the transport's lifetime, so it excused ANY carrier of that driver, including one
+      * belonging to an owned transport a test failed to close: precisely the leak this check exists to find. It is removed now that the driver
+      * marks its process-lifetime cycles like the others, which is what makes the narrow pattern sufficient.
+      */
+    val defaultAllowlist: Chunk[String] = Chunk("processSharedTransport")
+
+    /** The set of open file descriptors, each as its `/proc/self/fd` symlink target (`socket:[inode]`, `pipe:[inode]`, a file path, a `.jar`,
+      * ...). `Absent` on a platform without `/proc/self/fd` (macOS, Windows), where the descriptor probe is a no-op. The descriptor that the
+      * enumeration itself opens (the directory stream) targets `/proc/.../fd` and is filtered by [[benignFd]], so it never reads as a leak.
+      */
+    def openFdTargets(): Maybe[Set[String]] =
+        val dir = Paths.get("/proc/self/fd")
+        if !Files.isDirectory(dir) then Maybe.empty
+        else
+            val targets = Set.newBuilder[String]
+            val stream  = Files.newDirectoryStream(dir)
+            try
+                stream.forEach { entry =>
+                    val target =
+                        try Files.readSymbolicLink(entry).toString
+                        catch case _: Throwable => "<gone>" // the fd closed between listing and readlink; ignore
+                    targets += target
+                }
+            finally stream.close()
+            end try
+            Maybe(targets.result())
+        end if
+    end openFdTargets
+
+    /** True for a descriptor target that is legitimately open for the JVM's lifetime regardless of any test: a classpath jar, a native
+      * library, a device or proc/sys pseudo-file, a JVM-internal anonymous inode (epoll, eventfd), or the runtime image. These are excluded
+      * from the descriptor diff so that lazy classloading (which opens jar handles as suites load classes) is never reported as a leak.
+      */
+    def benignFd(target: String): Boolean =
+        target.endsWith(".jar") || target.contains(".so") ||
+            target.startsWith("/dev/") || target.startsWith("/proc/") || target.startsWith("/sys/") ||
+            target.startsWith("anon_inode:") || target.startsWith("/modules/") || target == "<gone>"
+
+    /** Average scheduler load across active workers: queued plus executing tasks per worker. `0.0` when fully idle. */
+    def loadAvg(): Double = Scheduler.get.loadAvg()
+
+    /** The allocated workers holding work, the regulator's window included or not: what the idle probe reads, since a worker past the
+      * window keeps running a task that never yields and [[loadAvg]] no longer counts it.
+      */
+    def busyWorkers(): Int = Scheduler.get.busyWorkers()
+
+    /** Snapshot of currently-live non-daemon threads, by identity. Captured as a baseline at runner construction (so the JVM's own infra
+      * threads ; `main`, the sbt ForkMain reader ; are excluded), then diffed at `done()`.
+      */
+    def liveNonDaemonThreads(): Set[Thread] =
+        Thread.getAllStackTraces.keySet.asScala.iterator.filter(t => t.isAlive && !t.isDaemon).toSet
+
+    // sbt runs each suite task on a thread from its own ForkMain executor (`pool-N-thread-M`), which is non-daemon and stays
+    // parked between tasks; at `done()` those idle harness threads would look identical to a leaked test thread. They are
+    // identified structurally rather than by name: every `execute()` runs ON one of them, so registering the carrier thread at
+    // the top of each suite execution records exactly sbt's pool, with no pattern that a real test thread pool could collide
+    // with. Process-global because there is one fork JVM; the caller only registers when leak detection is active (forked), so
+    // it never accumulates in the long-lived main sbt JVM.
+    private val carrierThreads: java.util.Set[Thread] =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap[Thread, java.lang.Boolean]())
+
+    /** Records the calling thread as sbt harness infrastructure, excluding it from [[leakedNonDaemonThreads]]. Called at the top of each
+      * suite execution, where the calling thread is the sbt ForkMain pool thread carrying that task.
+      */
+    def registerCarrierThread(): Unit =
+        carrierThreads.add(Thread.currentThread): Unit
+
+    /** Live non-daemon threads not present in `baseline`, not a registered sbt carrier thread, not the calling thread, and not allowlisted:
+      * threads a test started and left running, which a raw `Thread` or an un-shutdown executor produces and which block a clean JVM exit. A
+      * thread is allowlisted if any pattern appears in its name or any of its stack frames. Each entry is the thread name plus its top frame.
+      */
+    def leakedNonDaemonThreads(baseline: Set[Thread], allowlist: Chunk[String]): Chunk[String] =
+        val self = Thread.currentThread
+        val out  = Chunk.newBuilder[String]
+        Thread.getAllStackTraces.asScala.foreach { case (t, st) =>
+            if t.isAlive && !t.isDaemon && (t ne self) && !baseline.contains(t) && !carrierThreads.contains(t) then
+                val allowlisted = allowlist.exists(p => t.getName.contains(p) || st.exists(_.toString.contains(p)))
+                if !allowlisted then
+                    // Report the thread's state and full stack, not just the top frame: a leaked non-daemon thread blocks a clean
+                    // JVM exit, and the stack (what it is parked on or looping in) is what a CI reader needs to trace it back to the
+                    // test that started it. The top frame alone is usually an opaque park/wait.
+                    val stack = if st.nonEmpty then st.iterator.take(30).map(f => s"        at $f").mkString("\n") else "        <no frame>"
+                    out += s"${t.getName} (${t.getState})\n$stack"
+                end if
+        }
+        out.result()
+    end leakedNonDaemonThreads
+
+    /** A stack frame of a worker that currently holds work (`load > 0`), if any: identifies where a still-running fiber is executing. Reads
+      * the full status (captures worker stack traces), so call it only when reporting, not in a tight poll.
+      */
+    def busyWorkerFrame(): Maybe[String] =
+        val workers            = Scheduler.get.status().workers
+        var i                  = 0
+        var res: Maybe[String] = Maybe.empty
+        while i < workers.length && res.isEmpty do
+            val w = workers(i)
+            if (w ne null) && w.load > 0 && (w.frame ne null) then res = Maybe(w.frame)
+            i += 1
+        end while
+        res
+    end busyWorkerFrame
+
+    /** The JVM stack of the thread named `name`, found via `Thread.getAllStackTraces`, joined into one string.
+      * Keyed by a `BusyWorker.mount` name so the leak dump can show the stack of every busy worker.
+      * `Absent` when no live thread has that name.
+      */
+    def stackOfThread(name: String): Maybe[String] =
+        var res: Maybe[String] = Maybe.empty
+        Thread.getAllStackTraces.asScala.foreach { case (t, st) =>
+            if res.isEmpty && t.getName == name then res = Maybe(st.mkString("\n"))
+        }
+        res
+    end stackOfThread
+
+    /** A thread dump of every thread that is actually doing something at probe time, for an actionable fiber-leak report: each thread whose
+      * state is `RUNNABLE` or whose stack runs kyo code, with its name, state, and stack. Unlike the per-busy-worker dump (which is keyed to
+      * the busy scheduler workers' mount threads via [[stackOfThread]]) this also captures NON-worker threads, e.g. a caller stuck mid-`offer`
+      * that holds a queue's race-repair counter while a worker spins in `close()` waiting for it. Idle pool/parked threads with no kyo frame are
+      * filtered out to keep the report focused. The leak check's own thread is excluded.
+      */
+    def runningThreadsDump(): String =
+        val self = Thread.currentThread()
+        val sb   = new StringBuilder
+        Thread.getAllStackTraces.asScala.toList
+            .filter { (t, st) =>
+                (t ne self) && st.nonEmpty &&
+                ((t.getState eq Thread.State.RUNNABLE) || st.exists(_.getClassName.startsWith("kyo.")))
+            }
+            .sortBy((t, _) => t.getName)
+            .foreach { (t, st) =>
+                sb.append(s"\n  \"${t.getName}\" ${t.getState}\n")
+                st.iterator.take(30).foreach(f => sb.append(s"    at $f\n"))
+            }
+        sb.toString
+    end runningThreadsDump
+
+    /** Outcome of [[awaitSchedulerIdle]]. `Accounted` means work is still running but every worker holding it is allowlisted, which is
+      * quiescent for this check's purposes and must not be conflated with `Idle` in the report.
+      */
+    enum IdleResult derives CanEqual:
+        case Idle
+        case Accounted(loadAvg: Double)
+        case Busy(loadAvg: Double, frame: Maybe[String])
+    end IdleResult
+
+    /** True when at least one worker holds work and EVERY such worker is matched by `allowlist`, against either its kyo trace or its JVM
+      * stack.
+      *
+      * `forall`, not `exists`: one allowlisted carrier must not excuse a second, unrelated busy worker. An empty busy set is `Idle`, never
+      * `Accounted`, so the caller keeps those two outcomes distinct.
+      */
+    def busyWorkAllAccounted(allowlist: Chunk[String]): Boolean =
+        val busy = Scheduler.get.busyFiberTraces()
+        busy.nonEmpty && busy.forall { w =>
+            val text = w.fiberTrace + "\n" + stackOfThread(w.mount).getOrElse("")
+            allowlist.exists(text.contains)
+        }
+    end busyWorkAllAccounted
+
+    /** Polls until the scheduler holds no UNACCOUNTED work continuously for `settleNanos`, or until `budgetNanos` elapses.
+      *
+      * Quiescence is no allocated worker holding work OR every busy worker allowlisted, because a process-lifetime carrier (kyo-net's shared transport, which
+      * marks itself `processSharedTransport`) never lets load reach zero. Waiting on load alone made every fork holding one spend the whole
+      * budget and then be excused by the allowlist anyway: the verdict was right, the wait was pure cost. [[awaitFdDrain]] already applies the
+      * allowlist before it waits, for the same reason.
+      *
+      * The settle window still lets transient tail activity (a reporter fiber, a finalizer) drain before a verdict, so only work that persists
+      * past the budget is reported as `Busy`. Blocking by design: called at the sbt `done()` boundary, outside any fiber, so parking the caller
+      * is correct here rather than an `Async` suspension.
+      *
+      * Canonical form: `loadNow` and `allAccounted` are injected so the loop is testable without a live scheduler, as `awaitFdDrain` takes its
+      * probe.
+      */
+    def awaitSchedulerIdle(
+        budgetNanos: Long,
+        settleNanos: Long,
+        pollNanos: Long,
+        loadNow: () => Double,
+        allAccounted: () => Boolean,
+        now: () => Long = () => System.nanoTime(),
+        park: Long => Unit = LockSupport.parkNanos(_)
+    ): IdleResult =
+        // now/park are the loop's only real-time dependencies, defaulting to the monotonic clock and a real park; a test overrides them with a
+        // virtual clock (park advances the clock instead of sleeping) to drive the settle/budget logic deterministically.
+        val deadline                  = now() + budgetNanos
+        var quietSince: Long          = -1L
+        var lastAccountedAt: Long     = 0L
+        var accountedChecked          = false
+        var accounted                 = false
+        var result: Maybe[IdleResult] = Maybe.empty
+        while result.isEmpty && now() < deadline do
+            val sampledAt = now()
+            val idle      = loadNow() == 0.0
+            // busyFiberTraces renders a kyo trace per busy worker and is documented as a leak probe rather than a monitoring surface, so the
+            // accounted branch is re-evaluated at most once per settle window instead of on every poll.
+            if !idle && (!accountedChecked || sampledAt - lastAccountedAt >= settleNanos) then
+                accounted = allAccounted()
+                lastAccountedAt = sampledAt
+                accountedChecked = true
+            end if
+            if idle || accounted then
+                if quietSince < 0 then quietSince = sampledAt
+                else if sampledAt - quietSince >= settleNanos then
+                    result = Maybe(if idle then IdleResult.Idle else IdleResult.Accounted(loadNow()))
+            else quietSince = -1L
+            end if
+            if result.isEmpty then park(pollNanos)
+        end while
+        result.getOrElse {
+            if loadNow() == 0.0 then IdleResult.Idle
+            else if allAccounted() then IdleResult.Accounted(loadNow())
+            else IdleResult.Busy(loadNow(), busyWorkerFrame())
+        }
+    end awaitSchedulerIdle
+
+    /** Production binding of [[awaitSchedulerIdle]]: samples the live scheduler and treats `allowlist` as the accounted set. */
+    def awaitSchedulerIdle(budgetNanos: Long, settleNanos: Long, pollNanos: Long, allowlist: Chunk[String]): IdleResult =
+        awaitSchedulerIdle(budgetNanos, settleNanos, pollNanos, () => busyWorkers().toDouble, () => busyWorkAllAccounted(allowlist))
+
+    /** The busy workers behind a `Busy` verdict, re-sampled until at least one is seen or `budgetNanos` elapses.
+      *
+      * The verdict comes from the load, which counts queued and running tasks; the dump reads each worker's current task, and a preempted
+      * task is off its worker between two slices. One sample can land in that gap on every worker (a starved host makes the gaps long)
+      * and render an empty dump for a real finding. A leak keeps a worker busy, so it is seen within a poll or two; an empty result after
+      * the budget means the load went away, and the finding still carries the frame the probe saw.
+      */
+    private def busyWorkersWithin(budgetNanos: Long, pollNanos: Long): Seq[kyo.scheduler.top.BusyWorker] =
+        val deadline = System.nanoTime() + budgetNanos
+        var busy     = Scheduler.get.busyFiberTraces()
+        while busy.isEmpty && System.nanoTime() < deadline do
+            LockSupport.parkNanos(pollNanos)
+            busy = Scheduler.get.busyFiberTraces()
+        busy
+    end busyWorkersWithin
+
+    /** Re-samples the leaked-descriptor set until it drains to empty or `budgetNanos` elapses, parking `settleNanos` between samples, and
+      * returns the descriptors that persisted through EVERY sample. A descriptor still mid-teardown at `done()` (an async deferred close
+      * discharged on the reap thread, or a FIN cascade) drains within the budget and is dropped; a genuinely leaked descriptor never closes
+      * and so survives the whole budget and is returned. The intersection is monotonic (the set only shrinks), so this can only drop a
+      * descriptor that actually closed during the window, never a real leak. An empty first sample returns immediately, so a clean run pays
+      * nothing.
+      */
+    def awaitFdDrain(leaksNow: () => Chunk[String], budgetNanos: Long, settleNanos: Long): Chunk[String] =
+        val deadline = System.nanoTime() + budgetNanos
+        var current  = leaksNow()
+        while current.nonEmpty && System.nanoTime() < deadline do
+            LockSupport.parkNanos(settleNanos)
+            val sample = leaksNow()
+            current = current.filter(sample.contains)
+        end while
+        current
+    end awaitFdDrain
+
+    /** True when running inside an sbt forked test JVM (`sbt.ForkMain`), the only JVM where end-of-run leak detection is both sound (the fork
+      * holds only this run's resources) and safe to fail by exit (failing the main sbt JVM would take sbt down). Two agreeing signals: the
+      * `sun.java.command` property and an `sbt.ForkMain` frame on the `main` thread. Defaults to `false` on any ambiguity, because the verdict
+      * gates an irreversible JVM-failing action.
+      */
+    def isForked: Boolean =
+        Option(System.getProperty("sun.java.command")).exists(_.startsWith("sbt.ForkMain")) ||
+            Thread.getAllStackTraces.asScala.exists { (t, st) =>
+                (t.getName == "main") && st.exists(_.getClassName.startsWith("sbt.ForkMain"))
+            }
+
+    /** Descriptor targets open at `done()` that were not open at construction and are neither benign ([[benignFd]]) nor allowlisted: a socket,
+      * pipe, or file a leaf opened and never closed. Diffing against the baseline excludes the fork's own startup descriptors, like the
+      * `sbt.ForkMain` socket back to the main JVM, which is open the whole run.
+      */
+    def fdLeaks(baseline: Set[String], current: Set[String], allowlist: Chunk[String]): Chunk[String] =
+        val out = Chunk.newBuilder[String]
+        current.foreach { target =>
+            if !baseline.contains(target) && !benignFd(target) && !allowlist.exists(target.contains) then
+                out += target
+        }
+        out.result()
+    end fdLeaks
+
+    /** Restricts descriptor leaks to the enabled descriptor categories: a socket target (`socket:[inode]`) is kept only when `checkSockets` is
+      * on, every other target (files, directories, pipes) only when `checkFileDescriptors` is on. Lets a suite exempt the socket category while
+      * still detecting file-descriptor leaks (e.g. an unclosed `Files.list` directory stream).
+      */
+    def fdLeaksForCategories(leaks: Chunk[String], checkSockets: Boolean, checkFileDescriptors: Boolean): Chunk[String] =
+        leaks.filter(target => if target.startsWith("socket:[") then checkSockets else checkFileDescriptors)
+
+    private val tcpStates = Map(
+        "01" -> "ESTABLISHED",
+        "02" -> "SYN_SENT",
+        "03" -> "SYN_RECV",
+        "04" -> "FIN_WAIT1",
+        "05" -> "FIN_WAIT2",
+        "06" -> "TIME_WAIT",
+        "07" -> "CLOSE",
+        "08" -> "CLOSE_WAIT",
+        "09" -> "LAST_ACK",
+        "0A" -> "LISTEN",
+        "0B" -> "CLOSING"
+    )
+
+    /** The description of the socket `inode` from the lines of one `/proc/net/tcp{,6}` table, or `Absent` when the table has no row for it.
+      *
+      * A connection also carries its send and receive queue sizes and its peer's row, found by the swapped address pair. Together they tell
+      * apart the ways a connection outlives a run while still ESTABLISHED: bytes stranded in this side's receive queue (a read that stopped),
+      * a peer that is an orphan (inode 0, no fd anywhere) still holding its tail and FIN, or a peer that is live elsewhere. A peer with no row
+      * is off this host or already gone. A listener has no peer to look up.
+      */
+    def describeTcpRow(lines: Seq[String], inode: String): Maybe[String] =
+        val rows = lines.map(_.trim.split("\\s+"))
+        // columns: sl local rem st tx_queue:rx_queue ... inode (index 9); the header row has no numeric inode at f(9)
+        def state(f: Array[String]): String  = tcpStates.getOrElse(f(3).toUpperCase, f(3))
+        def queues(f: Array[String]): String =
+            val q = f(4).split(":")
+            s"tx:${java.lang.Long.parseLong(q(0), 16)} rx:${java.lang.Long.parseLong(q(1), 16)}"
+        rows.find(f => f.length > 9 && f(9) == inode) match
+            case None    => Maybe.empty
+            case Some(f) =>
+                val lp   = Integer.parseInt(f(1).split(":")(1), 16)
+                val rp   = Integer.parseInt(f(2).split(":")(1), 16)
+                val peer =
+                    if rp == 0 then ""
+                    else
+                        rows.find(p => p.length > 9 && p(1) == f(2) && p(2) == f(1)) match
+                            case None    => "; peer: no row"
+                            case Some(p) =>
+                                val holder = if p(9) == "0" then "orphan (no fd)" else s"inode:${p(9)}"
+                                s"; peer ${state(p)} ${queues(p)} $holder"
+                Maybe(s" [${state(f)} local:$lp remote:$rp ${queues(f)}$peer]")
+        end match
+    end describeTcpRow
+
+    /** For a `socket:[inode]` target, resolves the socket to an actionable description: a TCP connection's state, local/remote ports, queue
+      * sizes and peer from `/proc/net/tcp{,6}` ([[describeTcpRow]]; e.g. `CLOSE_WAIT` means the peer closed and this side held the connection
+      * open, and the ports say which side it is), or a Unix-domain socket's path from `/proc/net/unix`. A socket with no row in any of those
+      * tables is a TCP fd already in kernel state CLOSED (protocol teardown done, fd not yet `close(2)`'d) or a closed unnamed UDS: the suffix
+      * says so explicitly rather than leaving the inode ambiguous. Returns "" for a non-socket target.
+      */
+    def describeSocket(target: String): String =
+        if !target.startsWith("socket:[") then ""
+        else
+            val inode                                = target.stripPrefix("socket:[").stripSuffix("]")
+            def scanTcp(path: String): Maybe[String] =
+                try describeTcpRow(java.nio.file.Files.readAllLines(Paths.get(path)).asScala.toSeq, inode)
+                catch case _: Throwable => Maybe.empty
+            def scanUnix(): Maybe[String] =
+                try
+                    val lines              = java.nio.file.Files.readAllLines(Paths.get("/proc/net/unix")).asScala
+                    var res: Maybe[String] = Maybe.empty
+                    lines.foreach { line =>
+                        val f = line.trim.split("\\s+")
+                        // columns: Num RefCount Protocol Flags Type St Inode [Path]; inode at index 6, optional path at index 7
+                        if res.isEmpty && f.length > 6 && f(6) == inode then
+                            val path = if f.length > 7 then f(7) else "<unnamed>"
+                            res = Maybe(s" [unix $path]")
+                        end if
+                    }
+                    res
+                catch case _: Throwable => Maybe.empty
+            scanTcp("/proc/net/tcp").orElse(scanTcp("/proc/net/tcp6")).orElse(scanUnix())
+                // Say what the absence proves, which is only that no row matched. Three different sockets produce it: one that was
+                // connected and has since closed, one that was created and never dialed, and a closed Unix-domain socket. They have
+                // opposite diagnoses, since the first points at a close path that ran too late and the second at a connect that never
+                // happened, so a label naming just one of them sends the reader the wrong way. A socket still mid-handshake does NOT
+                // land here: SYN_SENT carries a row.
+                .getOrElse(
+                    " [no /proc/net row: closed after use, never dialed, or a closed Unix-domain socket; these are indistinguishable here]"
+                )
+    end describeSocket
+
+    /** Leak-debug attribution: descriptor target -> the leaf path that first left it open. Populated only in leak-debug mode (see
+      * [[LeakDebug]]), where leaves run serially and the runner's per-leaf probe records each leaf's surviving descriptors here; joined into the
+      * leak report by [[originOf]]. Empty (and never read) in a normal parallel run.
+      */
+    private val fdOrigins = new java.util.concurrent.ConcurrentHashMap[String, String]()
+
+    /** Record, against `leafPath`, every descriptor open after the leaf body that was not open before it (excluding benign descriptors). First
+      * writer wins, so the leaf that introduced a descriptor owns it. Called by the runner's per-leaf probe in leak-debug mode only.
+      */
+    def recordLeafOrigins(leafPath: String, before: Set[String], after: Set[String]): Unit =
+        after.foreach { target =>
+            if !before.contains(target) && !benignFd(target) then discard(fdOrigins.putIfAbsent(target, leafPath))
+        }
+    end recordLeafOrigins
+
+    /** The leak-debug attribution suffix for a leaked target: ` (opened by test: <leaf>)` when leak-debug mode recorded an origin, else "".
+      * A normal (non-debug) run records nothing, so this is always "" there and the report is unchanged.
+      */
+    def originOf(target: String): String =
+        fdOrigins.get(target) match
+            case null => ""
+            case leaf => s" (opened by test: $leaf)"
+    end originOf
+
+    /** Process-global resource snapshot taken once at runner construction, before any suite runs, and diffed at `done()`. Captures the open
+      * descriptor targets and the set of live non-daemon threads so the JVM's own startup infrastructure (the `main` thread, the ForkMain
+      * reader and socket) is excluded from the diff.
+      */
+    final case class Baseline(fds: Maybe[Set[String]], threads: Set[Thread])
+
+    /** Captures a [[Baseline]] of the current open descriptors and live non-daemon threads. */
+    def baseline(): Baseline = Baseline(openFdTargets(), liveNonDaemonThreads())
+
+    /** Runs the enabled end-of-run probes against `baseline`, excusing any finding matched by `allowlist`, and returns a leak report or `Absent`
+      * when the fork is clean. The four `check*` flags gate the categories independently (a suite can exempt just sockets, say, and still detect
+      * file-descriptor, thread, and fiber leaks); the scheduler settle still runs whenever any category is enabled.
+      *
+      * Order: the scheduler/fiber probe first (it owns the settle window), then a `System.gc()` plus settle so Cleaner-closed abandoned
+      * channels and finished threads drop out before the descriptor and thread diffs (a genuine leak stays referenced and survives the gc, so
+      * this trims false positives without hiding real leaks). The fiber probe builds a per-busy-worker dump (each worker's rendered kyo trace,
+      * when its task carries one, plus its JVM thread stack) and matches the allowlist against either the kyo trace or the JVM stack of each busy
+      * worker. Every busy worker must match before the finding is excused, so one expected event loop cannot hide another worker's leak.
+      * The descriptor probe enumerates `/proc/self/fd` and reports the exact leaked targets with no count tolerance.
+      */
+    def detect(
+        baseline: Baseline,
+        allowlist: Chunk[String],
+        checkFibers: Boolean,
+        checkThreads: Boolean,
+        checkFileDescriptors: Boolean,
+        checkSockets: Boolean,
+        idleBudgetNanos: Long,
+        settleNanos: Long,
+        pollNanos: Long,
+        fdDrainBudgetNanos: Long
+    ): Maybe[String] =
+        val findings           = Chunk.newBuilder[String]
+        val effectiveAllowlist = defaultAllowlist ++ allowlist
+
+        // Always settle on scheduler quiescence first: it lets in-flight fibers finish and release their resources before the thread and
+        // descriptor diffs run, which trims false positives for every category. Record a fiber finding only when that category is enabled.
+        awaitSchedulerIdle(idleBudgetNanos, settleNanos, pollNanos, effectiveAllowlist) match
+            case IdleResult.Idle | IdleResult.Accounted(_) => ()
+            case IdleResult.Busy(la, frame)                =>
+                if checkFibers then
+                    val busy      = busyWorkersWithin(idleBudgetNanos, pollNanos)
+                    val perWorker =
+                        busy.map { w =>
+                            val header     = s"  worker thread ${w.mount}:"
+                            val kyoSection = if w.fiberTrace.nonEmpty then s"\n    kyo trace:\n${w.fiberTrace}" else ""
+                            val stack      = stackOfThread(w.mount).map { st =>
+                                st.linesIterator.take(30).map(f => s"        at $f").mkString("\n")
+                            }.getOrElse("        <stack unavailable>")
+                            s"$header$kyoSection\n    thread stack:\n$stack"
+                        }.mkString("\n")
+                    val allowlisted = busy.nonEmpty && busy.forall { w =>
+                        val matchText = w.fiberTrace + "\n" + stackOfThread(w.mount).getOrElse("")
+                        effectiveAllowlist.exists(matchText.contains)
+                    }
+                    if !allowlisted then
+                        findings +=
+                            s"fiber leak: scheduler still busy (busy workers=${la.toInt}) after settle; running at ${frame.getOrElse("<unknown frame>")}" +
+                                s"\n  per-busy-worker fiber dump:\n$perWorker" +
+                                s"\n  all running threads (worker and non-worker) at probe time:${runningThreadsDump()}"
+                    end if
+        end match
+
+        System.gc()
+        LockSupport.parkNanos(settleNanos)
+
+        if checkThreads then
+            val threadLeaks = leakedNonDaemonThreads(baseline.threads, effectiveAllowlist)
+            if threadLeaks.nonEmpty then
+                findings += s"non-daemon thread leak (${threadLeaks.size}): ${threadLeaks.mkString("; ")}"
+        end if
+
+        if checkFileDescriptors || checkSockets then
+            baseline.fds match
+                case Maybe.Present(before) =>
+                    // A descriptor may still be mid-close at done(): a client connection closes asynchronously while it processes the
+                    // server's FIN (EOF -> pump teardown -> channel close), and an io_uring deferred close runs its close(2) on the reap
+                    // thread a few cycles after done() observed scheduler quiescence (the reap loop is a dedicated thread, not a
+                    // scheduler carrier, so awaitSchedulerIdle cannot see it). Re-sample until the leaked set drains to empty or the drain
+                    // budget elapses, so a still-completing teardown is not mistaken for a leak; a genuinely leaked descriptor never
+                    // closes and so survives the whole budget. (Safe: awaitFdDrain only ever drops descriptors that closed during the
+                    // window, never a real leak.)
+                    def leaksNow(): Chunk[String] =
+                        val raw = openFdTargets().map(fdLeaks(before, _, effectiveAllowlist)).getOrElse(Chunk.empty)
+                        fdLeaksForCategories(raw, checkSockets, checkFileDescriptors)
+                    val persistent = awaitFdDrain(() => leaksNow(), fdDrainBudgetNanos, settleNanos)
+                    if persistent.nonEmpty then
+                        val described = persistent.map(t => t + describeSocket(t) + originOf(t))
+                        // Attach the live driver diagnostics: the io_uring/poller dump names each driver's pendingCloses / closeAfterDrain
+                        // / inFlight, so a survivor is self-classifying (a stranded deferred close names the fd; an abandoned connection
+                        // shows a pending recv with no close requested) rather than an opaque inode.
+                        findings += s"file-descriptor leak (${persistent.size}): ${described.mkString("; ")}" +
+                            s"\n  driver diagnostics at probe time:\n${kyo.internal.Diagnostics.dumpAll()}"
+                    end if
+                case Maybe.Absent => () // /proc/self/fd unavailable: descriptor probe is a no-op on this platform.
+            end match
+        end if
+
+        val all = findings.result()
+        if all.isEmpty then Maybe.empty
+        else Maybe(all.mkString("\n  - ", "\n  - ", ""))
+    end detect
+
+    /** Thrown from the forked runner's `done()` when [[detect]] finds a leak. Failing by exception is what marks the forked test task failed;
+      * sbt surfaces the message as a `ForkMain$ForkError`.
+      */
+    final class Detected(report: String)
+        extends RuntimeException(
+            s"kyo-test leak check failed:$report\n\nThese resources outlived the test run; a leaked fiber, thread, or descriptor means a " +
+                "test (or the code under test) did not release a resource. To attribute each leaked descriptor to the test that opened it, " +
+                "re-run with KYO_TEST_LEAK_DEBUG=1 (runs leaves serially and appends `opened by test: <leaf>` to each descriptor). Disable " +
+                "for a suite with `override def config = super.config.leakCheck(false)`. A fiber or thread finding can be excused with " +
+                "`super.config.leakCheckAllowlist(\"<stack-substring>\")`, which matches stack frames; a socket cannot, since its target is " +
+                "an inode that changes every run, so exempt that category with `super.config.leakCheckSockets(false)` instead."
+        )
+
+end LeakCheck

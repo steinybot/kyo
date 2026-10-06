@@ -133,7 +133,9 @@ private[compiler] case class ServicePrinter(
             )
             .addParameterList( //
                 "configure" :- s"${Types.managedChannelBuilder("?")} => ${Types.managedChannelBuilder("?")}",
-                "shutdown" :- s"(${Types.managedChannel}, ${Types.duration}) => ${Types.frame} ?=> ${Types.pending(Types.any, Types.sync)}" := s"${Types.client}.shutdown"
+                "shutdown" :-
+                    s"(${Types.managedChannel}, ${Types.duration}) => ${Types.frame} ?=> ${Types.pending(Types.any, Types.sync)}" :=
+                    s"${Types.client}.shutdown"
             )
             .addUsingParameters(Types.frame)
             .addReturnType(Types.pending("Client", s"${Types.scope} & ${Types.sync}"))
@@ -173,8 +175,8 @@ private[compiler] case class ServicePrinter(
             }
 
     private def printClientImplMethod(method: MethodDescriptor): PrinterEndo = {
-        val parameters = clientMethodParameters(method)
-        val returnType = clientMethodReturnType(method)
+        val parameters   = clientMethodParameters(method)
+        val returnType   = clientMethodReturnType(method)
         val delegateName = method.streamType match {
             case StreamType.Unary           => "unary"
             case StreamType.ClientStreaming => "clientStreaming"
@@ -198,8 +200,8 @@ private[compiler] case class ServicePrinter(
     }
 
     private def clientMethodParameters(method: MethodDescriptor): Seq[Parameter] = {
-        def requestParameter  = "request" :- Types.grpcRequestInit(method.inputType.scalaType)
-        def requestsParameter  = "requests" :- Types.grpcRequestInit(Types.streamGrpcRequest(method.inputType.scalaType))
+        def requestParameter     = "request" :- Types.grpcRequestInit(method.inputType.scalaType)
+        def requestsParameter    = "requests" :- Types.grpcRequestInit(Types.streamGrpcRequest(method.inputType.scalaType))
         def requestBidiParameter = "requests" :- Types.grpcRequestBidiInit(Types.streamGrpcRequest(method.inputType.scalaType))
         method.streamType match {
             case StreamType.Unary | StreamType.ServerStreaming => Seq(requestParameter)

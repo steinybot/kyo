@@ -2,14 +2,14 @@ package kyo
 
 import scala.util.Try
 
-class ChunkTest extends Test:
+class ChunkTest extends kyo.test.Test[Any]:
 
     "Chunk.from" - {
         "Array" - {
             "creates a Chunk.Indexed from a non-empty Array" in {
                 val array = Array("a", "b", "c")
                 val chunk = Chunk.from(array)
-                assert(chunk.isInstanceOf[Chunk.Indexed[String]])
+                succeed("the Array overload of Chunk.from statically returns Chunk.Indexed, so Indexed-ness is a compile-time guarantee")
                 assert(chunk == Seq("a", "b", "c"))
             }
 
@@ -55,11 +55,12 @@ class ChunkTest extends Test:
                 }
             }
 
-            "returns the same instance for Chunk input" in pendingUntilFixed {
+            "returns the same instance for Chunk input".pendingUntilFixed(
+                "Chunk.from does not yet return the same instance for a Chunk input (no identity fast-path)"
+            ) in {
                 val original = Chunk(1, 2, 3).append(4)
                 val result   = Chunk.from(original)
                 assert(result eq original)
-                ()
             }
 
             "creates a Chunk.FromSeq for non-Chunk IndexedSeq input" in {
@@ -72,6 +73,35 @@ class ChunkTest extends Test:
                 val list  = List(1, 2, 3)
                 val chunk = Chunk.from(list)
                 assert(chunk.isInstanceOf[Chunk.internal.Compact[Int]])
+            }
+
+            "with exact size hint" - {
+                "pre-sizes the copy of a non-IndexedSeq, same result as no hint" in {
+                    val list  = List(1, 2, 3, 4, 5)
+                    val hint  = Chunk.from(list, list.size)
+                    val plain = Chunk.from(list)
+                    assert(hint == Seq(1, 2, 3, 4, 5))
+                    assert(hint == plain)
+                    assert(hint.isInstanceOf[Chunk.internal.Compact[Int]])
+                }
+
+                "keeps the zero-copy FromSeq fast path for IndexedSeq input" in {
+                    val vector = Vector(1, 2, 3)
+                    val chunk  = Chunk.from(vector, vector.size)
+                    assert(chunk == Seq(1, 2, 3))
+                    assert(chunk.isInstanceOf[Chunk.internal.FromSeq[Int]])
+                }
+
+                "negative hint falls back to size-agnostic copying" in {
+                    val list  = List(1, 2, 3)
+                    val chunk = Chunk.from(list, -1)
+                    assert(chunk == Seq(1, 2, 3))
+                }
+
+                "empty source" in {
+                    val chunk = Chunk.from(List.empty[Int], 0)
+                    assert(chunk.isEmpty && (chunk eq Chunk.empty))
+                }
             }
         }
 
@@ -139,6 +169,57 @@ class ChunkTest extends Test:
         "throws NoSuchElementException for an empty chunk" in {
             val chunk = Chunk.empty[Int].toIndexed
             assert(Try(chunk.head).isFailure)
+        }
+    }
+
+    "updated" - {
+        "replaces the last element" in {
+            assert(Chunk(1, 2, 3).updated(2, 30) == Chunk(1, 2, 30))
+        }
+
+        "replaces a middle element" in {
+            assert(Chunk(1, 2, 3).updated(1, 20) == Chunk(1, 20, 3))
+        }
+
+        "replaces the head" in {
+            assert(Chunk(1, 2, 3).updated(0, 10) == Chunk(10, 2, 3))
+        }
+
+        "works across appended chains" in {
+            val chunk = Chunk.empty[Int].append(1).append(2).append(3)
+            assert(chunk.updated(2, 30) == Chunk(1, 2, 30))
+            assert(chunk.updated(0, 10) == Chunk(10, 2, 3))
+        }
+
+        "leaves the original unchanged" in {
+            val chunk = Chunk(1, 2, 3)
+            assert(chunk.updated(1, 20) == Chunk(1, 20, 3))
+            assert(chunk == Chunk(1, 2, 3))
+        }
+
+        "out of bounds fails" in {
+            assert(Try(Chunk(1, 2, 3).updated(3, 4)).isFailure)
+            assert(Try(Chunk(1, 2, 3).updated(-1, 4)).isFailure)
+            assert(Try(Chunk.empty[Int].updated(0, 1)).isFailure)
+        }
+    }
+
+    "toIndexed" - {
+        "flattens a chain of appends preserving the elements" in {
+            val chunk = Chunk.empty[Int].append(1).append(2).append(3).toIndexed
+            assert(chunk == Chunk(1, 2, 3))
+            assert(chunk(0) == 1)
+            assert(chunk(2) == 3)
+        }
+
+        "returns the same instance when already indexed" in {
+            val chunk = Chunk(1, 2, 3).toIndexed
+            assert(chunk.toIndexed eq chunk)
+        }
+
+        "flattens a dropped view" in {
+            val chunk = Chunk(1, 2, 3, 4, 5).dropLeft(2).toIndexed
+            assert(chunk == Chunk(3, 4, 5))
         }
     }
 
@@ -245,14 +326,14 @@ class ChunkTest extends Test:
 
         "throws IndexOutOfBoundsException for negative index" in {
             val chunk = Chunk(1, 2, 3)
-            assertThrows[IndexOutOfBoundsException] {
+            interceptThrown[IndexOutOfBoundsException] {
                 chunk(-1)
             }
         }
 
         "throws IndexOutOfBoundsException for index >= size" in {
             val chunk = Chunk(1, 2, 3)
-            assertThrows[IndexOutOfBoundsException] {
+            interceptThrown[IndexOutOfBoundsException] {
                 chunk(3)
             }
         }
@@ -457,7 +538,7 @@ class ChunkTest extends Test:
         }
 
         "with complex accumulation" in {
-            val chunk = Chunk(1, 2, 3, 4, 5).dropLeft(1).append(6)
+            val chunk  = Chunk(1, 2, 3, 4, 5).dropLeft(1).append(6)
             val result = chunk.foldLeft(Map.empty[String, Int]) { (map, n) =>
                 map + (s"key$n" -> (n * 10))
             }
@@ -533,7 +614,7 @@ class ChunkTest extends Test:
         }
 
         "mapping and filtering an empty chunk" in {
-            val chunk = Chunk.empty[Int]
+            val chunk  = Chunk.empty[Int]
             val result = chunk
                 .map(_ * 2)
                 .filter(_ % 2 == 0)
@@ -541,7 +622,7 @@ class ChunkTest extends Test:
         }
 
         "filter and map" in {
-            val chunk = Chunk(1, 2, 3, 4, 5, 6)
+            val chunk  = Chunk(1, 2, 3, 4, 5, 6)
             val result = chunk
                 .filter(_ % 2 == 0)
                 .map(_ + 1)
@@ -706,6 +787,11 @@ class ChunkTest extends Test:
             val array1 = chunk.toArray
             val array2 = chunk.toArray
             assert(array1 ne array2)
+        }
+
+        "handles primitive types properly" in {
+            val chunk = Chunk.from(Array(1, 2))
+            assert(chunk.toArray.toList == List(1, 2))
         }
     }
 
@@ -1192,6 +1278,69 @@ class ChunkTest extends Test:
         "prints the elements of a Chunk.Append" in {
             val chunk = Chunk(1, 2, 3).append(4)
             assert(chunk.toString == "Chunk(1, 2, 3, 4)")
+        }
+    }
+
+    "Flag.Reader" - {
+        "Chunk[Int]" - {
+            val reader = summon[Flag.Reader[Chunk[Int]]]
+
+            "typeName" in {
+                assert(reader.typeName == "Chunk[Int]")
+            }
+
+            "parses comma-separated ints" in {
+                assert(reader("1,2,3") == Right(Chunk(1, 2, 3)))
+            }
+
+            "handles whitespace" in {
+                assert(reader(" 1 , 2 , 3 ") == Right(Chunk(1, 2, 3)))
+            }
+
+            "single element" in {
+                assert(reader("42") == Right(Chunk(42)))
+            }
+
+            "empty string" in {
+                assert(reader("") == Right(Chunk.empty[Int]))
+            }
+
+            "embedded empty element fails for Int" in {
+                assert(reader("1,,2").isLeft)
+            }
+
+            "leading comma fails for Int" in {
+                assert(reader(",1,2").isLeft)
+            }
+
+            "trailing comma is ignored by split (Java behavior)" in {
+                // Java's String.split drops trailing empty strings
+                assert(reader("1,2,") == Right(Chunk(1, 2)))
+            }
+        }
+
+        "Chunk[String]" - {
+            val reader = summon[Flag.Reader[Chunk[String]]]
+
+            "typeName" in {
+                assert(reader.typeName == "Chunk[String]")
+            }
+
+            "parses comma-separated strings" in {
+                assert(reader("a,b,c") == Right(Chunk("a", "b", "c")))
+            }
+
+            "trims whitespace from elements" in {
+                assert(reader(" a , b , c ") == Right(Chunk("a", "b", "c")))
+            }
+
+            "Chunk[Chunk[Int]] rejected at compile time" in {
+                typeCheckFailure("""summon[Flag.Reader[Chunk[Chunk[Int]]]]""")("Scalar")
+            }
+
+            "Chunk[Record[...]] rejected at compile time" in {
+                typeCheckFailure("""summon[Flag.Reader[Chunk[Record["x" ~ Int]]]]""")("Scalar")
+            }
         }
     }
 

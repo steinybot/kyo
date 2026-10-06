@@ -1,0 +1,131 @@
+package kyo.stats.machine
+
+import kyo.*
+import kyo.ffi.*
+
+/** The macOS host reader: cpu-time through mach `host_statistics`, memory and swap through `sysctl` plus
+  * mach `vm_statistics64`, load averages through `getloadavg`, and per-mount disk through the mount
+  * enumeration and `statfs`. All syscalls go through a small projection shim that flattens the nested and
+  * array struct fields the FFI struct layer cannot read into flat primitive out-params.
+  *
+  * The four out-buffers are RETAINED, allocated once at construction and closed by the sampler's Scope
+  * finalizer: `Buffer.alloc` opens a fresh memory arena per call, so allocating them per read would allocate
+  * four arenas on every tick. Every read is through `Buffer`'s non-generic `getLong`/`setLong`/`getDouble`
+  * accessors rather than the generic `get`/`set`, which box every element through the `UnsafeLayout[A]`
+  * typeclass dispatch (JVM erasure); the non-generic accessors bypass that dispatch, so a steady read
+  * allocates nothing. cgroup and PSI are Linux-only and are never written here, and macOS has no iowait or
+  * steal concept, so those cells are never written either and their series are never registered.
+  */
+final private[machine] class MachineMacos(
+    h: MachineHandles,
+    s: MachineSampler,
+    loader: MachineMacos.Loader = MachineMacos.FfiLoader
+)(using AllowUnsafe) extends Machine:
+
+    private val cpuOut  = Buffer.alloc[Long](4)
+    private val memOut  = Buffer.alloc[Long](3)
+    private val swapOut = Buffer.alloc[Long](2)
+    private val loadOut = Buffer.alloc[Double](3)
+
+    private val disk = new MacosDisk(h)
+
+    def read()(using AllowUnsafe): Unit =
+        bindings match
+            case Present(b) => readAll(b)
+            case Absent     => ()
+
+    def readDisks()(using AllowUnsafe): Unit =
+        bindings match
+            case Present(b) =>
+                try disk.read(b)
+                catch
+                    case ex: Throwable if Machine.degradable(ex) =>
+                        discard(Machine.reportDegraded("the macOS disk reader", ex))
+            case Absent => ()
+
+    /** One tick's non-disk read over a supplied binding, guarded.
+      *
+      * A library that loaded can still fail a later call: a lazily-initialized generated impl raises its
+      * class-init failure from the first real symbol lookup, and a class already poisoned by such a failure
+      * raises `NoClassDefFoundError` from every call after it. This is the reader's degradation boundary, so
+      * the tick that fails is dropped and the sampler keeps running.
+      */
+    private[machine] def readAll(b: MacosBindings)(using AllowUnsafe): Unit =
+        try
+            readCpu(b)
+            readMemory(b)
+            readSwap(b)
+            readLoad(b)
+        catch
+            case ex: Throwable if Machine.degradable(ex) =>
+                discard(Machine.reportDegraded("the macOS host reader", ex))
+    end readAll
+
+    def close()(using AllowUnsafe): Unit =
+        cpuOut.close()
+        memOut.close()
+        swapOut.close()
+        loadOut.close()
+        disk.close()
+    end close
+
+    /** The binding, loaded once; a load failure (a host with no koffi, an unresolvable shim) degrades
+      * every reading to absent.
+      */
+    private lazy val bindings: Maybe[MacosBindings] =
+        try Present(loader())
+        catch
+            case ex: Throwable if Machine.degradable(ex) =>
+                discard(Machine.reportDegraded("the macOS host reader's native library (machine_macos)", ex))
+                Absent
+
+    private[machine] def readCpu(b: MacosBindings)(using AllowUnsafe): Unit =
+        if b.hostCpuLoad(cpuOut) == 0 then
+            val user   = cpuOut.getLong(0)
+            val system = cpuOut.getLong(1)
+            val idle   = cpuOut.getLong(2)
+            val nice   = cpuOut.getLong(3)
+            h.cpuUser.observe(user)
+            h.cpuSystem.observe(system)
+            h.cpuIdle.observe(idle)
+            h.cpuTotal.observe(user + system + idle + nice)
+        end if
+    end readCpu
+
+    private[machine] def readMemory(b: MacosBindings)(using AllowUnsafe): Unit =
+        if b.vmStatistics(memOut) == 0 then
+            h.memTotal.set(memOut.getLong(0))
+            h.memFree.observe(memOut.getLong(1))
+            h.memAvailable.observe(memOut.getLong(2))
+        end if
+    end readMemory
+
+    private[machine] def readSwap(b: MacosBindings)(using AllowUnsafe): Unit =
+        if b.swapUsage(swapOut) == 0 then
+            h.swapTotal.set(swapOut.getLong(0))
+            h.swapFree.observe(swapOut.getLong(1))
+        end if
+    end readSwap
+
+    private[machine] def readLoad(b: MacosBindings)(using AllowUnsafe): Unit =
+        if b.getloadavg(loadOut, 3) == 3 then
+            h.loadOne.set(loadOut.getDouble(0))
+            h.loadFive.set(loadOut.getDouble(1))
+            h.loadFifteen.set(loadOut.getDouble(2))
+        end if
+    end readLoad
+
+end MachineMacos
+
+private[machine] object MachineMacos:
+
+    /** How the reader obtains its binding. A parameter so a test can stand in a load that fails the way a host
+      * without the shim does, which no host the suite runs on reproduces on demand.
+      */
+    trait Loader:
+        def apply()(using AllowUnsafe): MacosBindings
+
+    object FfiLoader extends Loader:
+        def apply()(using AllowUnsafe): MacosBindings = Ffi.load[MacosBindings]
+
+end MachineMacos

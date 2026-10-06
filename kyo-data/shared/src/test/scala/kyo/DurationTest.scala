@@ -5,7 +5,7 @@ import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.Duration as ScalaDuration
 
-class DurationTest extends Test:
+class DurationTest extends kyo.test.Test[Any]:
 
     given CanEqual[ScalaDuration, ScalaDuration] = CanEqual.derived
     given CanEqual[JavaDuration, JavaDuration]   = CanEqual.derived
@@ -24,7 +24,7 @@ class DurationTest extends Test:
                 assert(i.minutes.toMinutes == i)
                 assert(i.hours.toHours == i)
             }
-            succeed
+            ()
         }
 
         "conversion for value 1" in {
@@ -65,14 +65,14 @@ class DurationTest extends Test:
             genLong(0, maxNanos).foreach { i =>
                 assert(i.nanos.toJava == java.time.Duration.ofNanos(i))
             }
-            succeed
+            ()
         }
 
         "toScala" in {
             genLong(0, maxNanos).foreach { i =>
                 assert(i.nanos.toScala == scala.concurrent.duration.Duration.fromNanos(i))
             }
-            succeed
+            ()
         }
 
         "math" in {
@@ -86,7 +86,7 @@ class DurationTest extends Test:
                 assert(added.toJava == expectedAdd)
                 assert(mult.toJava == expectedMult)
             }
-            succeed
+            ()
         }
 
         "overflow" in {
@@ -97,6 +97,24 @@ class DurationTest extends Test:
             assert(multiplied == Duration.Infinity)
             assert(added == Duration.Infinity)
             assert(hours == Duration.Infinity)
+        }
+
+        "negative values are Duration.Zero in every unit" in {
+            genLong(1, Long.MaxValue).foreach { i =>
+                val n = -i
+                assert(n.nanos == Duration.Zero)
+                assert(n.micros == Duration.Zero)
+                assert(n.millis == Duration.Zero)
+                assert(n.seconds == Duration.Zero)
+                assert(n.minutes == Duration.Zero)
+                assert(n.hours == Duration.Zero)
+                assert(n.days == Duration.Zero)
+                assert(n.weeks == Duration.Zero)
+                assert(n.months == Duration.Zero)
+                assert(n.years == Duration.Zero)
+            }
+            assert(Long.MinValue.seconds == Duration.Zero)
+            assert((-1).seconds == Duration.Zero)
         }
 
         "Long.to* shouldn't compile" in {
@@ -124,7 +142,7 @@ class DurationTest extends Test:
             testCases.foreach { case (input, expected) =>
                 assert(Duration.parse(input) == Result.succeed(expected))
             }
-            succeed
+            ()
         }
 
         "invalid durations" in {
@@ -139,7 +157,7 @@ class DurationTest extends Test:
             testCases.foreach { input =>
                 assert(Duration.parse(input).isFailure)
             }
-            succeed
+            ()
         }
 
         "case insensitivity" in {
@@ -231,27 +249,69 @@ class DurationTest extends Test:
             assert((1000.micros).show == "1.millis")
             assert((1000.nanos).show == "1.micros")
         }
+
+        // show exists to be read, and an exact unit stops being readable once its number runs to eight digits. 14 seconds and change
+        // divides evenly only at microseconds, so it used to render as "14031085.micros": correct, and not the number anyone wanted.
+        "scales when no exact unit reads well" in {
+            assert(14031085.micros.show == "14.03.seconds")
+            assert(1234567.nanos.show == "1.23.millis")
+            assert(123456789.nanos.show == "123.46.millis")
+            // Exactness still wins where it reads: 54 is a fine way to say two and a quarter days.
+            assert((2.days + 6.hours).show == "54.hours")
+        }
+
+        // Scaling rounds, and a value that rounds to a whole number is written as one: "2.seconds", never "2.0.seconds".
+        "drops a zero fraction after rounding" in {
+            assert((2.seconds + 1.nano).show == "2.seconds")
+            assert((5.hours + 1.micro).show == "5.hours")
+        }
+
+        // The boundary between the two renderings, from either side.
+        "renders exactly up to four digits and scales past them" in {
+            assert(9999.millis.show == "9999.millis")
+            assert(10000.millis.show == "10.seconds")
+            assert(9999.micros.show == "9999.micros")
+            assert(10001.micros.show == "10.millis")
+        }
     }
 
-    "Duration subtraction" - {
-        "subtracting smaller from larger" in {
-            assert(5.seconds - 2.seconds == 3.seconds)
+    "Duration.minus" - {
+        "present when the subtrahend is not longer" in {
+            assert(5.seconds.minus(2.seconds) == Present(3.seconds))
+            assert(3.minutes.minus(3.minutes) == Present(Duration.Zero))
+            assert(10.hours.minus(Duration.Zero) == Present(10.hours))
         }
 
-        "subtracting larger from smaller" in {
-            assert(2.seconds - 5.seconds == Duration.Zero)
+        "absent when the subtrahend is longer" in {
+            assert(2.seconds.minus(5.seconds) == Absent)
+            assert(Duration.Zero.minus(1.nano) == Absent)
+            assert(1.day.minus(Duration.Infinity) == Absent)
         }
 
-        "subtracting equal durations" in {
-            assert(3.minutes - 3.minutes == Duration.Zero)
+        "Infinity less a finite duration stays Infinity" in {
+            assert(Duration.Infinity.minus(1.second) == Present(Duration.Infinity))
+            assert(Duration.Infinity.minus(Duration.Infinity) == Present(Duration.Zero))
+        }
+    }
+
+    "Duration.minusOrZero" - {
+        "the difference when the subtrahend is not longer" in {
+            assert(5.seconds.minusOrZero(2.seconds) == 3.seconds)
+            assert(10.hours.minusOrZero(Duration.Zero) == 10.hours)
         }
 
-        "subtracting from zero" in {
-            assert(Duration.Zero - 1.second == Duration.Zero)
+        "Zero when the subtrahend is longer" in {
+            assert(2.seconds.minusOrZero(5.seconds) == Duration.Zero)
+            assert(Duration.Zero.minusOrZero(1.second) == Duration.Zero)
         }
 
-        "subtracting zero" in {
-            assert(10.hours - Duration.Zero == 10.hours)
+        "agrees with minus whenever minus is present" in {
+            val durations = Chunk(Duration.Zero, 1.nano, 999.millis, 1.second, 3.hours, Duration.Infinity)
+            for
+                a <- durations
+                b <- durations
+            do assert(a.minusOrZero(b) == a.minus(b).getOrElse(Duration.Zero))
+            end for
         }
     }
 
@@ -283,4 +343,93 @@ class DurationTest extends Test:
             assert(result.isFailure)
         }
     }
+    "Flag.Reader" - {
+        val reader = summon[Flag.Reader[Duration]]
+
+        "typeName" in {
+            assert(reader.typeName == "Duration")
+        }
+
+        "seconds" in {
+            assert(reader("5s") == Right(5.seconds))
+        }
+
+        "milliseconds" in {
+            assert(reader("100ms") == Right(100.millis))
+        }
+
+        "nanoseconds" in {
+            assert(reader("500ns") == Right(500.nanos))
+        }
+
+        "minutes" in {
+            assert(reader("2minutes") == Right(2.minutes))
+        }
+
+        "hours" in {
+            assert(reader("1hours") == Right(1.hour))
+        }
+
+        "days" in {
+            assert(reader("3d") == Right(3.days))
+        }
+
+        "with whitespace between value and unit" in {
+            assert(reader("10 seconds") == Right(10.seconds))
+        }
+
+        "infinity" in {
+            assert(reader("infinity") == Right(Duration.Infinity))
+        }
+
+        "inf" in {
+            assert(reader("inf") == Right(Duration.Infinity))
+        }
+
+        "invalid format" in {
+            assert(reader("not-a-duration").isLeft)
+        }
+
+        "invalid unit" in {
+            assert(reader("5xyz").isLeft)
+        }
+
+        "5m parses as minutes" in {
+            assert(reader("5m") == Right(5.minutes))
+        }
+
+        "5mo parses as months (not minutes)" in {
+            // "mo" should not accidentally match "minutes" via prefix
+            assert(reader("5months") == Right(Duration.fromUnits(5, Duration.Units.Months)))
+        }
+
+        "0s parses as zero duration" in {
+            assert(reader("0s") == Right(Duration.Zero))
+        }
+
+        "0 without unit is invalid" in {
+            assert(reader("0").isLeft)
+        }
+
+        "single-letter abbreviation s" in {
+            assert(reader("1s") == Right(1.second))
+        }
+
+        "single-letter abbreviation h" in {
+            assert(reader("1h") == Right(1.hour))
+        }
+
+        "single-letter abbreviation d" in {
+            assert(reader("1d") == Right(1.day))
+        }
+
+        "single-letter abbreviation w" in {
+            assert(reader("1w") == Right(Duration.fromUnits(1, Duration.Units.Weeks)))
+        }
+
+        "single-letter abbreviation y" in {
+            assert(reader("1y") == Right(Duration.fromUnits(1, Duration.Units.Years)))
+        }
+    }
+
 end DurationTest

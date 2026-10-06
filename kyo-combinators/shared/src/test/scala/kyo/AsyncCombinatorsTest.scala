@@ -1,12 +1,16 @@
 package kyo
 
-class AsyncCombinatorsTest extends Test:
+class AsyncCombinatorsTest extends kyo.test.Test[Any]:
+
+    // The `Kyo.fromFuture` / `Kyo.fromPromiseScala` construction tests build scala.concurrent.Futures, which need an
+    // ExecutionContext. The ScalaTest base provided one; kyo-test does not, so supply the same cross-platform EC.
+    given scala.concurrent.ExecutionContext = kyo.internal.Platform.executionContext
 
     "async" - {
         "construct" - {
-            "should generate Async effect from async" in run {
+            "should generate Async effect from async" in {
                 var state: Int = 0
-                val effect = Kyo.async[Int, Nothing]((continuation) =>
+                val effect     = Kyo.async[Int, Nothing]((continuation) =>
                     val cont = Sync.defer { state = state + 1; state }
                     continuation(cont)
                 )
@@ -15,9 +19,9 @@ class AsyncCombinatorsTest extends Test:
                 }
             }
 
-            "should generate failing Async effect from async" in run {
+            "should generate failing Async effect from async" in {
                 var state: Int = 0
-                val effect = Kyo.async[Int, String]((continuation) =>
+                val effect     = Kyo.async[Int, String]((continuation) =>
                     continuation(Abort.fail("failed"))
                 )
                 Abort.run(effect).map:
@@ -26,7 +30,7 @@ class AsyncCombinatorsTest extends Test:
                     case Result.Panic(thr)     => fail(s"Unexpectedly panic with exception $thr")
             }
 
-            "should construct from Future" in run {
+            "should construct from Future" in {
                 val future = scala.concurrent.Future(100)
                 val effect = Kyo.fromFuture(future)
                 effect.map(v =>
@@ -34,8 +38,8 @@ class AsyncCombinatorsTest extends Test:
                 )
             }
 
-            "should construct from Promise" in run {
-                val promise = scala.concurrent.Promise[Int]
+            "should construct from Promise" in {
+                val promise = scala.concurrent.Promise[Int]()
                 val effect  = Kyo.fromPromiseScala(promise)
                 scala.concurrent.Future {
                     promise.complete(scala.util.Success(100))
@@ -43,17 +47,17 @@ class AsyncCombinatorsTest extends Test:
                 effect.map(v => assert(v == 100))
             }
 
-            "should construct from foreachPar" in run {
+            "should construct from foreachPar" in {
                 val effect = Kyo.foreachPar(Seq(1, 2, 3))(v => v * 2)
                 effect.map(v => assert(v == Seq(2, 4, 6)))
             }
 
-            "should construct from collectAllPar" in run {
+            "should construct from collectAllPar" in {
                 val effect = Kyo.collectAllPar(Seq(Sync.defer(1), Sync.defer(2), Sync.defer(3)))
                 effect.map(v => assert(v == Seq(1, 2, 3)))
             }
 
-            "should generate a fiber that doesn't complete using never" in runJVM {
+            "should generate a fiber that doesn't complete using never".onlyJvm in {
                 val effect = Kyo.never
                 Abort.run[Throwable] {
                     val r = KyoApp.runAndBlock(5.millis)(effect)
@@ -67,14 +71,14 @@ class AsyncCombinatorsTest extends Test:
         }
 
         "forkUnscoped" - {
-            "should fork a fibers effect" in run {
+            "should fork a fibers effect" in {
                 val effect       = Async.sleep(100.millis) *> 10
                 val forkedEffect = effect.forkUnscoped
                 val joinedEffect = forkedEffect.map(_.get)
                 joinedEffect.map(v => assert(v == 10))
             }
 
-            "should join a forked effect" in run {
+            "should join a forked effect" in {
                 val effect       = Async.sleep(100.millis) *> 10
                 val forkedEffect = Fiber.initUnscoped(effect)
                 val joinedEffect = forkedEffect.join
@@ -83,7 +87,7 @@ class AsyncCombinatorsTest extends Test:
         }
 
         "zip par" - {
-            "should zip right par" in run {
+            "should zip right par" in {
                 val e1     = Sync.defer(1)
                 val e2     = Sync.defer(2)
                 val effect = e1 &> e2
@@ -92,7 +96,7 @@ class AsyncCombinatorsTest extends Test:
                 )
             }
 
-            "should zip left par" in run {
+            "should zip left par" in {
                 val e1     = Sync.defer(1)
                 val e2     = Sync.defer(2)
                 val effect = e1 <& e2
@@ -101,7 +105,7 @@ class AsyncCombinatorsTest extends Test:
                 )
             }
 
-            "should zip par" in run {
+            "should zip par" in {
                 val e1     = Sync.defer(1)
                 val e2     = Sync.defer(2)
                 val effect = e1 <&> e2
@@ -109,10 +113,54 @@ class AsyncCombinatorsTest extends Test:
                     assert(v == (1, 2))
                 )
             }
+
+        }
+
+        "async" - {
+            // An orphaned effect never runs its finalizer, which the leaf timeout reports.
+            "interrupting the caller of async interrupts the effect it registered".times(100) in {
+                for
+                    gate     <- Latch.init(1)
+                    entered  <- Latch.init(1)
+                    released <- AtomicBoolean.init(false)
+                    fiber    <- Fiber.initUnscoped {
+                        Kyo.async[Int, Nothing] { register =>
+                            Sync.defer(register(Sync.ensure(released.set(true))(entered.release.andThen(gate.await).andThen(1))))
+                        }
+                    }
+                    _ <- entered.await
+                    _ <- fiber.interrupt
+                    _ <- fiber.getResult
+                    _ <- Sync.ensure(gate.release)(assertEventually(released.get))
+                yield succeed
+                end for
+            }
+
+            // The caller parks between registering and joining, so the interrupt lands before the join links it to the
+            // promise. An orphaned effect never releases `finalized`, which the leaf timeout reports.
+            "interrupting the caller before it joins interrupts the effect it registered".timeout(15.seconds) in {
+                for
+                    gate      <- Latch.init(1)
+                    entered   <- Latch.init(1)
+                    hold      <- Latch.init(1)
+                    finalized <- Latch.init(1)
+                    fiber     <- Fiber.initUnscoped {
+                        Kyo.async[Int, Nothing] { register =>
+                            Sync.defer(register(Sync.ensure(finalized.release)(entered.release.andThen(gate.await).andThen(1))))
+                                .andThen(hold.await)
+                        }
+                    }
+                    _ <- entered.await
+                    _ <- fiber.interrupt
+                    _ <- fiber.getResult
+                    _ <- Sync.ensure(gate.release.andThen(hold.release))(finalized.await)
+                yield succeed
+                end for
+            }
         }
         "fork" - {
-            "should fork a fiber and manage its lifecycle" in run {
-                var state = 0
+            "should fork a fiber and manage its lifecycle" in {
+                var state  = 0
                 val effect = Kyo.async[Int, Nothing]((continuation) =>
                     state = state + 1
                     continuation(state)
@@ -129,9 +177,9 @@ class AsyncCombinatorsTest extends Test:
                 )
             }
 
-            "should clean up resources when scope is closed" in run {
+            "should clean up resources when scope is closed" in {
                 var cleanedUp = false
-                val effect = Kyo.async[Int, Nothing]((continuation) =>
+                val effect    = Kyo.async[Int, Nothing]((continuation) =>
                     continuation(42)
                 )
 
@@ -150,9 +198,9 @@ class AsyncCombinatorsTest extends Test:
 
         "await" - {
 
-            "should wait for fiber completion" in run {
+            "should wait for fiber completion" in {
                 var completed = false
-                val effect = Kyo.async[Int, Nothing](continuation =>
+                val effect    = Kyo.async[Int, Nothing](continuation =>
                     completed = true
                     continuation(42)
                 )

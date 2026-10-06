@@ -5,29 +5,22 @@ import java.util.concurrent.TimeUnit
 import kyo.*
 import kyo.ZIOs.*
 import kyo.internal.Platform
-import org.scalatest.compatible.Assertion
-import org.scalatest.concurrent.Eventually.*
-import scala.concurrent.Future
 import zio.Cause
 import zio.Exit
 import zio.Task
 import zio.ZIO
 
-class ZIOsTest extends Test:
+class ZIOsTest extends kyo.test.Test[Any]:
     given [E]: CanEqual[Cause[E], Cause[E]]        = CanEqual.derived
     given [E, A]: CanEqual[Exit[E, A], Exit[E, A]] = CanEqual.derived
 
-    def runZIO[T](v: Task[T]): T =
-        zio.Unsafe.unsafe(implicit u =>
-            zio.Runtime.default.unsafe.run(v).getOrThrow()
-        )
+    // Run the body THROUGH the ZIO runtime (preserving the kyo<->ZIO interop these tests cover), bridging the
+    // resulting Future back into a kyo computation so it can be a kyo-test leaf body.
+    def runZIO[T](v: Task[T]): T < Async =
+        Async.fromFuture(zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.runToFuture(v)))
 
-    def runKyo(v: => Assertion < (Abort[Throwable] & Async)): Future[Assertion] =
-        zio.Unsafe.unsafe(implicit u =>
-            zio.Runtime.default.unsafe.runToFuture(
-                ZIOs.run(v)
-            )
-        )
+    def runKyo(v: => Unit < (Abort[Throwable] & Async)): Unit < Async =
+        Async.fromFuture(zio.Unsafe.unsafe(implicit u => zio.Runtime.default.unsafe.runToFuture(ZIOs.run(v))))
 
     "Abort[String]" in runKyo {
         val a: Nothing < (Abort[String] & Async) = ZIOs.get(ZIO.fail("error"))
@@ -75,7 +68,10 @@ class ZIOsTest extends Test:
     "Envs[Int & Double]" in {
         typeCheckFailure("""
             val a = ZIOs.get(ZIO.service[Int] *> ZIO.service[Double])
-        """)("could not find implicit value for izumi.reflect.Tag[Int & Double]")
+        """)(
+            """ZIO environments are not supported yet. Please handle them before calling this method.
+You must not use an intersection type, yet have provided scala.Int & scala.Double"""
+        )
     }
 
     "A < ZIOs" in runKyo {
@@ -175,7 +171,7 @@ class ZIOsTest extends Test:
                 "both" in runZIO {
                     val started = new CountDownLatch(2)
                     val done    = new CountDownLatch(2)
-                    val v =
+                    val v       =
                         for
                             _ <- ZIOs.get(zioLoop(started, done))
                             _ <- Fiber.initUnscoped(kyoLoop(started, done))
@@ -191,8 +187,8 @@ class ZIOsTest extends Test:
                 }
 
                 "parallel loops" in runZIO {
-                    val started = new CountDownLatch(2)
-                    val done    = new CountDownLatch(2)
+                    val started        = new CountDownLatch(2)
+                    val done           = new CountDownLatch(2)
                     def parallelEffect =
                         ZIOs.run {
                             val loop1 = ZIOs.get(zioLoop(started, done))
@@ -210,8 +206,8 @@ class ZIOsTest extends Test:
                 }
 
                 "race loops" in runZIO {
-                    val started = new CountDownLatch(2)
-                    val done    = new CountDownLatch(2)
+                    val started    = new CountDownLatch(2)
+                    val done       = new CountDownLatch(2)
                     def raceEffect =
                         ZIOs.run {
                             val loop1 = ZIOs.get(zioLoop(started, done))
@@ -225,6 +221,28 @@ class ZIOsTest extends Test:
                         r <- f.await
                         _ <- ZIO.attempt(done.await(100, TimeUnit.MILLISECONDS))
                     yield assert(r.isInterrupted)
+                    end for
+                }
+
+                "interrupt racing acquisition never orphans the bridged kyo fiber" in runZIO {
+                    // A ZIO interrupt that lands between ZIOs.run's fork and the wiring of its interruption
+                    // path must still stop the bridged kyo fiber. Each iteration forks a busy spin loop and
+                    // interrupts it immediately, maximizing that window; a dropped interrupt leaves a worker
+                    // spinning, so progress keeps advancing after every fiber has been awaited.
+                    val progress          = new java.util.concurrent.atomic.AtomicLong(0)
+                    def spin: Unit < Sync =
+                        Sync.defer {
+                            discard(progress.incrementAndGet())
+                            spin
+                        }
+                    val iteration: Task[Unit] =
+                        ZIOs.run(spin).fork.flatMap(f => (f.interrupt *> f.await).unit)
+                    for
+                        _  <- ZIO.foreachDiscard(1 to 400)(_ => iteration)
+                        p1 <- ZIO.succeed(progress.get())
+                        _  <- ZIO.sleep(zio.Duration.fromMillis(200))
+                        p2 <- ZIO.succeed(progress.get())
+                    yield assert(p1 == p2)
                     end for
                 }
             }
@@ -247,7 +265,7 @@ class ZIOsTest extends Test:
                 "both" in runKyo {
                     val started = new CountDownLatch(2)
                     val done    = new CountDownLatch(2)
-                    val v =
+                    val v       =
                         for
                             _ <- ZIOs.get(zioLoop(started, done))
                             _ <- kyoLoop(started, done)
@@ -263,8 +281,8 @@ class ZIOsTest extends Test:
                 }
 
                 "parallel loops" in runKyo {
-                    val started = new CountDownLatch(2)
-                    val done    = new CountDownLatch(2)
+                    val started        = new CountDownLatch(2)
+                    val done           = new CountDownLatch(2)
                     def parallelEffect =
                         val loop1 = ZIOs.get(zioLoop(started, done))
                         val loop2 = kyoLoop(started, done)
@@ -281,8 +299,8 @@ class ZIOsTest extends Test:
                 }
 
                 "race loops" in runKyo {
-                    val started = new CountDownLatch(2)
-                    val done    = new CountDownLatch(2)
+                    val started    = new CountDownLatch(2)
+                    val done       = new CountDownLatch(2)
                     def raceEffect =
                         val loop1 = ZIOs.get(zioLoop(started, done))
                         val loop2 = kyoLoop(started, done)
@@ -327,7 +345,7 @@ class ZIOsTest extends Test:
         }
 
         "nested ZIO failure in Kyo" in runKyo {
-            val nestedZIO: ZIO[Any, String, Int] = ZIO.fail("Nested ZIO failed")
+            val nestedZIO: ZIO[Any, String, Int]         = ZIO.fail("Nested ZIO failed")
             val kyoEffect: Int < (Abort[String] & Async) =
                 ZIOs.get(ZIO.succeed(ZIOs.get(nestedZIO))).flatten
             Abort.run(kyoEffect).map { result =>
@@ -394,8 +412,8 @@ class ZIOsTest extends Test:
 
         "Interrupt" in runKyo {
             Cause.interrupt(zio.FiberId.None).toError match
-                case Result.Panic(e: Interrupted) => succeed
-                case _                            => fail("Expected Result.Panic with Fiber.Interrupted")
+                case Result.Panic(_: Interrupted) => succeed("interrupt cause converts to a Panic wrapping Interrupted")
+                case _                            => fail("Expected Result.Panic with Interrupted")
             end match
         }
 

@@ -3,7 +3,6 @@ package kyo.scheduler
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -11,26 +10,53 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kyo.scheduler.Task.Done
 import kyo.scheduler.Task.Preempted
-import kyo.scheduler.util.Threads
 import org.scalatest.NonImplicitAssertions
-import org.scalatest.concurrent.Eventually.*
+import org.scalatest.concurrent.Eventually
 import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.time.Millis
+import org.scalatest.time.Seconds
+import org.scalatest.time.Span
 
-class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
+class WorkerTest extends AnyFreeSpec with NonImplicitAssertions with Eventually with org.scalatest.BeforeAndAfterEach {
 
-    val executor = Executors.newCachedThreadPool(Threads("test-worker"))
+    implicit override val patienceConfig: PatienceConfig =
+        PatienceConfig(timeout = Span(15, Seconds), interval = Span(50, Millis))
+
+    // A worker mounts by submitting ITSELF here, so wrapping the executor lets afterEach count in-flight run() invocations and
+    // wait for zero, not a fixed settle. The InternalClock ticker also runs here but is not a Worker, so the isInstanceOf filter excludes it.
+    private val activeWorkers = new AtomicInteger(0)
+    val executor: Executor    = command =>
+        TestExecutors.cached.execute { () =>
+            val isWorker = command.isInstanceOf[Worker]
+            if (isWorker) { val _ = activeWorkers.incrementAndGet() }
+            try command.run()
+            finally if (isWorker) { val _ = activeWorkers.decrementAndGet() }
+        }
+
+    // Set to true after each test to stop all workers created during that test
+    private var globalStop = new AtomicBoolean(false)
+
+    override def afterEach(): Unit = {
+        globalStop.set(true)
+        // Wait for every mounted worker's run() loop to actually return (activeWorkers back to 0), not for a fixed
+        // delay. The nanoTime bound is a catastrophic-only hang canary, never the pass condition.
+        val deadline = System.nanoTime() + 15000000000L
+        while (activeWorkers.get() > 0 && System.nanoTime() < deadline) Thread.`yield`()
+        globalStop = new AtomicBoolean(false) // fresh for next test
+    }
 
     private def createWorker(
         executor: Executor = _ => (),
         scheduleTask: (Task, Worker) => Unit = (_, _) => ???,
         stop: () => Boolean = () => false,
         stealTask: Worker => Task = _ => null,
-        currentCycle: () => Long = () => 0
+        currentEpoch: () => Long = () => 0L
     ): Worker = {
-        val clock = InternalClock(executor)
+        val testStop = globalStop
+        val clock    = InternalClock(executor)
         new Worker(0, executor, scheduleTask, stealTask, clock, 5) {
-            def getCurrentCycle() = currentCycle()
-            def shouldStop()      = stop()
+            def currentInterruptEpoch(): Long = currentEpoch()
+            def shouldStop()                  = testStop.get() || stop()
         }
     }
 
@@ -52,6 +78,255 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             worker.enqueue(task)
             assert(worker.load() == 1)
             assert(task.executions == 0)
+        }
+    }
+
+    "interrupt prioritization" - {
+        // A fiber resets its accumulated runtime when interrupted (Task.resetRuntime), so it is
+        // scheduled promptly to observe the interrupt and run its finalizers rather than being
+        // deprioritized by the runtime it built up while running.
+
+        "a task whose runtime is reset is scheduled ahead of lower-runtime busy tasks" in {
+            val worker = createWorker()
+            val order  = new ConcurrentLinkedQueue[String]()
+
+            val victim = TestTask(_run = () => { order.add("victim"); Done })
+            victim.addRuntime(1000)
+            victim.resetRuntime()
+
+            def busy(name: String): TestTask = {
+                var n = 0
+                TestTask(_run = () => { order.add(name); n += 1; if (n < 5) Preempted else Done })
+            }
+            List("busy1", "busy2", "busy3", "busy4").map(busy).foreach(worker.enqueue)
+            worker.enqueue(victim)
+            worker.run()
+
+            assert(
+                order.toArray.toList.indexOf("victim") == 0,
+                s"reset task was not scheduled first: ${order.toArray.toList}"
+            )
+        }
+
+        "a reset task's scheduling delay is independent of queued load" in {
+            def victimPosition(numBusy: Int): Int = {
+                val worker = createWorker()
+                val order  = new ConcurrentLinkedQueue[String]()
+
+                val victim = TestTask(_run = () => { order.add("victim"); Done })
+                victim.addRuntime(1000000)
+                victim.resetRuntime()
+
+                def busy(name: String): TestTask = {
+                    var n = 0
+                    TestTask(_run = () => { order.add(name); n += 1; if (n < 5) Preempted else Done })
+                }
+                (1 to numBusy).map(i => busy(s"b$i")).foreach(worker.enqueue)
+                worker.enqueue(victim)
+                worker.run()
+                order.toArray.toList.indexOf("victim")
+            }
+
+            val small = victimPosition(numBusy = 4)
+            val large = victimPosition(numBusy = 20)
+            assert(
+                large <= small,
+                s"reset-task scheduling delay grew with load (positions: 4-busy=$small, 20-busy=$large)"
+            )
+        }
+
+        "a task reset while already queued is scheduled promptly regardless of load" in {
+            def victimPosition(numBusy: Int): Int = {
+                // The interrupt epoch advances at the moment the victim's runtime is reset, mirroring
+                // how Scheduler.notifyInterrupt bumps Scheduler.interruptEpoch on a real interrupt.
+                val epoch  = new java.util.concurrent.atomic.AtomicLong(0L)
+                val worker = createWorker(currentEpoch = () => epoch.get())
+                val order  = new ConcurrentLinkedQueue[String]()
+
+                // High runtime, enqueued before any reset; reset later, while queued, by the first
+                // busy task to run (as a fiber's runtime is reset when interrupted mid-flight).
+                val victim = TestTask(_run = () => { order.add("victim"); Done })
+                victim.addRuntime(1000000)
+
+                var resetYet                     = false
+                def busy(name: String): TestTask = {
+                    var n = 0
+                    TestTask(_run = () => {
+                        if (!resetYet) {
+                            victim.resetRuntime()
+                            epoch.incrementAndGet() // test-local analog of Scheduler.notifyInterrupt's bump
+                            resetYet = true
+                        }
+                        order.add(name)
+                        n += 1
+                        if (n < 5) Preempted else Done
+                    })
+                }
+                (1 to numBusy).map(i => busy(s"b$i")).foreach(worker.enqueue)
+                worker.enqueue(victim)
+                worker.run()
+                order.toArray.toList.indexOf("victim")
+            }
+
+            val small = victimPosition(numBusy = 4)
+            val large = victimPosition(numBusy = 20)
+            // Once the epoch advances, the next rebalance re-sifts the reset victim to the queue head
+            // (the frozen test clock fires exactly one rebuild), so the victim reaches the same constant
+            // position regardless of how many busy tasks are queued: load-independent, not merely bounded.
+            assert(
+                large == small,
+                s"reset-while-queued scheduling position depended on load (positions: 4-busy=$small, 20-busy=$large)"
+            )
+        }
+
+        "a queued task reset without an epoch advance is not boosted (rebalance is epoch-gated)" in {
+            // No epoch advance: rebalance's gate (epoch != lastRebuiltEpoch) stays false, so no rebuild
+            // fires and the in-place reset is invisible to the heap. The victim then stays at its natural
+            // load-dependent position, proving rebalance does nothing on the common (epoch-unchanged) path.
+            def victimPosition(numBusy: Int): Int = {
+                val worker = createWorker() // currentEpoch defaults to () => 0L: never advances
+                val order  = new ConcurrentLinkedQueue[String]()
+
+                val victim = TestTask(_run = () => { order.add("victim"); Done })
+                victim.addRuntime(1000000)
+
+                var resetYet                     = false
+                def busy(name: String): TestTask = {
+                    var n = 0
+                    TestTask(_run = () => {
+                        if (!resetYet) { victim.resetRuntime(); resetYet = true } // reset, but NO epoch bump
+                        order.add(name)
+                        n += 1
+                        if (n < 5) Preempted else Done
+                    })
+                }
+                (1 to numBusy).map(i => busy(s"b$i")).foreach(worker.enqueue)
+                worker.enqueue(victim)
+                worker.run()
+                order.toArray.toList.indexOf("victim")
+            }
+
+            val small = victimPosition(numBusy = 4)
+            val large = victimPosition(numBusy = 20)
+            assert(
+                large > small,
+                s"victim was boosted without an epoch advance (positions: 4-busy=$small, 20-busy=$large)"
+            )
+        }
+
+        "a task interrupted during its slice is re-run immediately, never requeued behind queued load" in {
+            // The mount-boundary race: the interrupt lands while the task is running, so its runtime
+            // key is untrustworthy at requeue time (the reset races addRuntime/doPreempt RMWs). The
+            // worker must re-run the task instead of requeueing it, or queued load starves it.
+            val worker = createWorker()
+            val order  = new ConcurrentLinkedQueue[String]()
+
+            def late(name: String): TestTask = TestTask(_run = () => { order.add(name); Done })
+            val late1                        = late("late1")
+            val late2                        = late("late2")
+
+            lazy val victim: TestTask = TestTask(_run = () => {
+                if (!victim.interrupted) {
+                    order.add("victim")
+                    // Fresh low-runtime arrivals land while the victim runs; the interrupt then
+                    // lands mid-slice, before the worker decides whether to requeue.
+                    worker.enqueue(late1)
+                    worker.enqueue(late2)
+                    victim.interrupted = true
+                    Preempted
+                } else {
+                    // An IOTask whose promise is complete finalizes and returns Done when re-run.
+                    order.add("victim-final")
+                    Done
+                }
+            })
+            victim.addRuntime(1000000) // accumulated slice runtime: a stale key if requeued
+
+            worker.enqueue(victim)
+            worker.run()
+
+            val l = order.toArray.toList.map(_.toString)
+            assert(
+                l == List("victim", "victim-final", "late1", "late2"),
+                s"interrupted task was requeued instead of re-run immediately: $l"
+            )
+        }
+
+        "repeated epoch advances within one frozen tick fire at most one rebuild (bounded under storm)" in {
+            // Every busy task advances the epoch (an interrupt storm), but the frozen test clock keeps
+            // now - lastRebuildMs at 0 after the first rebuild, so the minInterval gate fires exactly one
+            // rebuild per tick. The victim still reaches the same constant head position as a single advance.
+            def victimPosition(numBusy: Int): Int = {
+                val epoch  = new java.util.concurrent.atomic.AtomicLong(0L)
+                val worker = createWorker(currentEpoch = () => epoch.get())
+                val order  = new ConcurrentLinkedQueue[String]()
+
+                val victim = TestTask(_run = () => { order.add("victim"); Done })
+                victim.addRuntime(1000000)
+
+                var resetYet                     = false
+                def busy(name: String): TestTask = {
+                    var n = 0
+                    TestTask(_run = () => {
+                        if (!resetYet) { victim.resetRuntime(); resetYet = true }
+                        epoch.incrementAndGet() // advance on EVERY run: an interrupt storm
+                        order.add(name)
+                        n += 1
+                        if (n < 5) Preempted else Done
+                    })
+                }
+                (1 to numBusy).map(i => busy(s"b$i")).foreach(worker.enqueue)
+                worker.enqueue(victim)
+                worker.run()
+                order.toArray.toList.indexOf("victim")
+            }
+
+            val small = victimPosition(numBusy = 4)
+            val large = victimPosition(numBusy = 20)
+            assert(
+                large == small,
+                s"storm of epoch advances moved the victim position with load (positions: 4-busy=$small, 20-busy=$large)"
+            )
+        }
+
+        "a victim reset in a worker's queue is boosted by that worker's own run loop (worker-local)" in {
+            // rebalance operates only on this.queue via queue.rebuild(); the boost is driven entirely by
+            // the worker's own run loop with no cross-worker coordination. A single worker boosts its own
+            // queued victim once the epoch advances at the reset point.
+            val epoch  = new java.util.concurrent.atomic.AtomicLong(0L)
+            val worker = createWorker(currentEpoch = () => epoch.get())
+            val order  = new ConcurrentLinkedQueue[String]()
+
+            val victim = TestTask(_run = () => { order.add("victim"); Done })
+            victim.addRuntime(1000000)
+
+            var resetYet                     = false
+            def busy(name: String): TestTask = {
+                var n = 0
+                TestTask(_run = () => {
+                    if (!resetYet) {
+                        victim.resetRuntime()
+                        epoch.incrementAndGet()
+                        resetYet = true
+                    }
+                    order.add(name)
+                    n += 1
+                    if (n < 5) Preempted else Done
+                })
+            }
+            List("b1", "b2", "b3", "b4").map(busy).foreach(worker.enqueue)
+            worker.enqueue(victim)
+            worker.run()
+
+            val victimIndex = order.toArray.toList.indexOf("victim")
+            // b1 triggers the reset (position 0). rebalance fires at the top of the NEXT loop
+            // iteration, but that iteration's task is already b2 (carried from b1's addAndPoll).
+            // b2 runs at position 1; when b2 calls addAndPoll the rebuilt heap returns victim.
+            // So victim is at position 2, not stranded at the back behind all the busy work.
+            assert(
+                victimIndex == 2,
+                s"victim was not boosted to position 2 by its own worker's loop: ${order.toArray.toList}"
+            )
         }
     }
 
@@ -176,9 +451,9 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "executing a task that gets preempted" in {
-            val worker      = createWorker(currentCycle = () => 1)
+            val worker      = createWorker()
             var preemptions = 0
-            val task = TestTask(
+            val task        = TestTask(
                 _run = () =>
                     if (preemptions < 10) {
                         preemptions += 1
@@ -193,10 +468,29 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             assert(task.executions == 11)
         }
 
+        "a preempted task with an empty local queue steals stranded work instead of resuming it (wedge fix)" in {
+            // Models the scheduler wedge: a worker is pinned on a task that keeps yielding (Preempted)
+            // and cannot complete until other work runs, while its own queue is empty and the work that
+            // would unblock it is stranded on another (blocked) worker. The pinned worker must preempt
+            // and steal that stranded work rather than re-running its own task forever.
+            val strandedRan = new java.util.concurrent.atomic.AtomicBoolean(false)
+            val stranded    = TestTask(_run = () => { strandedRan.set(true); Task.Done })
+            val handedOut   = new java.util.concurrent.atomic.AtomicBoolean(false)
+            // The victim hands out the stranded task exactly once, modelling a successful steal.
+            val worker = createWorker(stealTask = _ => if (handedOut.compareAndSet(false, true)) stranded else null)
+            // `pinned` yields (Preempted) every slice until the stranded task has run, then completes.
+            val pinned = TestTask(_run = () => if (strandedRan.get()) Task.Done else Task.Preempted)
+            worker.enqueue(pinned)
+            worker.run()
+            assert(strandedRan.get())
+            assert(stranded.executions == 1)
+            assert(worker.load() == 0)
+        }
+
         "sets worker local" in {
             val worker    = createWorker()
             var w: Worker = null
-            val task = TestTask(_run = () => {
+            val task      = TestTask(_run = () => {
                 w = Worker.current()
                 Task.Done
             })
@@ -215,7 +509,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             val worker = createWorker(executor)
             val cdl1   = new CountDownLatch(1)
             val cdl2   = new CountDownLatch(1)
-            val task = TestTask(_run = () => {
+            val task   = TestTask(_run = () => {
                 cdl1.countDown()
                 cdl2.await()
                 Done
@@ -228,14 +522,19 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "pending task" in {
-            val worker = createWorker(executor)
-            val cdl    = new CountDownLatch(1)
-            val task = TestTask(_run = () => {
+            val worker  = createWorker(executor)
+            val started = new CountDownLatch(1)
+            val cdl     = new CountDownLatch(1)
+            val task    = TestTask(_run = () => {
+                started.countDown()
                 cdl.await()
                 Done
             })
             worker.enqueue(task)
-            eventually(assert(worker.load() == 1))
+            // load() also reads 1 while the task is still queued, and reads 0 between the worker's poll and its
+            // mount of the task, so only the task's own start proves load() == 0 below means it finished.
+            started.await()
+            assert(worker.load() == 1)
             cdl.countDown()
             eventually(assert(worker.load() == 0))
             assert(task.executions == 1)
@@ -246,7 +545,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
                 val worker = createWorker(executor)
                 val cdl1   = new CountDownLatch(1)
                 val cdl2   = new CountDownLatch(1)
-                val task = TestTask(_run = () => {
+                val task   = TestTask(_run = () => {
                     cdl1.countDown()
                     cdl2.await()
                     Done
@@ -263,7 +562,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
                 val worker = createWorker(executor)
                 val cdl1   = new CountDownLatch(1)
                 val cdl2   = new CountDownLatch(1)
-                val task = TestTask(_run = () => {
+                val task   = TestTask(_run = () => {
                     cdl1.countDown()
                     cdl2.await(1, TimeUnit.DAYS)
                     Done
@@ -279,7 +578,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             "blocked thread" in {
                 val worker = createWorker(executor)
                 val thread = new AtomicReference[Thread]
-                val task = TestTask(_run = () => {
+                val task   = TestTask(_run = () => {
                     thread.set(Thread.currentThread())
                     LockSupport.park()
                     Done
@@ -295,7 +594,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             "only if not forced" in {
                 val worker = createWorker(executor)
                 val thread = new AtomicReference[Thread]
-                val task = TestTask(_run = () => {
+                val task   = TestTask(_run = () => {
                     thread.set(Thread.currentThread())
                     LockSupport.park()
                     Done
@@ -312,7 +611,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
 
         "blocked worker is drained" in {
             val drained = new ConcurrentLinkedQueue[Task]
-            val worker = createWorker(
+            val worker  = createWorker(
                 executor,
                 (t, w) => {
                     drained.add(t)
@@ -329,7 +628,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             for (_ <- 0 until 10) worker.enqueue(task)
             eventually(assert(worker.load() == 10))
             cdl2.countDown()
-            eventually(assert(!worker.checkAvailability(0)))
+            eventually(assert(!worker.checkAvailability(System.currentTimeMillis())))
             assert(drained.size() == 9)
             cdl1.countDown()
             eventually(assert(worker.load() == 0))
@@ -337,35 +636,101 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "steal a task from another worker" in {
-            val cdl1 = new CountDownLatch(1)
-            val cdl2 = new CountDownLatch(1)
-            val task1 = TestTask(_run = () => {
+            val started1 = new CountDownLatch(1)
+            val started2 = new CountDownLatch(1)
+            val cdl1     = new CountDownLatch(1)
+            val cdl2     = new CountDownLatch(1)
+            val task1    = TestTask(_run = () => {
+                started1.countDown()
                 cdl1.await()
                 Done
             })
             val task2 = TestTask(_run = () => {
+                started2.countDown()
                 cdl2.await()
                 Done
             })
             val worker1 = createWorker(executor)
             val worker2 = createWorker(executor, stealTask = w => worker1.stealingBy(w))
 
+            // The thief tries once and goes idle when the victim holds its queue lock, so it is woken only once worker1 is parked
+            // inside task1 and can no longer be polling its queue.
             worker1.enqueue(task1)
+            started1.await()
             worker1.enqueue(task2)
-            eventually(assert(worker1.load() == 2))
+            assert(worker1.load() == 2)
             assert(worker2.load() == 0)
 
             worker2.wakeup()
-            eventually {
-                assert(worker1.load() == 1)
-                assert(worker2.load() == 1)
-            }
+            started2.await()
+            assert(worker1.load() == 1)
+            assert(worker2.load() == 1)
             cdl1.countDown()
             cdl2.countDown()
             eventually {
                 assert(task2.executions == 1)
                 assert(task1.executions == 1)
             }
+        }
+
+        "a thief that finds the victim's queue locked takes nothing, and steals on its next wakeup" in {
+            val started1 = new CountDownLatch(1)
+            val cdl1     = new CountDownLatch(1)
+            val task1    = TestTask(_run = () => {
+                started1.countDown()
+                cdl1.await()
+                Done
+            })
+            val task2       = TestTask()
+            val gateEntered = new CountDownLatch(1)
+            val gateRelease = new CountDownLatch(1)
+            val gateArmed   = new AtomicBoolean(true)
+            // WorkerQueue reads a task's runtime under the queue lock when it inserts it, so this task holds the lock of the
+            // queue it is being added to for as long as the test wants.
+            val gate = new Task {
+                def run(startMillis: Long, clock: InternalClock, deadline: Long) = Done
+                override private[scheduler] def runtime(): Int                   = {
+                    if (gateArmed.compareAndSet(true, false)) {
+                        gateEntered.countDown()
+                        gateRelease.await()
+                    }
+                    0
+                }
+            }
+            val thiefReturned = new java.util.concurrent.Semaphore(0)
+            val worker1       = createWorker(executor)
+            val worker2       = createWorker(
+                command =>
+                    executor.execute { () =>
+                        try command.run()
+                        finally thiefReturned.release()
+                    },
+                stealTask = w => worker1.stealingBy(w)
+            )
+
+            worker1.enqueue(task1)
+            started1.await()
+            worker1.enqueue(task2)
+            val adding = new CountDownLatch(1)
+            executor.execute { () =>
+                worker1.enqueue(gate)
+                adding.countDown()
+            }
+            gateEntered.await()
+
+            worker2.wakeup()
+            thiefReturned.acquire()
+            assert(worker2.load() == 0)
+            assert(task2.executions == 0)
+            assert(worker1.load() == 2)
+
+            gateRelease.countDown()
+            adding.await()
+            worker2.wakeup()
+            thiefReturned.acquire()
+            assert(task2.executions == 1)
+            assert(worker1.load() == 1)
+            cdl1.countDown()
         }
 
         "stop" in {
@@ -375,6 +740,9 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             executor.execute { () =>
                 started.countDown()
                 val worker = createWorker(stop = () => stop.get())
+                // The worker's own executor is the no-op default, so wakeup only takes the
+                // Idle -> Dispatched edge and run() below claims it.
+                worker.wakeup()
                 worker.run()
                 done.countDown()
             }
@@ -389,10 +757,10 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         val scheduled = new AtomicInteger
 
         def withWorker[A](testCode: Worker => A): A = {
-            val clock = InternalClock(executor)
+            val clock  = InternalClock(executor)
             val worker = new Worker(0, executor, (_, _) => { scheduled.incrementAndGet(); () }, _ => null, clock, 10) {
-                def getCurrentCycle() = 0L
-                def shouldStop()      = false
+                def currentInterruptEpoch(): Long = 0L
+                def shouldStop()                  = false
             }
             testCode(worker)
         }
@@ -409,7 +777,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "when task is running longer than time slice" in withWorker { worker =>
-            val cdl = new CountDownLatch(1)
+            val cdl             = new CountDownLatch(1)
             val longRunningTask = TestTask(_run = () => {
                 while (cdl.getCount() > 0) {}
                 Task.Done
@@ -420,7 +788,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "when worker is blocked" in withWorker { worker =>
-            val cdl = new CountDownLatch(1)
+            val cdl         = new CountDownLatch(1)
             val blockedTask = TestTask(_run = () => {
                 cdl.await()
                 Task.Done
@@ -431,7 +799,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "drains queue when transitioning to stalled state" in withWorker { worker =>
-            val cdl = new CountDownLatch(1)
+            val cdl         = new CountDownLatch(1)
             val stalledTask = TestTask(_run = () => {
                 cdl.await()
                 Task.Done
@@ -447,7 +815,7 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "preempts long-running task if queue isn't empty" in withWorker { worker =>
-            var preempted = false
+            var preempted       = false
             val longRunningTask = TestTask(
                 _run = () => {
                     while (!preempted) {}
@@ -462,8 +830,13 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
                 assert(preempted)
             }
         }
-        "doesn't preempt long-running task if queue is empty" in withWorker { worker =>
-            var preempted = false
+        "preempts a long-running task even when the queue is empty (so run() can attempt a steal)" in withWorker { worker =>
+            // Replaces the original "doesn't preempt ... if queue is empty". A worker pinned on a long
+            // task with an empty local queue must still be preempted, so run() can steal work stranded
+            // on another (blocked) worker's queue (the scheduler-wedge fix: the pinned worker is the
+            // only one that can make progress, but with an empty queue it had no reason to yield).
+            // The task here exits once preempted.
+            var preempted       = false
             val longRunningTask = TestTask(
                 _run = () => {
                     while (!preempted) {}
@@ -473,32 +846,436 @@ class WorkerTest extends AnyFreeSpec with NonImplicitAssertions {
             )
             worker.enqueue(longRunningTask)
             eventually {
-                assert(!worker.checkAvailability(System.currentTimeMillis()))
-                assert(!preempted)
+                worker.checkAvailability(System.currentTimeMillis())
+                assert(preempted)
             }
         }
-        "drains queue only once when transitioning to stalled state" in withWorker { worker =>
-            scheduled.set(0)
-            val cdl = new CountDownLatch(1)
-            val stalledTask = TestTask(_run = () => {
-                cdl.await()
+        "drains the queue on the transition to stalled and again for what arrives while the task stays over its slice" in withWorker {
+            worker =>
+                scheduled.set(0)
+                val cdl         = new CountDownLatch(1)
+                val stalledTask = TestTask(_run = () => {
+                    cdl.await()
+                    Task.Done
+                })
+                worker.enqueue(stalledTask)
+
+                for (_ <- 1 to 5) {
+                    worker.enqueue(TestTask())
+                }
+
+                // The first check past the slice takes the Running -> Stalled edge and drains the five queued tasks.
+                eventually(assert(!worker.checkAvailability(System.currentTimeMillis())))
+                assert(scheduled.get() == 5)
+                // The worker is already Stalled, and its task is still over its slice: a task that arrives now is drained
+                // by the next check rather than left behind a task that is not yielding. A check with nothing queued drains
+                // nothing.
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+                assert(scheduled.get() == 5)
+                worker.enqueue(TestTask())
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+                assert(scheduled.get() == 6)
+                worker.enqueue(TestTask())
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+                assert(scheduled.get() == 7)
+
+                cdl.countDown()
+                eventually(assert(worker.checkAvailability(System.currentTimeMillis())))
+        }
+        "a Stalled worker still preempts its CPU-bound task when fresh work queues up (wedge regression)" in withWorker { worker =>
+            // Regression for the scheduler wedge (kyo-core AsyncTest hang under CPU-bound load):
+            // once a worker entered Stalled state, checkAvailability short-circuited checkStalling,
+            // so a CPU-bound task pinned on a Stalled worker never received another doPreempt even
+            // as fresh work queued behind it. The task spun forever and the queue grew unbounded.
+            // checkStalling must run for any non-blocked worker, Stalled or not.
+            @volatile var preempts = 0
+            val release            = new CountDownLatch(1)
+            val cpuBound           = TestTask(
+                _preempt = () => preempts += 1,
+                // CPU-bound spin that ignores preemption, modelling a fiber pinned mid-time-slice.
+                _run = () => {
+                    while (release.getCount() > 0) {}
+                    Task.Done
+                }
+            )
+            worker.enqueue(cpuBound)
+            worker.enqueue(TestTask()) // queue non-empty so the worker stalls and drains, entering Stalled
+            eventually {
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+                assert(worker.load() == 1) // filler drained; only the running CPU-bound task remains
+            }
+            val afterStall = preempts
+            // Fresh work arrives AFTER the worker is already Stalled with an empty queue. The old
+            // code never re-preempted here; the fix keeps issuing doPreempt while Stalled.
+            worker.enqueue(TestTask())
+            eventually {
+                worker.checkAvailability(System.currentTimeMillis())
+                assert(preempts > afterStall, "a Stalled worker must keep preempting its CPU-bound task when new work queues behind it")
+            }
+            release.countDown()
+        }
+    }
+
+    "checkAvailability" - {
+        "blocked flag makes worker unavailable" in {
+            val drained = new java.util.concurrent.ConcurrentLinkedQueue[Task]()
+            val started = new CountDownLatch(1)
+            val done    = new CountDownLatch(1)
+            val worker  = createWorker(
+                executor = executor,
+                scheduleTask = (t, _) => { val _ = drained.add(t) }
+            )
+            // Start a task that blocks
+            val task1 = TestTask(_run = () => {
+                started.countDown()
+                done.await(5, TimeUnit.SECONDS)
                 Task.Done
             })
-            worker.enqueue(stalledTask)
+            worker.enqueue(task1)
+            assert(started.await(5, TimeUnit.SECONDS))
 
-            for (_ <- 1 to 5) {
-                worker.enqueue(TestTask())
+            // Add a second task to the queue
+            val task2 = TestTask()
+            worker.enqueue(task2)
+
+            // Simulate BlockingMonitor setting blocked flag
+            worker.blocked = true
+
+            // checkAvailability should return false and drain
+            eventually {
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+            }
+            assert(drained.size() >= 1, "queue should be drained when blocked")
+
+            // Unblock
+            worker.blocked = false
+            done.countDown()
+            eventually(assert(task1.executions == 1))
+        }
+
+        "a task enqueued after the worker already stalled is still drained" in {
+            val drained = new java.util.concurrent.ConcurrentLinkedQueue[Task]()
+            val started = new CountDownLatch(1)
+            val done    = new CountDownLatch(1)
+            val worker  = createWorker(
+                executor = executor,
+                scheduleTask = (t, _) => { val _ = drained.add(t) }
+            )
+            val blocking = TestTask(_run = () => {
+                started.countDown()
+                done.await(5, TimeUnit.SECONDS)
+                Task.Done
+            })
+            worker.enqueue(blocking)
+            assert(started.await(5, TimeUnit.SECONDS))
+            worker.blocked = true
+
+            // First check takes the Running -> Stalled edge and drains whatever was queued at that instant.
+            eventually {
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+            }
+            drained.clear()
+
+            // Scheduler.schedule's random fallback ignores availability, so a task can land here now, with the
+            // worker already Stalled and parked inside its blocking call. The producer cannot prevent this: a
+            // worker may block at any point after a task is handed to it.
+            val stranded = TestTask()
+            worker.enqueue(stranded)
+
+            // Every later check finds the Running -> Stalled CAS already taken, so a drain gated on that edge
+            // alone never runs again and this task sits in the queue of a worker that cannot run it. When the
+            // blocked worker is an I/O driver parked in a poll, and the stranded task is what would produce the
+            // event that poll waits for, neither side can move: the driver never cycles and the task never runs.
+            val _ = worker.checkAvailability(System.currentTimeMillis())
+            assert(
+                drained.contains(stranded),
+                "a task enqueued onto an already-stalled worker must be drained, or it strands until that worker unblocks"
+            )
+
+            worker.blocked = false
+            done.countDown()
+            eventually(assert(blocking.executions == 1))
+        }
+
+        "a task enqueued after the worker stalled on a task that ignores preemption is still drained" in {
+            val drained = new java.util.concurrent.ConcurrentLinkedQueue[Task]()
+            val started = new CountDownLatch(1)
+            val release = new CountDownLatch(1)
+            val worker  = createWorker(
+                executor = executor,
+                scheduleTask = (t, _) => { val _ = drained.add(t) }
+            )
+            // Runs past its slice without honoring the preemption issued for it, the way a nested evaluation (a
+            // finalizer, an unsafe run) or a step with no suspension point does. It spins rather than parks, so the
+            // BlockingMonitor never flags the worker blocked: the worker is Stalled and nothing else.
+            val spinning = TestTask(_run = () => {
+                started.countDown()
+                while (release.getCount() > 0) {}
+                Task.Done
+            })
+            worker.enqueue(spinning)
+            assert(started.await(5, TimeUnit.SECONDS))
+
+            // First check past the slice takes the Running -> Stalled edge and drains whatever was queued at that instant.
+            eventually {
+                assert(!worker.checkAvailability(System.currentTimeMillis()))
+            }
+            drained.clear()
+
+            // A task lands here now, with the worker already Stalled and its task not yielding. Only the worker itself
+            // serves its queue, and it will not before the task yields, so without a drain the task sits for as long as
+            // the spin lasts, however many other workers are idle: an idle worker is only woken by an enqueue onto itself.
+            val stranded = TestTask()
+            worker.enqueue(stranded)
+            val _ = worker.checkAvailability(System.currentTimeMillis())
+            assert(
+                drained.contains(stranded),
+                "a task enqueued onto a stalled worker whose task ignores preemption must be drained, or it strands until that task yields"
+            )
+
+            release.countDown()
+            eventually(assert(spinning.executions == 1))
+        }
+
+        "a drain that re-enters another stalled worker's drain does not drain itself again" in {
+            // Two stalled workers whose scheduleTask stands in for Scheduler.schedule when no worker is available: the random
+            // fallback places the task on an unavailable worker, and the next placement's scan checks that worker, which drains
+            // it. Each drained task is handed to the other worker and that worker is checked, so A's drain re-enters B's, whose
+            // task lands back on A while A's drain is still on the stack. Draining A again there nests without bound: on CI the
+            // scheduler threads died of StackOverflowError and took the tasks they had drained with them.
+            val workers = new Array[Worker](2)
+            val far     = Long.MaxValue / 2 // past any task's slice, so both workers read as stalled without waiting on the clock
+            val started = new CountDownLatch(2)
+            val release = new CountDownLatch(1)
+            val handoff: (Task, Worker) => Unit = (t, from) => {
+                val to = if (from eq workers(0)) workers(1) else workers(0)
+                to.enqueue(t)
+                val _ = to.checkAvailability(far)
+            }
+            workers(0) = createWorker(executor = executor, scheduleTask = handoff)
+            workers(1) = createWorker(executor = executor, scheduleTask = handoff)
+            val spinners = workers.toSeq.map { w =>
+                val spinning = TestTask(_run = () => {
+                    started.countDown()
+                    while (release.getCount() > 0) {}
+                    Task.Done
+                })
+                w.enqueue(spinning)
+                spinning
+            }
+            val task = TestTask()
+            try {
+                assert(started.await(5, TimeUnit.SECONDS))
+                // Takes both workers through Running -> Stalled while their queues are empty, so nothing drains yet.
+                assert(!workers(0).checkAvailability(far))
+                assert(!workers(1).checkAvailability(far))
+
+                workers(0).enqueue(task)
+                val overflow =
+                    try { val _ = workers(0).checkAvailability(far); None }
+                    catch { case e: StackOverflowError => Some(e) }
+                assert(overflow.isEmpty, "a drain re-entered through another worker's drain drained the same worker again, without bound")
+                // The task ends queued on one of the workers, behind its spinner, rather than lost.
+                assert(workers.map(_.load()).sum == 3, s"loads ${workers.map(_.load()).toList}")
+            } finally release.countDown()
+            eventually(assert(spinners.forall(_.executions == 1)))
+            eventually(assert(task.executions == 1))
+        }
+
+        "cleared blocked flag restores availability" in {
+            val worker = createWorker(executor = executor)
+            // No task running, checkStalling won't trigger
+            worker.blocked = true
+            assert(!worker.checkAvailability(System.currentTimeMillis()))
+            worker.blocked = false
+            assert(worker.checkAvailability(System.currentTimeMillis()))
+        }
+    }
+
+    "mountId" - {
+        "is set during run and cleared on exit" in {
+            val mountIdDuringRun = new java.util.concurrent.atomic.AtomicLong(0)
+            val done             = new CountDownLatch(1)
+            val worker           = createWorker(executor = executor)
+            val task             = TestTask(_run = () => {
+                mountIdDuringRun.set(worker.mountId)
+                done.countDown()
+                Task.Done
+            })
+            worker.enqueue(task)
+            assert(done.await(5, TimeUnit.SECONDS))
+            assert(mountIdDuringRun.get() != 0, "mountId should be non-zero while running")
+            eventually(assert(task.executions == 1))
+        }
+    }
+
+    "runTask clears interrupt flag" in {
+        val flagAfterTask = new AtomicBoolean(false)
+        val latch         = new CountDownLatch(1)
+        val task1         = TestTask(_run = () => {
+            Thread.currentThread().interrupt() // set interrupt flag
+            Task.Done
+        })
+        val task2 = TestTask(_run = () => {
+            flagAfterTask.set(Thread.interrupted()) // check if flag leaked
+            latch.countDown()
+            Task.Done
+        })
+
+        val worker = createWorker(executor = executor)
+        worker.enqueue(task1)
+        worker.enqueue(task2)
+
+        assert(latch.await(5, TimeUnit.SECONDS))
+        assert(!flagAfterTask.get(), "interrupt flag should be cleared between tasks")
+    }
+
+    "run clears a stale interrupt left on the reused thread" in {
+        // A reused thread can come back still carrying an interrupt from unrelated work; Worker.run clears it on mount. This
+        // executor hands its single thread back with the flag intact (j.u.c pools clear it before dispatch, hiding the hand-back; one thread makes the reuse exact).
+        val pending        = new ConcurrentLinkedQueue[Runnable]()
+        val stopped        = new AtomicBoolean(false)
+        val pool: Executor = r => {
+            pending.add(r)
+            ()
+        }
+        val poolThread = new Thread(() => {
+            while (!stopped.get()) {
+                val r = pending.poll()
+                if (r ne null) r.run()
+                else Thread.`yield`()
+            }
+        })
+        poolThread.setDaemon(true)
+        poolThread.start()
+
+        val clock = InternalClock(TestExecutors.cached)
+        try {
+            val stained       = new CountDownLatch(1)
+            val stainedThread = new AtomicReference[Thread](null)
+            pool.execute(() => {
+                stainedThread.set(Thread.currentThread())
+                Thread.currentThread().interrupt()
+                stained.countDown()
+            })
+            assert(stained.await(5, TimeUnit.SECONDS))
+
+            val testStop = globalStop
+            val worker   = new Worker(0, pool, (_, _) => ???, _ => null, clock, 5) {
+                def currentInterruptEpoch(): Long = 0L
+                def shouldStop()                  = testStop.get()
             }
 
-            eventually(assert(!worker.checkAvailability(System.currentTimeMillis())))
-            worker.enqueue(TestTask())
-            assert(!worker.checkAvailability(System.currentTimeMillis()))
-            worker.enqueue(TestTask())
-            assert(!worker.checkAvailability(System.currentTimeMillis()))
+            val flagOnEntry = new AtomicBoolean(false)
+            val ranOn       = new AtomicReference[Thread](null)
+            val done        = new CountDownLatch(1)
+            val task        = TestTask(_run = () => {
+                ranOn.set(Thread.currentThread())
+                flagOnEntry.set(Thread.interrupted())
+                done.countDown()
+                Task.Done
+            })
+            worker.enqueue(task)
 
-            assert(scheduled.get() == 5)
-            cdl.countDown()
-            eventually(assert(worker.checkAvailability(System.currentTimeMillis())))
+            assert(done.await(5, TimeUnit.SECONDS))
+            assert(ranOn.get() eq stainedThread.get(), "the task should mount the thread that carries the stale flag")
+            assert(!flagOnEntry.get(), "run() should clear the stale interrupt before mounting a task")
+        } finally {
+            stopped.set(true)
+            clock.stop()
+            poolThread.join(5000)
+        }
+    }
+
+    "needsInterrupt" in {
+        val task = TestTask()
+        assert(!task.needsInterrupt())
+
+        task.interrupted = true
+        assert(task.needsInterrupt())
+    }
+
+    "fatal Throwable from a task wedges the worker (BUG REPRODUCER for FatalFiberTest cascade)" in {
+        // Repros the chain: FatalFiberTest throws LinkageError -> Worker.runTask's
+        // catch only matches NonFatal -> fatal escapes runTask -> escapes Worker.run's
+        // unguarded while(true) -> thread dies, Worker.state stays at Running, mount/
+        // mountId/blocked never cleared -> wakeup() can never re-arm this Worker ->
+        // subsequent enqueued tasks sit in the dead queue.
+        val worker = createWorker(executor = executor)
+
+        val mountThread = new AtomicReference[Thread](null)
+        val fatalTask   = TestTask(_run = () => {
+            mountThread.set(Thread.currentThread())
+            throw new LinkageError("simulated NoClassDefFoundError")
+        })
+        worker.enqueue(fatalTask)
+
+        // Worker thread picks it up and dies executing it.
+        eventually {
+            assert(fatalTask.executions == 1, "fatal task should have been executed once before the thread died")
+        }
+        // The fatal Throwable unwinds run()'s finally (republishing the worker Idle), then kills the pool thread. Wait for that
+        // thread to die: an enqueue landing in the death window is lost outright, so the eventually below could never recover it.
+        eventually {
+            val thread = mountThread.get()
+            assert((thread ne null) && !thread.isAlive(), "the worker's thread should have died from the fatal Throwable")
+        }
+
+        // Now enqueue a trivial second task. A healthy Worker re-arms via wakeup() ->
+        // exec.execute(this) and runs it. A wedged Worker has state stuck at Running,
+        // so the CAS Idle->Dispatched in wakeup() fails and the task never runs. `eventually` is the
+        // barrier: a wedged worker never runs task2 and fails at its own timeout.
+        val task2 = TestTask()
+        worker.enqueue(task2)
+
+        eventually {
+            assert(
+                task2.executions == 1,
+                s"Worker should recover and execute the next task after fatal, but task2.executions=${task2.executions}"
+            )
+        }
+    }
+
+    "dispatch claim" - {
+        // wakeup() takes Idle -> Dispatched and asks the executor for a thread; run() claims the worker on the
+        // Dispatched -> Running edge. An executor that counts dispatches without running them models a handoff
+        // the pool accepted and dropped, so run() below stands in for the arrival that eventually mounts.
+        "a second arrival for the same dispatch loses the claim and bows out" in {
+            val dispatches            = new AtomicInteger(0)
+            val lostHandoff: Executor = command =>
+                if (command.isInstanceOf[Worker]) { val _ = dispatches.incrementAndGet() }
+            val worker = createWorker(executor = lostHandoff)
+            val task   = TestTask()
+            worker.enqueue(task)
+            assert(dispatches.get() == 1, s"expected one dispatch, got ${dispatches.get()}")
+            assert(worker.load() == 1, "task queued on an unmounted Dispatched worker")
+            // First arrival: claims Dispatched -> Running, runs the queued task, exits through the idle path.
+            worker.run()
+            assert(task.executions == 1)
+            assert(worker.load() == 0)
+            // Second arrival for the same dispatch: the Dispatched edge is gone, so it must return without
+            // mounting or re-running anything.
+            worker.run()
+            assert(task.executions == 1, "a duplicate arrival must not re-run anything")
+        }
+
+        "a worker emptied by a thief before its arrival parks Idle and accepts the next wakeup" in {
+            val dispatches            = new AtomicInteger(0)
+            val lostHandoff: Executor = command =>
+                if (command.isInstanceOf[Worker]) { val _ = dispatches.incrementAndGet() }
+            val worker = createWorker(executor = lostHandoff)
+            val thief  = createWorker(executor = lostHandoff)
+            val task   = TestTask()
+            worker.enqueue(task)
+            assert(dispatches.get() == 1)
+            val stolen = worker.stealingBy(thief)
+            assert(stolen eq task, "the thief empties the queue before the dispatch arrives")
+            // The arrival still comes: it claims the worker, finds nothing to run, and parks it back at Idle.
+            worker.run()
+            assert(task.executions == 0, "the stolen task belongs to the thief now")
+            // Back at Idle, so the next enqueue dispatches normally.
+            worker.enqueue(TestTask())
+            assert(dispatches.get() == 2, "a worker parked at Idle takes a fresh dispatch")
         }
     }
 }

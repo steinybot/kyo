@@ -1,6 +1,6 @@
 package kyo
 
-class AbortTest extends Test:
+class AbortTest extends kyo.test.Test[Any]:
 
     case class Ex1() extends RuntimeException derives CanEqual
     case class Ex2() derives CanEqual
@@ -216,7 +216,7 @@ class AbortTest extends Test:
                     Abort.run[Int](v).eval
                 val _: Result[Int, Int] =
                     t3(42)
-                succeed
+                succeed("type-resolution compile check: Abort.run inference is a compile-time property")
             }
             "super" in {
                 val ex                        = new Exception
@@ -259,7 +259,7 @@ class AbortTest extends Test:
                     Result.succeed(Result.succeed(Result.succeed(Result.succeed(Result.succeed(Result.succeed(18))))))
                 assert(res == expected)
             }
-            "doesn't produce Fail if E isn't Throwable" in run {
+            "doesn't produce Fail if E isn't Throwable" in {
                 val ex = new Exception
                 Abort.run[Any](throw ex).map(result => assert(result == Result.panic(ex)))
             }
@@ -294,7 +294,7 @@ class AbortTest extends Test:
                 }
 
                 "works with nested Aborts" in {
-                    val ex = new RuntimeException("Inner exception")
+                    val ex     = new RuntimeException("Inner exception")
                     val nested = Abort.run[IllegalArgumentException] {
                         Abort.run[RuntimeException](Abort.panic(ex))
                     }
@@ -342,7 +342,7 @@ class AbortTest extends Test:
                     Abort.runPartial[Int](v)
                 val _: Result.Partial[Int, Int] < Abort[Nothing] =
                     t3(42)
-                succeed
+                succeed("type-resolution compile check: Abort.runPartial inference is a compile-time property")
             }
             "super" in {
                 val ex                                                 = new Exception
@@ -402,9 +402,11 @@ class AbortTest extends Test:
                 }
 
                 "does not convert matching Panic to Failure" in {
+                    // The partial run lets the panic through, so it is the outer run's own ending rather than a value
+                    // the outer run carries.
                     val ex     = new RuntimeException("Test exception")
                     val result = Abort.run(Abort.runPartial[RuntimeException](Abort.panic(ex))).eval
-                    assert(result == Result.Success(Result.Panic(ex)))
+                    assert(result == Result.Panic(ex))
                 }
 
                 "doesn't affect Success" in {
@@ -419,12 +421,24 @@ class AbortTest extends Test:
                 }
 
                 "works with nested Aborts" in {
-                    val ex = new RuntimeException("Inner exception")
+                    // Neither partial run catches a panic, so it passes through both and ends the outer run.
+                    val ex     = new RuntimeException("Inner exception")
                     val nested = Abort.runPartial[IllegalArgumentException] {
                         Abort.runPartial[RuntimeException](Abort.panic(ex))
                     }
                     val result = Abort.run(nested).eval
-                    assert(result == Result.Success(Result.Success(Result.Panic(ex))))
+                    assert(result == Result.Panic(ex))
+                }
+
+                "a Result.Panic the body produces as a value is not taken as the run's own panic" in {
+                    // The run boxes the body's value into the success lane, so a Result.Panic the body produces as a
+                    // plain value (a fiber's getResult handed on as data, say) comes back as the success carrying it,
+                    // never as the run's own panic.
+                    val ex                            = new Exception("carried")
+                    val v: Result[Nothing, Int] < Any = Result.panic(ex)
+                    val r                             = Abort.run[Throwable](v).eval
+                    assert(r.isSuccess, s"the carried panic was read as the run's own: $r")
+                    assert(r == Result.Success(Result.panic(ex)))
                 }
             }
         }
@@ -538,7 +552,7 @@ class AbortTest extends Test:
             }
 
             "short-circuiting" in {
-                var sideEffect = 0
+                var sideEffect       = 0
                 def test(b: Boolean) = Abort.run[String] {
                     for
                         _ <- Abort.when(b)("FAIL!")
@@ -695,7 +709,7 @@ class AbortTest extends Test:
                     val r = Abort.run(Abort.catching(throw new RuntimeException)).eval
                     assert(r.isPanic)
                 }
-                "Panic" in pendingUntilFixed {
+                "Panic".pendingUntilFixed("Abort.catching does not yet recover a panic of the caught error type") in {
                     class Distinct1 extends Throwable derives CanEqual
 
                     val d1: Distinct1                 = new Distinct1
@@ -703,7 +717,6 @@ class AbortTest extends Test:
                     val r: Result[Distinct1, Boolean] = Abort.run(a).eval
 
                     assert(r == Result.fail(d1))
-                    ()
                 }
             }
             "with other effect" - {
@@ -787,7 +800,7 @@ class AbortTest extends Test:
             "short-circuiting with map" - {
                 "should not execute subsequent operations on failure" in {
                     var executed = false
-                    val result = Abort.run[String](
+                    val result   = Abort.run[String](
                         Abort.fail("failure").map(_ => executed = true)
                     )
                     assert(result.eval == Result.fail("failure"))
@@ -796,7 +809,7 @@ class AbortTest extends Test:
 
                 "should execute subsequent operations on success" in {
                     var executed = false
-                    val result = Abort.run(Abort.run[String](
+                    val result   = Abort.run(Abort.run[String](
                         Abort.get[Int](Right(42)).map(_ => executed = true)
                     ))
                     assert(result.eval == Result.succeed(Result.succeed(())))
@@ -923,7 +936,7 @@ class AbortTest extends Test:
         }
         val finalResult: Result[String, Int] < (Env[Int] & Var[Int]) = result
         val _                                                        = finalResult
-        succeed
+        succeed("type-resolution compile check: multi-effect type inference is a compile-time property")
     }
 
     "handling of Abort[Nothing]" - {
@@ -963,9 +976,9 @@ class AbortTest extends Test:
         }
     }
 
-    "Abort.run with parametrized type" in pendingUntilFixed {
+    "Abort.run with parametrized type".pendingUntilFixed("Abort.run type inference does not yet work for a parametrized error type") in {
         class Test[A]
-        typeCheck("Abort.run(Abort.fail(new Test[Int]))")
+        discard(typeCheck("Abort.run(Abort.fail(new Test[Int]))"))
     }
 
     "Abort.run with type unions" - {
@@ -1024,9 +1037,9 @@ class AbortTest extends Test:
             val computation: Int < Abort[String | Int | CustomError | Boolean] =
                 Abort.fail("String error")
 
-            val result1 = Abort.run[String](computation)
-            val result2 = Abort.run[Int](result1)
-            val result3 = Abort.run[CustomError](result2)
+            val result1                                                                             = Abort.run[String](computation)
+            val result2                                                                             = Abort.run[Int](result1)
+            val result3                                                                             = Abort.run[CustomError](result2)
             val finalResult: Result[CustomError, Result[Int, Result[String, Int]]] < Abort[Boolean] =
                 result3
 
@@ -1054,7 +1067,7 @@ class AbortTest extends Test:
 
             "doesn't affect successful computations" in {
                 val computation: Int < Abort[CustomError] = 100
-                val recovered =
+                val recovered                             =
                     Abort.recover[CustomError](_ => 42)(computation)
                 assert(Abort.run(recovered).eval == Result.succeed(100))
             }
@@ -1132,7 +1145,7 @@ class AbortTest extends Test:
 
             "with Env effect" in {
                 val computation: Int < Abort[CustomError] = Abort.fail(CustomError("Failed"))
-                val recovered = Abort.recover[CustomError] { error =>
+                val recovered                             = Abort.recover[CustomError] { error =>
                     Env.get[String].map(_.length)
                 }(computation)
 
@@ -1142,7 +1155,7 @@ class AbortTest extends Test:
 
             "with Var effect" in {
                 val computation: Int < Abort[CustomError] = Abort.fail(CustomError("Failed"))
-                val recovered = Abort.recover[CustomError] { error =>
+                val recovered                             = Abort.recover[CustomError] { error =>
                     for
                         current <- Var.get[Int]
                         _       <- Var.set(current + error.message.length)
@@ -1156,7 +1169,7 @@ class AbortTest extends Test:
 
             "with both Env and Var effects" in {
                 val computation: Int < Abort[CustomError] = Abort.fail(CustomError("Error"))
-                val recovered = Abort.recover[CustomError] { error =>
+                val recovered                             = Abort.recover[CustomError] { error =>
                     for
                         env    <- Env.get[String]
                         _      <- Var.update[Int](_ + env.length + error.message.length)
@@ -1178,7 +1191,7 @@ class AbortTest extends Test:
             "with onPanic using effects" in {
                 val ex                                    = new RuntimeException("Panic!")
                 val computation: Int < Abort[CustomError] = Abort.panic(ex)
-                val recovered = Abort.recover[CustomError](
+                val recovered                             = Abort.recover[CustomError](
                     onFail = _ => Env.get[Int],
                     onPanic = _ => Var.update[Int](_ + 1).andThen(Var.get[Int])
                 )(computation)
@@ -1205,7 +1218,7 @@ class AbortTest extends Test:
 
             "can be chained with other operations" in {
                 val computation: Int < Abort[CustomError] = Abort.fail(CustomError("Failed"))
-                val result = computation
+                val result                                = computation
                     .handle(Abort.recover[CustomError](_ => 42))
                     .map(_ * 2)
 
@@ -1215,7 +1228,7 @@ class AbortTest extends Test:
             "works with onPanic" in {
                 val ex                                    = new RuntimeException("Panic!")
                 val computation: Int < Abort[CustomError] = Abort.panic(ex)
-                val result = computation.handle(Abort.recover[CustomError](
+                val result                                = computation.handle(Abort.recover[CustomError](
                     onFail = _ => 42,
                     onPanic = _ => -1
                 ))
@@ -1323,7 +1336,7 @@ class AbortTest extends Test:
         }
 
         "with other effects" in {
-            val local = Local.init("default")
+            val local    = Local.init("default")
             val combined = Kyo.lift {
                 local.let("custom") {
                     Choice.eval(1, 2).flatMap { n =>
@@ -1345,7 +1358,7 @@ class AbortTest extends Test:
 
         "handles failures" in {
             val computation = Abort.fail(CustomError("Expected error"))
-            val recovered =
+            val recovered   =
                 Abort.recoverError[CustomError] {
                     error => s"Recovered: ${error.show}"
                 }(computation)
@@ -1356,7 +1369,7 @@ class AbortTest extends Test:
         "handles panics" in {
             val ex          = new RuntimeException("Panic message")
             val computation = Abort.panic(ex)
-            val recovered = Abort.recoverError[CustomError] {
+            val recovered   = Abort.recoverError[CustomError] {
                 error => s"Recovered: ${error.show}"
             }(computation)
 
@@ -1366,7 +1379,7 @@ class AbortTest extends Test:
         "doesn't affect successful computations" in {
             val computation: String < Abort[CustomError] = "success"
             var called                                   = false
-            val recovered =
+            val recovered                                =
                 Abort.recoverError[CustomError] { _ =>
                     called = true
                     "Should not be called"
@@ -1377,12 +1390,75 @@ class AbortTest extends Test:
         }
     }
 
+    "tap" - {
+        val boom = new RuntimeException("boom")
+
+        "fires on failure and re-raises the same failure" in {
+            val (seen, result) =
+                Var.runTuple(Maybe.empty[Throwable]) {
+                    Abort.run[Throwable](
+                        Abort.tap[Throwable](e => Var.set(Present(e): Maybe[Throwable]))(Abort.fail(boom): Int < Abort[Throwable])
+                    )
+                }.eval
+            assert(result == Result.Failure(boom))
+            assert(seen == Present(boom))
+        }
+
+        "does not fire on success" in {
+            val (seen, result) =
+                Var.runTuple(false) {
+                    Abort.run[Throwable](Abort.tap[Throwable](_ => Var.set(true))(42: Int < Abort[Throwable]))
+                }.eval
+            assert(result == Result.Success(42))
+            assert(!seen)
+        }
+
+        "an enclosing recover still sees the tapped failure (does not consume)" in {
+            val (order, result) =
+                Var.runTuple(List.empty[String]) {
+                    Abort.run[Nothing] {
+                        Abort.recover[Throwable](_ => Var.update[List[String]]("recover" :: _).andThen(-1)) {
+                            Abort.tap[Throwable](_ => Var.update[List[String]]("tap" :: _).unit)(Abort.fail(boom): Int < Abort[Throwable])
+                        }
+                    }
+                }.eval
+            assert(result == Result.Success(-1))
+            assert(order.reverse == List("tap", "recover"))
+        }
+    }
+
+    "tapError" - {
+        val boom = new RuntimeException("boom")
+
+        "fires on a panic too, and re-raises it" in {
+            val (seen, result) =
+                Var.runTuple(Maybe.empty[Result.Error[Throwable]]) {
+                    Abort.run[Throwable](Abort.tapError[Throwable](err => Var.set(Present(err): Maybe[Result.Error[Throwable]]))(
+                        Abort.panic(boom): Int < Abort[Throwable]
+                    ))
+                }.eval
+            assert(result == Result.Panic(boom))
+            assert(seen == Present(Result.Panic(boom)))
+        }
+
+        "fires on a typed failure with the full Error" in {
+            val (seen, result) =
+                Var.runTuple(Maybe.empty[Result.Error[String]]) {
+                    Abort.run[String](Abort.tapError[String](err => Var.set(Present(err): Maybe[Result.Error[String]]))(
+                        Abort.fail("domain"): Int < Abort[String]
+                    ))
+                }.eval
+            assert(result == Result.Failure("domain"))
+            assert(seen == Present(Result.Failure("domain")))
+        }
+    }
+
     "foldError" - {
         case class CustomError(message: String) derives CanEqual
 
         "handles success case" in {
             val computation: Int < Abort[CustomError] = 42
-            val result = Abort.foldError[CustomError](
+            val result                                = Abort.foldError[CustomError](
                 onSuccess = i => s"Success: $i",
                 onError = error => s"Error: ${error.show}"
             )(computation)
@@ -1392,7 +1468,7 @@ class AbortTest extends Test:
 
         "handles failure case" in {
             val computation = Abort.fail(CustomError("Expected error"))
-            val result = Abort.foldError[CustomError](
+            val result      = Abort.foldError[CustomError](
                 onSuccess = i => s"Success: $i",
                 onError = error => s"Error: ${error.show}"
             )(computation)
@@ -1403,7 +1479,7 @@ class AbortTest extends Test:
         "handles panic case" in {
             val ex          = new RuntimeException("Panic message")
             val computation = Abort.panic(ex)
-            val result = Abort.foldError[CustomError](
+            val result      = Abort.foldError[CustomError](
                 onSuccess = i => s"Success: $i",
                 onError = error => s"Error: ${error.show}"
             )(computation)
@@ -1413,13 +1489,110 @@ class AbortTest extends Test:
 
         "removes Abort from the effect set" in {
             val computation = Abort.fail(CustomError("Expected error"))
-            val folded = Abort.foldError[CustomError](
+            val folded      = Abort.foldError[CustomError](
                 onSuccess = i => s"Success: $i",
                 onError = _ => "Error handled"
             )(computation)
 
             val _: String < Any = folded
-            succeed
+            succeed("type-resolution compile check: foldError removes Abort from the effect row")
+        }
+    }
+
+    "ignore" - {
+        "discards Failure" in {
+            val result = Abort.run[Nothing](Abort.ignore[Ex1](Abort.fail(ex1))).eval
+            assert(result == Result.succeed(()))
+        }
+        "discards Success" in {
+            val result = Abort.run[Nothing](Abort.ignore[Ex1](42)).eval
+            assert(result == Result.succeed(()))
+        }
+        "propagates Panic" in {
+            val ex     = new Exception("boom")
+            val result = Abort.run[Nothing](Abort.ignore[Ex1](Abort.panic[Ex1](ex))).eval
+            assert(result == Result.panic(ex))
+        }
+        "union types - handles only specified type" in {
+            val result = Abort.run[Ex2](Abort.ignore[Ex1](Abort.fail[Ex1 | Ex2](ex2))).eval
+            assert(result == Result.fail(ex2))
+        }
+        "side effects run" in {
+            Var.run(0) {
+                Abort.ignore[Ex1](Var.update[Int](_ + 1).andThen(Abort.fail(ex1))).andThen(
+                    Var.get[Int].map(v => assert(v == 1))
+                )
+            }
+        }
+        "inside Abort.run yields Panic" in {
+            val ex     = new RuntimeException("panic")
+            val result = Abort.run[Nothing](Abort.ignore[Ex1](throw ex)).eval
+            assert(result.isPanic)
+        }
+    }
+
+    "loopUntil" - {
+        case class Done() derives CanEqual
+
+        "loops until abort" in {
+            Var.run(0) {
+                Abort.loopUntil[Done] {
+                    Var.update[Int](_ + 1).map { v =>
+                        if v >= 5 then Abort.fail(Done())
+                        else ()
+                    }
+                }.andThen(Var.get[Int].map(v => assert(v == 5)))
+            }
+        }
+        "first iteration aborts" in {
+            Var.run(0) {
+                Abort.loopUntil[String] {
+                    Var.update[Int](_ + 1).andThen(Abort.fail("stop"))
+                }.andThen(Var.get[Int].map(v => assert(v == 1)))
+            }
+        }
+        "propagates Panic" in {
+            val ex     = new RuntimeException("panic")
+            val result = Abort.run[Nothing](Abort.loopUntil[String](throw ex)).eval
+            assert(result.isPanic)
+        }
+        "works with generic error type" in {
+            Var.run(0) {
+                Abort.loopUntil[Int] {
+                    Var.update[Int](_ + 1).map { v =>
+                        if v >= 3 then Abort.fail(42)
+                        else ()
+                    }
+                }.andThen(Var.get[Int].map(v => assert(v == 3)))
+            }
+        }
+        "interacts with other effects" in {
+            Var.run(0) {
+                Env.run(10) {
+                    Abort.loopUntil[String] {
+                        Env.get[Int].map { env =>
+                            Var.update[Int](_ + 1).map { v =>
+                                if v >= env then Abort.fail("done")
+                                else ()
+                            }
+                        }
+                    }
+                }.andThen(Var.get[Int].map(v => assert(v == 10)))
+            }
+        }
+    }
+
+    "a Result carried as a value" - {
+        "a Result.Panic the body produces as a value is not taken as the run's own panic" in {
+            val ex                            = new Exception("carried")
+            val v: Result[Nothing, Int] < Any = Result.panic(ex)
+            val r                             = Abort.run[Throwable](v).eval
+            assert(r.isSuccess && r.exists(_.isPanic), s"the carried panic was taken as the run's own: $r")
+        }
+        "a Result.Failure the body produces as a value is not taken as the run's own failure" in {
+            val v: Result[String, Int] < Any = Result.fail("carried")
+            val r                            = Abort.run[String](v).eval
+            assert(r.isSuccess && r.exists(_.isFailure), s"the carried failure was taken as the run's own: $r")
         }
     }
 

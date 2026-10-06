@@ -33,7 +33,7 @@ class CanLiftTest extends Test:
         type MyAlias[A] = A
         implicitly[CanLift[MyAlias[Int]]]
         typeCheckFailure("implicitly[CanLift[MyAlias[Int < Any]]]")("may contain a nested effect computation")
-        succeed
+        // typeCheckFailure already counts as an assertion
     }
 
     "work with higher-kinded types" in {
@@ -56,7 +56,7 @@ class CanLiftTest extends Test:
         42.weakMethod
         "hello".weakMethod
         typeCheckFailure("(42: Int < Any).weakMethod")("may contain a nested effect computation")
-        succeed
+        // typeCheckFailure already counts as an assertion
     }
 
     "work with type bounds" in {
@@ -81,6 +81,17 @@ class CanLiftTest extends Test:
         type Intersection = A & B
         implicitly[CanLift[Intersection]]
         typeCheckFailure("implicitly[CanLift[A & (B < Any)]]")("may contain a nested effect computation.")
+        // typeCheckFailure already counts as an assertion
+    }
+
+    "case objects lift without reaching the macro" in {
+        implicitly[CanLift[Maybe.Absent.type]]
         succeed
+    }
+
+    "a kyo module object does not lift" in {
+        typeCheckFailure("implicitly[CanLift[kyo.kernel.ArrowEffect.type]]")(
+            "Cannot lift 'kyo.kernel.ArrowEffect$' to a 'ArrowEffect$ < S"
+        )
     }
 end CanLiftTest

@@ -2,7 +2,7 @@ package kyo
 
 import kernel.ArrowEffect
 import kyo.Result.*
-import kyo.Tag
+import kyo.internal.Reducible
 import kyo.kernel.Effect
 import scala.annotation.targetName
 
@@ -12,6 +12,7 @@ import scala.annotation.targetName
   * them in a composable way. It serves as a more powerful alternative to exceptions that integrates with Kyo's effect system.
   *
   * A computation using Abort can complete in three distinct ways:
+  *
   *   - `Success[A]`: The computation completes successfully with a value of type A
   *   - `Failure[E]`: An expected business/domain failure with a meaningful error value of type E
   *   - `Panic(ex: Throwable)`: An unexpected exception, similar to unchecked exceptions
@@ -198,30 +199,34 @@ object Abort:
         reduce: Reducible[Abort[ER]]
     ): B < (S & reduce.SReduced & S2) =
         reduce {
-            ArrowEffect.handleCatching[
+            // Aborts never resume, so every abort under the erased tag completes the region with its error regardless of acceptance,
+            // which the done clause decides outside the region, re-raising an unaccepted error to the enclosing handler. The
+            // `Result.succeed` wrap boxes a nested error into the success lane, impossible once error completion shares the region's
+            // value type; explicit type arguments split the erased row into `Abort[E]` and the remainder, which inference will not.
+            ArrowEffect.handleCont[
                 Const[Error[E]],
                 Const[Unit],
                 Abort[E],
                 Result[E, A],
                 B,
                 Abort[ER] & S,
-                Abort[ER] & S,
                 S2
             ](
                 erasedTag[E],
                 v.map(Result.succeed[E, A](_))
             )(
-                accept = [C] =>
-                    input =>
-                        input.isPanic ||
-                            input.asInstanceOf[Error[Any]].failure.exists(ct.accepts),
-                handle = [C] => (input, _) => input,
-                recover =
-                    case ct(fail) if ct <:< ConcreteTag[Throwable] =>
-                        continue(Result.Failure(fail))
-                    case fail =>
-                        continue(Result.Panic(fail)),
-                done = continue(_)
+                [C] => (input, _) => input,
+                {
+                    case err: Error[Any] @unchecked if !(err.isPanic || err.failure.exists(ct.accepts)) =>
+                        Abort.error(err.asInstanceOf[Error[ER]])
+                    case r =>
+                        continue(r.asInstanceOf[Result[E, A]])
+                },
+                ex =>
+                    Maybe(
+                        if ct <:< ConcreteTag[Throwable] && ct.accepts(ex) then continue(Result.Failure(ex.asInstanceOf[E]))
+                        else continue(Result.Panic(ex))
+                    )
             )
         }
 
@@ -290,6 +295,50 @@ object Abort:
         Abort.runWith[E](v):
             case Panic(thr)                      => throw thr
             case other: Partial[E, A] @unchecked => other
+
+    /** Ignores failures of type E, discarding both the success value and the failure value.
+      *
+      * Only failures of the specified type E are discarded. Panics are re-raised through Abort[Nothing]. This is useful when you want to
+      * run a computation purely for its side effects while suppressing expected failures.
+      *
+      * @param v
+      *   The computation to run and ignore failures from
+      * @return
+      *   A unit computation that discards both success and failure values, re-raising panics
+      */
+    def ignore[E](using
+        Frame
+    )[A, S, ER](
+        v: => A < (Abort[E | ER] & S)
+    )(
+        using
+        ct: ConcreteTag[E],
+        reduce: Reducible[Abort[ER]]
+    ): Unit < (S & reduce.SReduced & Abort[Nothing]) =
+        runWith[E](v):
+            case Success(_)   => ()
+            case Failure(_)   => ()
+            case panic: Panic => Abort.error(panic)
+
+    /** Loops forever until the body produces an Abort failure of type E.
+      *
+      * The loop runs until an Abort[E] short-circuits execution. The failure is discarded and Unit is returned. Panics are propagated.
+      *
+      * @param v
+      *   The loop body that may abort with E
+      * @return
+      *   Unit after the abort occurs
+      */
+    def loopUntil[E](using
+        Frame
+    )[S, ER](
+        v: => Unit < (Abort[E | ER] & S)
+    )(
+        using
+        ct: ConcreteTag[E],
+        reduce: Reducible[Abort[ER]]
+    ): Unit < (S & reduce.SReduced & Abort[Nothing]) =
+        ignore[E](kernel.Loop.forever(v))
 
     /** Recovers from an Abort failure by applying the provided function.
       *
@@ -381,6 +430,47 @@ object Abort:
         reduce: Reducible[Abort[ER]]
     ): (A | B) < (S & reduce.SReduced & Abort[Nothing]) =
         runWith[E](v)(_.foldError(identity, onError))
+
+    /** Observes an Abort failure with a side effect, then re-raises it unchanged.
+      *
+      * This is the non-consuming sibling of [[recover]]: `onFail` runs when the computation fails with an E, and the failure is
+      * re-raised afterwards so enclosing handlers still see it. Success values and panics pass through without evaluating `onFail`
+      * (see [[tapError]] to observe panics too). Use it for intermediate observation such as logging or metrics, where the failure's
+      * fate is decided elsewhere.
+      *
+      * @param onFail
+      *   A function invoked with the failure value of type E; its result is discarded
+      * @param v
+      *   The original computation that may fail
+      * @return
+      *   The original computation, with `onFail` run on an E failure and that failure re-raised unchanged
+      */
+    def tap[E](
+        using Frame
+    )[A, S, S2, ER](onFail: E => Any < S2)(v: => A < (Abort[E | ER] & S))(
+        using ConcreteTag[E]
+    ): A < (Abort[E | ER] & S & S2) =
+        recover[E](e => onFail(e).andThen(Abort.fail(e)))(v)
+
+    /** Observes an Abort failure or panic with a side effect, then re-raises it unchanged.
+      *
+      * This is the non-consuming sibling of [[recoverError]]: `onError` receives the full [[Result.Error]] (`Failure(e)` or
+      * `Panic(t)`) and then the error is re-raised so enclosing handlers still see it. Success values pass through without
+      * evaluating `onError`.
+      *
+      * @param onError
+      *   A function invoked with the Error value (either Failure[E] or Panic); its result is discarded
+      * @param v
+      *   The original computation that may fail or panic
+      * @return
+      *   The original computation, with `onError` run on an error and that error re-raised unchanged
+      */
+    def tapError[E](
+        using Frame
+    )[A, S, S2, ER](onError: Error[E] => Any < S2)(v: => A < (Abort[E | ER] & S))(
+        using ConcreteTag[E]
+    ): A < (Abort[E | ER] & S & S2) =
+        recoverError[E](err => onError(err).andThen(Abort.error(err)))(v)
 
     /** Recovers from an Abort failure by applying the provided function.
       *
@@ -506,10 +596,14 @@ object Abort:
     def catching[E](
         using Frame
     )[A, S](v: => A < S)(using ct: ConcreteTag[E]): A < (Abort[E] & S) =
-        Effect.catching(v) {
-            case ct(ex) => Abort.fail(ex)
-            case ex     => Abort.panic(ex)
-        }
+        ArrowEffect.handleCont(Tag[Catching], v: A < (Catching & Abort[E] & S))(
+            [C] => (_, cont) => cont(()),
+            a => a,
+            {
+                case ct(ex) => Maybe(Abort.fail(ex))
+                case ex     => Maybe(Abort.panic(ex))
+            }
+        )
 
     /** Catches exceptions of type E, transforms and converts them to Abort failures.
       *
@@ -527,10 +621,17 @@ object Abort:
     )[A, S, E1](f: E => E1)(v: => A < S)(
         using ct: ConcreteTag[E]
     ): A < (Abort[E1] & S) =
-        Effect.catching(v) {
-            case ct(ex) => Abort.fail(f(ex))
-            case ex     => Abort.panic(ex)
-        }
+        ArrowEffect.handleCont(Tag[Catching], v: A < (Catching & Abort[E1] & S))(
+            [C] => (_, cont) => cont(()),
+            a => a,
+            {
+                case ct(ex) => Maybe(Abort.fail(f(ex)))
+                case ex     => Maybe(Abort.panic(ex))
+            }
+        )
+
+    // The region `catching` installs, so a throw while building or running v reaches its recover arm; never suspended.
+    sealed private[kyo] trait Catching extends ArrowEffect[Const[Unit], Const[Unit]]
 
     /** Provides methods for working with literal error values in Abort effects.
       *

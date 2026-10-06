@@ -99,11 +99,11 @@ final class SelfCheck(
         )
 
     def runClient(): Unit = {
-        val cdl = new CountDownLatch(1)
+        val cdl  = new CountDownLatch(1)
         val task = Task {
             var acc       = 0d
-            val startTime = System.currentTimeMillis()
-            while (System.currentTimeMillis() - startTime < taskDurationMs)
+            val startTime = InternalClock.monotonicMillis()
+            while (InternalClock.monotonicMillis() - startTime < taskDurationMs)
                 acc += BigInt(2).pow(1000000).toDouble
             cdl.countDown()
         }
@@ -112,6 +112,7 @@ final class SelfCheck(
     }
 }
 
-object SelfCheck extends App {
-    new SelfCheck().run()
+object SelfCheck {
+    def main(args: Array[String]): Unit =
+        new SelfCheck().run()
 }

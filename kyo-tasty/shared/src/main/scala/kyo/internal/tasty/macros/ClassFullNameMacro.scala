@@ -1,0 +1,27 @@
+package kyo.internal.tasty.macros
+
+import scala.annotation.publicInBinary
+import scala.quoted.*
+
+/** Compile-time extraction of the dotted full name of `A`'s class symbol.
+  *
+  * Used by `Tasty.classFullName[A]`. Reads `TypeRepr.of[A].typeSymbol.fullName` so the result is the bare
+  * class full name, with type parameters stripped: `classFullName[List[Int]]` evaluates to
+  * `"scala.collection.immutable.List"`, not `"scala.collection.immutable.List[scala.Int]"`. The
+  * stripped form is what `Classpath.findClass`, `findClassLike`, and `findSymbol` accept.
+  *
+  * Public binary visibility supports inline callers while Scala access remains restricted to kyo.
+  */
+@publicInBinary
+private[kyo] object ClassFullNameMacro:
+
+    def impl[A](using Quotes, Type[A]): Expr[String] =
+        import quotes.reflect.*
+        // dealias so `Predef.String` -> `java.lang.String`, `Predef.Map[K, V]` -> `scala.collection.immutable.Map`, etc.
+        val typeSymbol = TypeRepr.of[A].dealias.typeSymbol
+        if !typeSymbol.exists then
+            report.errorAndAbort(s"Tasty.classFullName: type ${Type.show[A]} has no class symbol")
+        Expr(typeSymbol.fullName)
+    end impl
+
+end ClassFullNameMacro

@@ -1,0 +1,880 @@
+package kyo
+
+final class Json extends Codec:
+    def newWriter()(using Frame): Codec.Writer                  = kyo.internal.JsonWriter()
+    def newReader(input: Span[Byte])(using Frame): Codec.Reader =
+        kyo.internal.JsonReader(input)
+
+    private[kyo] def newReader(input: Span[Byte], maxNumberDigits: Int, maxExponent: Int)(using Frame): Codec.Reader =
+        val reader = kyo.internal.JsonReader(input)
+        reader.resetNumberLimits(maxNumberDigits, maxExponent)
+        reader
+    end newReader
+end Json
+
+/** Primary entry point for JSON serialization and schema generation.
+  *
+  * All methods are inline and require a `Schema[A]` instance in scope (typically provided by `Schema.derived` or an explicit given). The
+  * underlying encoding follows standard JSON conventions: case classes become objects, sealed traits/enums become discriminated `oneOf`,
+  * collections become arrays, and options/maybes become nullable values.
+  *
+  * @see
+  *   [[kyo.Schema]] for the type-driven serialization model
+  * @see
+  *   `Protobuf` in the kyo-schema-protobuf module for binary Protocol Buffers serialization
+  */
+object Json:
+    /** Default maximum nesting depth for objects/arrays in JSON decoding (DoS limit). */
+    inline val DefaultMaxDepth = Codec.DefaultMaxDepth
+
+    /** Default maximum number of entries in any single collection or object in JSON decoding (DoS limit). */
+    inline val DefaultMaxCollectionSize = Codec.DefaultMaxCollectionSize
+
+    /** Default maximum digits in a number's significand in JSON decoding (DoS limit). Converting a number costs time quadratic in its
+      * digits: measured at 1000 digits under 1 ms on JVM, JS, Native and Wasm, at 100000 digits 0.26 s (JVM) to 7.6 s (Native), and at
+      * 1000000 digits over 20 s on JVM. A number's scale, its fraction digits plus its exponent, must fit an `Int`, so a
+      * `maxNumberDigits` above `Int.MaxValue` less `maxExponent` fails the decode with a [[LimitExceededException]].
+      */
+    inline val DefaultMaxNumberDigits = 1000
+
+    /** Default, and largest accepted, maximum magnitude of a number's exponent in JSON decoding. `BigDecimal`'s scale is an `Int`, and
+      * the platforms disagree on the edge: JS, Native and Wasm reject an exponent past `Int.MaxValue`, and the JVM rejects
+      * `1e-2147483648`. A magnitude up to 999999999 keeps the scale inside `Int` on all four, measured. A larger `maxExponent` fails the
+      * decode with a [[LimitExceededException]].
+      */
+    inline val DefaultMaxExponent = 999999999
+
+    given Json = Json()
+
+    /** Line-delimited JSON (JSONL, also called NDJSON) support: one JSON value per line.
+      *
+      * Alias for [[kyo.JsonLines]], whose body lives in its own file. Reach it as `Json.Lines.Framer`,
+      * `Json.Lines.Line`, `Json.Lines.Pending`, `Json.Lines.Framed`, and `Json.Lines.DefaultMaxLineSize`.
+      */
+    export kyo.JsonLines as Lines
+
+    /** Encodes a value of type A to a JSON string.
+      *
+      * Takes `Json` as an explicit parameter, like [[decode]] does, rather than summoning it inside the body: a plain `summon[Json]`
+      * written inside an `inline def`'s body is resolved once, when this method is type-checked, not fresh at each call site after
+      * inlining. An explicit `using` parameter is resolved per call, so a caller-scoped `Json` given is honored the same way `decode`
+      * already honors one.
+      *
+      * `json` is the last parameter, after `schema` and `frame`, rather than the first: call sites across the codebase already supply
+      * `schema` explicitly as `Json.encode(v)(using someSchema)`, relying on Scala's using-clause rule that unsupplied parameters must
+      * be a trailing suffix. Putting the new parameter first would have shifted that existing explicit argument onto it and broken
+      * every such call site with a type mismatch; putting it last keeps every existing call site's argument list a valid prefix, with
+      * `frame` and `json` both still resolved implicitly when left unsupplied.
+      *
+      * @param value
+      *   the value to encode
+      * @return
+      *   the JSON string representation
+      */
+    inline def encode[A](value: A)(using schema: Schema[A], frame: Frame, json: Json): String =
+        val w = json.newWriter()
+        schema.writeTo(value, w)
+        new String(w.result().toArray, java.nio.charset.StandardCharsets.UTF_8)
+    end encode
+
+    /** Encodes a value of type A to raw UTF-8 JSON bytes.
+      *
+      * Takes `Json` as an explicit trailing parameter for the same reason [[encode]] does.
+      *
+      * @param value
+      *   the value to encode
+      * @return
+      *   the JSON bytes
+      */
+    inline def encodeBytes[A](value: A)(using schema: Schema[A], frame: Frame, json: Json): Span[Byte] =
+        val w = json.newWriter()
+        schema.writeTo(value, w)
+        w.result()
+    end encodeBytes
+
+    /** Decodes a JSON string into a value of type A.
+      *
+      * @param input
+      *   the JSON string to decode
+      * @param maxDepth
+      *   maximum nesting depth for objects/arrays (default `DefaultMaxDepth`)
+      * @param maxCollectionSize
+      *   maximum number of entries in maps, sets, or arrays (default `DefaultMaxCollectionSize`)
+      * @param maxNumberDigits
+      *   maximum digits in a number's significand (default `DefaultMaxNumberDigits`)
+      * @param maxExponent
+      *   maximum magnitude of a number's exponent, at most `DefaultMaxExponent` (default `DefaultMaxExponent`)
+      * @return
+      *   the decoded value, or a DecodeException if the input is malformed or does not match the schema
+      */
+    def decode[A](
+        input: String,
+        maxDepth: Int = DefaultMaxDepth,
+        maxCollectionSize: Int = DefaultMaxCollectionSize,
+        maxNumberDigits: Int = DefaultMaxNumberDigits,
+        maxExponent: Int = DefaultMaxExponent
+    )(using json: Json, schema: Schema[A], frame: Frame): Result[DecodeException, A] =
+        decodeWithin[A](
+            json,
+            Span.from(input.getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+            maxDepth,
+            maxCollectionSize,
+            maxNumberDigits,
+            maxExponent
+        )
+    end decode
+
+    /** Decodes raw UTF-8 JSON bytes into a value of type A.
+      *
+      * @param input
+      *   the raw UTF-8 JSON bytes to decode
+      * @param maxDepth
+      *   maximum nesting depth for objects/arrays (default `DefaultMaxDepth`)
+      * @param maxCollectionSize
+      *   maximum number of entries in maps, sets, or arrays (default `DefaultMaxCollectionSize`)
+      * @param maxNumberDigits
+      *   maximum digits in a number's significand (default `DefaultMaxNumberDigits`)
+      * @param maxExponent
+      *   maximum magnitude of a number's exponent, at most `DefaultMaxExponent` (default `DefaultMaxExponent`)
+      * @return
+      *   the decoded value, or a DecodeException if the input is malformed or does not match the schema
+      */
+    def decodeBytes[A](
+        input: Span[Byte],
+        maxDepth: Int = DefaultMaxDepth,
+        maxCollectionSize: Int = DefaultMaxCollectionSize,
+        maxNumberDigits: Int = DefaultMaxNumberDigits,
+        maxExponent: Int = DefaultMaxExponent
+    )(using json: Json, schema: Schema[A], frame: Frame): Result[DecodeException, A] =
+        decodeWithin[A](json, input, maxDepth, maxCollectionSize, maxNumberDigits, maxExponent)
+    end decodeBytes
+
+    /** Every JSON decode entry point routes through here, so the number limits are checked and handed to the reader in one place. */
+    private[kyo] def decodeWithin[A](
+        json: Json,
+        input: Span[Byte],
+        maxDepth: Int,
+        maxCollectionSize: Int,
+        maxNumberDigits: Int,
+        maxExponent: Int
+    )(using Schema[A], Frame): Result[DecodeException, A] =
+        val digitCeiling = Int.MaxValue - math.max(maxExponent, 0)
+        if maxExponent > DefaultMaxExponent then
+            Result.fail(LimitExceededException("Exponent limit", maxExponent, DefaultMaxExponent))
+        else if maxNumberDigits > digitCeiling then
+            Result.fail(LimitExceededException("Number digit limit", maxNumberDigits, digitCeiling))
+        else
+            Codec.readFully[A](json.newReader(input, maxNumberDigits, maxExponent), maxDepth, maxCollectionSize)
+        end if
+    end decodeWithin
+
+    /** Generates a JSON Schema for type A, enriched with runtime Schema metadata.
+      *
+      * Requires a `Schema[A]` in scope. The returned schema incorporates documentation, field descriptions, deprecation markers, examples,
+      * validation constraints, dropped fields, and renamed fields registered on the Schema.
+      *
+      * @param schema
+      *   the Schema[A] providing runtime metadata and structure
+      * @return
+      *   a JsonSchema derived from the Schema's structure and enriched with all metadata
+      */
+    def jsonSchema[A](using schema: Schema[A]): JsonSchema =
+        val base = JsonSchema.fromStructure(schema.structure)
+        base match
+            case obj: JsonSchema.Obj =>
+                Json.enrichJsonSchemaObj(
+                    obj,
+                    schema.documentation,
+                    schema.fieldDocs,
+                    schema.fieldDeprecated,
+                    if schema.examples.isEmpty then Chunk.empty
+                    else schema.examples.map(kyo.internal.declaredValue(schema, _)),
+                    schema.constraints,
+                    schema.droppedFields,
+                    schema.wireLayout.renamedKeys
+                )
+            case other => other
+        end match
+    end jsonSchema
+
+    import scala.annotation.publicInBinary
+    @publicInBinary private[kyo] def enrichJsonSchemaObj(
+        obj: JsonSchema.Obj,
+        doc: Maybe[String],
+        fieldDocs: Map[Seq[String], String],
+        fieldDeprecated: Map[Seq[String], String],
+        examples: Chunk[Structure.Value],
+        constraints: Seq[Schema.Constraint],
+        droppedFields: Set[String],
+        renamedFields: Map[String, String]
+    ): JsonSchema.Obj =
+        kyo.internal.JsonSchemaEnricher.enrichObj(
+            obj,
+            doc,
+            fieldDocs,
+            fieldDeprecated,
+            examples,
+            constraints,
+            droppedFields,
+            renamedFields
+        )
+    end enrichJsonSchemaObj
+
+    /** JSON Schema representation generated from Scala types.
+      *
+      * Provides compile-time JSON Schema generation from case classes, sealed traits/enums, primitives, and container types. The schema
+      * follows JSON Schema Draft 2020-12 conventions.
+      */
+    enum JsonSchema derives CanEqual:
+        /** Object schema with named properties and required field list. */
+        case Obj(
+            properties: List[(String, JsonSchema)],
+            required: List[String],
+            additionalProperties: Maybe[JsonSchema] = Maybe.empty,
+            description: Maybe[String] = Maybe.empty,
+            deprecated: Maybe[Boolean] = Maybe.empty,
+            examples: Chunk[Structure.Value] = Chunk.empty
+        )
+
+        /** Array schema with element type. */
+        case Arr(
+            items: JsonSchema,
+            minItems: Maybe[Int] = Maybe.empty,
+            maxItems: Maybe[Int] = Maybe.empty,
+            uniqueItems: Maybe[Boolean] = Maybe.empty,
+            description: Maybe[String] = Maybe.empty
+        )
+
+        /** String type. */
+        case Str(
+            minLength: Maybe[Int] = Maybe.empty,
+            maxLength: Maybe[Int] = Maybe.empty,
+            pattern: Maybe[String] = Maybe.empty,
+            format: Maybe[String] = Maybe.empty,
+            description: Maybe[String] = Maybe.empty
+        )
+
+        /** Numeric type (floating-point). */
+        case Num(
+            minimum: Maybe[Double] = Maybe.empty,
+            exclusiveMinimum: Maybe[Double] = Maybe.empty,
+            maximum: Maybe[Double] = Maybe.empty,
+            exclusiveMaximum: Maybe[Double] = Maybe.empty,
+            description: Maybe[String] = Maybe.empty
+        )
+
+        /** Integer type. */
+        case Integer(
+            minimum: Maybe[Long] = Maybe.empty,
+            exclusiveMinimum: Maybe[Long] = Maybe.empty,
+            maximum: Maybe[Long] = Maybe.empty,
+            exclusiveMaximum: Maybe[Long] = Maybe.empty,
+            description: Maybe[String] = Maybe.empty
+        )
+
+        /** Boolean type. */
+        case Bool(description: Maybe[String] = Maybe.empty)
+
+        /** Null type (represents the JSON null value; maps to Unit in Scala). */
+        case Null(description: Maybe[String] = Maybe.empty)
+
+        /** Nullable wrapper (JSON Schema `oneOf` with null). */
+        case Nullable(inner: JsonSchema, description: Maybe[String] = Maybe.empty)
+
+        /** Sum type represented as `oneOf` with discriminated variants. */
+        case OneOf(variants: List[(String, JsonSchema)], description: Maybe[String] = Maybe.empty)
+    end JsonSchema
+
+    object JsonSchema:
+
+        /** Schema for [[JsonSchema]] emitting standard JSON Schema Draft 2020-12 wire shape.
+          *
+          * The auto-derived sealed-trait Schema would emit kyo-schema's tagged-union form (`{"Obj":{...}}`,
+          * `{"Str":{...}}`), which is not what the JSON Schema spec, MCP protocol, or any external consumer expects. This explicit
+          * Schema emits `{"type":"object","properties":{...},"required":[...]}` and the symmetric primitive shapes, and on read
+          * dispatches on the `type` field (object/array/string/number/integer/boolean/null) or recognises `oneOf` for unions.
+          */
+        given jsonSchemaSchema: Schema[JsonSchema] =
+            import scala.annotation.publicInBinary
+            new Schema[JsonSchema](Seq.empty):
+                @publicInBinary private[kyo] def serializeWrite(value: JsonSchema, writer: Codec.Writer): Unit =
+                    writeJsonSchema(value, writer)
+                @publicInBinary private[kyo] def serializeRead(reader: Codec.Reader): JsonSchema =
+                    readJsonSchema(reader)
+                @publicInBinary private[kyo] def getter(value: JsonSchema): Maybe[Any]            = Maybe(value)
+                @publicInBinary private[kyo] def setter(value: JsonSchema, next: Any): JsonSchema =
+                    next match
+                        case sv: JsonSchema => sv
+                        case _              => value
+                private lazy val _structure: Structure.Type =
+                    Structure.Type.Open(Tag[JsonSchema].asInstanceOf[Tag[Any]])
+                override def structure: Structure.Type = _structure
+            end new
+        end jsonSchemaSchema
+
+        private def writeJsonSchema(value: JsonSchema, writer: Codec.Writer): Unit =
+            import scala.collection.mutable.ArrayBuffer
+            // Build the (name, value) entries up-front so we can pass the exact size to objectStart and Maybe-elide
+            // absent fields without re-walking the case class.
+            val entries: ArrayBuffer[(String, () => Unit)] = ArrayBuffer.empty
+            value match
+                case obj: Obj =>
+                    discard(entries.addOne("type" -> (() => writer.string("object"))))
+                    // Always emit `properties` (even empty) so the wire shape matches the JSON-Schema
+                    // record validators (e.g. MCP elicitation/sampling hosts) that expect the field to
+                    // exist on every `type: object`. Omitting it on empty objects produces `{"type":"object"}`
+                    // which strict Zod-style record schemas reject as `properties: undefined`.
+                    discard(entries.addOne("properties" -> { () =>
+                        writer.objectStart("", obj.properties.size)
+                        obj.properties.foreach { (name, sub) =>
+                            writer.fieldBytes(name.getBytes(java.nio.charset.StandardCharsets.UTF_8), 0)
+                            writeJsonSchema(sub, writer)
+                        }
+                        writer.objectEnd()
+                    }))
+                    if obj.required.nonEmpty then
+                        discard(entries.addOne("required" -> { () =>
+                            writer.arrayStart(obj.required.size)
+                            obj.required.foreach(writer.string)
+                            writer.arrayEnd()
+                        }))
+                    end if
+                    obj.additionalProperties match
+                        case Maybe.Present(ap) =>
+                            discard(entries.addOne("additionalProperties" -> (() => writeJsonSchema(ap, writer))))
+                        case _ => ()
+                    end match
+                    obj.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                    obj.deprecated match
+                        case Maybe.Present(d) => discard(entries.addOne("deprecated" -> (() => writer.boolean(d))))
+                        case _                => ()
+                    if obj.examples.nonEmpty then
+                        discard(entries.addOne("examples" -> { () =>
+                            writer.arrayStart(obj.examples.size)
+                            obj.examples.foreach(ex => Schema.writeStructureValue(writer, ex))
+                            writer.arrayEnd()
+                        }))
+                    end if
+                case arr: Arr =>
+                    discard(entries.addOne("type" -> (() => writer.string("array"))))
+                    discard(entries.addOne("items" -> (() => writeJsonSchema(arr.items, writer))))
+                    arr.minItems match
+                        case Maybe.Present(n) => discard(entries.addOne("minItems" -> (() => writer.int(n))))
+                        case _                => ()
+                    arr.maxItems match
+                        case Maybe.Present(n) => discard(entries.addOne("maxItems" -> (() => writer.int(n))))
+                        case _                => ()
+                    arr.uniqueItems match
+                        case Maybe.Present(b) => discard(entries.addOne("uniqueItems" -> (() => writer.boolean(b))))
+                        case _                => ()
+                    arr.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case str: Str =>
+                    discard(entries.addOne("type" -> (() => writer.string("string"))))
+                    str.minLength match
+                        case Maybe.Present(n) => discard(entries.addOne("minLength" -> (() => writer.int(n))))
+                        case _                => ()
+                    str.maxLength match
+                        case Maybe.Present(n) => discard(entries.addOne("maxLength" -> (() => writer.int(n))))
+                        case _                => ()
+                    str.pattern match
+                        case Maybe.Present(p) => discard(entries.addOne("pattern" -> (() => writer.string(p))))
+                        case _                => ()
+                    str.format match
+                        case Maybe.Present(f) => discard(entries.addOne("format" -> (() => writer.string(f))))
+                        case _                => ()
+                    str.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case num: Num =>
+                    discard(entries.addOne("type" -> (() => writer.string("number"))))
+                    num.minimum match
+                        case Maybe.Present(n) => discard(entries.addOne("minimum" -> (() => writer.double(n))))
+                        case _                => ()
+                    num.exclusiveMinimum match
+                        case Maybe.Present(n) => discard(entries.addOne("exclusiveMinimum" -> (() => writer.double(n))))
+                        case _                => ()
+                    num.maximum match
+                        case Maybe.Present(n) => discard(entries.addOne("maximum" -> (() => writer.double(n))))
+                        case _                => ()
+                    num.exclusiveMaximum match
+                        case Maybe.Present(n) => discard(entries.addOne("exclusiveMaximum" -> (() => writer.double(n))))
+                        case _                => ()
+                    num.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case i: Integer =>
+                    discard(entries.addOne("type" -> (() => writer.string("integer"))))
+                    i.minimum match
+                        case Maybe.Present(n) => discard(entries.addOne("minimum" -> (() => writer.long(n))))
+                        case _                => ()
+                    i.exclusiveMinimum match
+                        case Maybe.Present(n) => discard(entries.addOne("exclusiveMinimum" -> (() => writer.long(n))))
+                        case _                => ()
+                    i.maximum match
+                        case Maybe.Present(n) => discard(entries.addOne("maximum" -> (() => writer.long(n))))
+                        case _                => ()
+                    i.exclusiveMaximum match
+                        case Maybe.Present(n) => discard(entries.addOne("exclusiveMaximum" -> (() => writer.long(n))))
+                        case _                => ()
+                    i.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case b: Bool =>
+                    discard(entries.addOne("type" -> (() => writer.string("boolean"))))
+                    b.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case n: Null =>
+                    discard(entries.addOne("type" -> (() => writer.string("null"))))
+                    n.description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case Nullable(inner, description) =>
+                    // JSON Schema convention: nullable as oneOf with the inner schema and the null type.
+                    discard(entries.addOne("oneOf" -> { () =>
+                        writer.arrayStart(2)
+                        writeJsonSchema(inner, writer)
+                        writeJsonSchema(Null(), writer)
+                        writer.arrayEnd()
+                    }))
+                    description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                case OneOf(variants, description) =>
+                    description match
+                        case Maybe.Present(d) => discard(entries.addOne("description" -> (() => writer.string(d))))
+                        case _                => ()
+                    discard(entries.addOne("oneOf" -> { () =>
+                        writer.arrayStart(variants.size)
+                        variants.foreach { (name, sub) =>
+                            // Variant schemas wrap each sub in a single-property object whose key is the variant name; this
+                            // matches MCP's discriminated-union convention for tool / prompt argument schemas.
+                            writer.objectStart("", 1)
+                            writer.fieldBytes(name.getBytes(java.nio.charset.StandardCharsets.UTF_8), 0)
+                            writeJsonSchema(sub, writer)
+                            writer.objectEnd()
+                        }
+                        writer.arrayEnd()
+                    }))
+            end match
+            writer.objectStart("", entries.size)
+            entries.foreach { (name, emit) =>
+                writer.fieldBytes(name.getBytes(java.nio.charset.StandardCharsets.UTF_8), 0)
+                emit()
+            }
+            writer.objectEnd()
+        end writeJsonSchema
+
+        private def readJsonSchema(reader: Codec.Reader): JsonSchema =
+            // Capture the raw value tree, then route by the `type` discriminator (or `oneOf`). Avoids juggling Reader cursor
+            // state across the variant-specific branches.
+            val sv = reader match
+                case ir: Codec.IntrospectingReader => ir.readStructure()
+                case other                         =>
+                    throw SchemaNotSerializableException(
+                        s"Schema[Json.JsonSchema] requires a self-describing reader (such as JSON or YAML); got ${other.getClass.getSimpleName}"
+                    )(using reader.frame)
+            fromStructureValue(sv)
+        end readJsonSchema
+
+        private def fromStructureValue(sv: Structure.Value): JsonSchema =
+            sv match
+                case Structure.Value.Record(fields) =>
+                    val byName = fields.iterator.toMap
+                    byName.get("type") match
+                        case Some(Structure.Value.Str("object"))  => fromObj(byName)
+                        case Some(Structure.Value.Str("array"))   => fromArr(byName)
+                        case Some(Structure.Value.Str("string"))  => fromStr(byName)
+                        case Some(Structure.Value.Str("number"))  => fromNum(byName)
+                        case Some(Structure.Value.Str("integer")) => fromInteger(byName)
+                        case Some(Structure.Value.Str("boolean")) => fromBool(byName)
+                        case Some(Structure.Value.Str("null"))    => fromNull(byName)
+                        case _                                    =>
+                            byName.get("oneOf") match
+                                case Some(Structure.Value.Sequence(elems)) =>
+                                    val description = byName.get("description") match
+                                        case Some(Structure.Value.Str(s)) => Maybe(s)
+                                        case _                            => Maybe.empty
+                                    withDescription(fromOneOf(elems), description)
+                                case _ =>
+                                    // Treat untyped records as opaque Obj with no declared properties; downstream code may
+                                    // populate properties via `additionalProperties` or treat as Any.
+                                    Obj(properties = List.empty, required = List.empty)
+                            end match
+                    end match
+                case other =>
+                    bug(s"JsonSchema.fromStructureValue: unexpected structure node $other")
+        end fromStructureValue
+
+        private def fromObj(byName: Map[String, Structure.Value]): Obj =
+            val properties = byName.get("properties") match
+                case Some(Structure.Value.Record(props)) =>
+                    props.iterator.map { case (name, sub) =>
+                        (name, fromStructureValue(sub))
+                    }.toList
+                case _ => List.empty[(String, JsonSchema)]
+            val required = byName.get("required") match
+                case Some(Structure.Value.Sequence(elems)) =>
+                    elems.iterator.collect { case Structure.Value.Str(s) => s }.toList
+                case _ => List.empty[String]
+            val additionalProperties = byName.get("additionalProperties") match
+                case Some(sv: Structure.Value) => Maybe(fromStructureValue(sv))
+                case _                         => Maybe.empty
+            val description = byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            val deprecated = byName.get("deprecated") match
+                case Some(Structure.Value.Bool(b)) => Maybe(b)
+                case _                             => Maybe.empty
+            val examples = byName.get("examples") match
+                case Some(Structure.Value.Sequence(elems)) => Chunk.from(elems.iterator.toSeq)
+                case _                                     => Chunk.empty[Structure.Value]
+            Obj(properties, required, additionalProperties, description, deprecated, examples)
+        end fromObj
+
+        private def fromArr(byName: Map[String, Structure.Value]): Arr =
+            val items = byName.get("items") match
+                case Some(sv: Structure.Value) => fromStructureValue(sv)
+                case _                         => Obj(List.empty, List.empty)
+            val minItems = byName.get("minItems") match
+                case Some(Structure.Value.Integer(n)) => Maybe(n.toInt)
+                case _                                => Maybe.empty
+            val maxItems = byName.get("maxItems") match
+                case Some(Structure.Value.Integer(n)) => Maybe(n.toInt)
+                case _                                => Maybe.empty
+            val uniqueItems = byName.get("uniqueItems") match
+                case Some(Structure.Value.Bool(b)) => Maybe(b)
+                case _                             => Maybe.empty
+            val description = byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            Arr(items, minItems, maxItems, uniqueItems, description)
+        end fromArr
+
+        private def fromBool(byName: Map[String, Structure.Value]): Bool =
+            byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Bool(Maybe(s))
+                case _                            => Bool()
+
+        private def fromNull(byName: Map[String, Structure.Value]): Null =
+            byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Null(Maybe(s))
+                case _                            => Null()
+
+        private def fromStr(byName: Map[String, Structure.Value]): Str =
+            val minLength = byName.get("minLength") match
+                case Some(Structure.Value.Integer(n)) => Maybe(n.toInt)
+                case _                                => Maybe.empty
+            val maxLength = byName.get("maxLength") match
+                case Some(Structure.Value.Integer(n)) => Maybe(n.toInt)
+                case _                                => Maybe.empty
+            val pattern = byName.get("pattern") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            val format = byName.get("format") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            val description = byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            Str(minLength, maxLength, pattern, format, description)
+        end fromStr
+
+        private def numericMaybe(sv: Option[Structure.Value]): Maybe[Double] =
+            sv match
+                case Some(Structure.Value.Decimal(d)) => Maybe(d)
+                case Some(Structure.Value.Integer(n)) => Maybe(n.toDouble)
+                case _                                => Maybe.empty
+
+        private def integerMaybe(sv: Option[Structure.Value]): Maybe[Long] =
+            sv match
+                case Some(Structure.Value.Integer(n)) => Maybe(n)
+                case Some(Structure.Value.Decimal(d)) => Maybe(d.toLong)
+                case _                                => Maybe.empty
+
+        private def fromNum(byName: Map[String, Structure.Value]): Num =
+            val description = byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            Num(
+                numericMaybe(byName.get("minimum")),
+                numericMaybe(byName.get("exclusiveMinimum")),
+                numericMaybe(byName.get("maximum")),
+                numericMaybe(byName.get("exclusiveMaximum")),
+                description
+            )
+        end fromNum
+
+        private def fromInteger(byName: Map[String, Structure.Value]): Integer =
+            val description = byName.get("description") match
+                case Some(Structure.Value.Str(s)) => Maybe(s)
+                case _                            => Maybe.empty
+            Integer(
+                integerMaybe(byName.get("minimum")),
+                integerMaybe(byName.get("exclusiveMinimum")),
+                integerMaybe(byName.get("maximum")),
+                integerMaybe(byName.get("exclusiveMaximum")),
+                description
+            )
+        end fromInteger
+
+        /** Decodes a JSON Schema `oneOf` array into a `JsonSchema`.
+          *
+          * Three branches:
+          *   1. All elements are single-field named-variant wrappers (`{"VariantName": {inner}}`): emit `OneOf` with the original variant
+          *      names. This is the round-trip path for `JsonSchema` values produced by this codec's `writeJsonSchema`.
+          *   2. Exactly two elements, one being `{"type":"null"}`: emit `Nullable(other)`.
+          *   3. Otherwise: foreign-schema input whose `oneOf` elements are direct sub-schemas with no encapsulating name. The variant names
+          *      do not exist in the source; synthesise `"variant0"`, `"variant1"`, ... so callers still receive `N` variants of the right
+          *      shape. The synthetic names are deterministic from position and never collide with a kyo-emitted `oneOf` (which always
+          *      lands in branch 1).
+          */
+        private def fromOneOf(elems: Chunk[Structure.Value]): JsonSchema =
+            // Determine whether the elements are named-variant wrappers (MCP discriminated-union style) or direct
+            // sub-schemas (Nullable style: `[{inner}, {"type":"null"}]`).
+            // A named-variant wrapper has exactly one field whose value is itself a Record (another JSON Schema object).
+            // A direct sub-schema is a Record that carries a "type" or "oneOf" key as its own descriptor.
+            val isNamedVariantWrapper: Structure.Value => Boolean = {
+                case Structure.Value.Record(fields) if fields.size == 1 =>
+                    fields.head._2.isInstanceOf[Structure.Value.Record]
+                case _ => false
+            }
+            val allNamedVariants = elems.iterator.forall(isNamedVariantWrapper)
+            if allNamedVariants && elems.nonEmpty then
+                val variants = elems.iterator.map {
+                    case Structure.Value.Record(fields) =>
+                        val (name, sub) = fields.head
+                        name -> fromStructureValue(sub)
+                    case other => bug(s"JsonSchema.fromOneOf: unexpected variant wrapper node $other")
+                }.toList
+                OneOf(variants)
+            else
+                // Direct sub-schemas: detect the Nullable pattern (exactly 2 elements, one of which is the null type).
+                val isNullSchema: Structure.Value => Boolean = {
+                    case Structure.Value.Record(fields) =>
+                        fields.iterator.exists { case ("type", Structure.Value.Str("null")) => true; case _ => false }
+                    case _ => false
+                }
+                val nonNullElems = elems.iterator.filterNot(isNullSchema).toList
+                val hasNull      = elems.iterator.exists(isNullSchema)
+                if hasNull && nonNullElems.lengthCompare(1) == 0 then
+                    Nullable(fromStructureValue(nonNullElems.head))
+                else
+                    // Foreign-schema input: the `oneOf` carries direct sub-schemas with no carried name, so no name can be recovered.
+                    // Synthesise positional names so callers still receive N variants of the right shape; kyo-emitted `oneOf` arrays
+                    // always wrap variants in named records (branch 1 above) and therefore never reach this branch.
+                    val variants = elems.iterator.zipWithIndex.map { (sv, i) =>
+                        s"variant$i" -> fromStructureValue(sv)
+                    }.toList
+                    OneOf(variants)
+                end if
+            end if
+        end fromOneOf
+
+        /** Generates a `JsonSchema` for type `A` at compile time.
+          *
+          * Supports:
+          *   - Primitives: Int, Long, Short, Byte -> Integer; Double, Float -> Num; String -> Str; Boolean -> Bool
+          *   - Case classes -> Obj with properties for each field
+          *   - Sealed traits/enums -> OneOf with variant schemas
+          *   - List, Vector, Set, Seq, Chunk -> Arr
+          *   - Option[X] -> Nullable
+          */
+        inline def from[A](using s: Schema[A]): JsonSchema = fromStructure(s.structure)
+
+        // Attaches a field's @doc to its property node's description; every JsonSchema case carries one.
+        private def withDescription(node: JsonSchema, doc: Maybe[String]): JsonSchema =
+            doc match
+                case Maybe.Present(d) =>
+                    node match
+                        case o: Obj      => o.copy(description = Maybe(d))
+                        case a: Arr      => a.copy(description = Maybe(d))
+                        case s: Str      => s.copy(description = Maybe(d))
+                        case n: Num      => n.copy(description = Maybe(d))
+                        case i: Integer  => i.copy(description = Maybe(d))
+                        case b: Bool     => b.copy(description = Maybe(d))
+                        case n: Null     => n.copy(description = Maybe(d))
+                        case n: Nullable => n.copy(description = Maybe(d))
+                        case o: OneOf    => o.copy(description = Maybe(d))
+                case _ => node
+
+        /** Derives a JsonSchema from a Structure.Type at runtime. */
+        private[kyo] def fromStructure(rt: Structure.Type): JsonSchema =
+            fromStructure(rt, Set.empty)
+
+        private def fromStructure(rt: Structure.Type, seen: Set[String]): JsonSchema =
+            rt match
+                case p: Structure.Type.Primitive =>
+                    p.kind match
+                        case Structure.PrimitiveKind.Int | Structure.PrimitiveKind.Long |
+                            Structure.PrimitiveKind.Short | Structure.PrimitiveKind.Byte |
+                            Structure.PrimitiveKind.BigInt => Integer()
+                        case Structure.PrimitiveKind.Double | Structure.PrimitiveKind.Float |
+                            Structure.PrimitiveKind.BigDecimal => Num()
+                        case Structure.PrimitiveKind.String | Structure.PrimitiveKind.Char |
+                            Structure.PrimitiveKind.Bytes | Structure.PrimitiveKind.Instant |
+                            Structure.PrimitiveKind.Duration => Str()
+                        case Structure.PrimitiveKind.Boolean => Bool()
+                        // Unit maps to an empty object on the wire (see `Schema.unitSchema`). Describing it as
+                        // `{"type":"null"}` here would mismatch the actual wire shape AND violate consumers
+                        // that require an object-typed schema (e.g. MCP tool `inputSchema`).
+                        case Structure.PrimitiveKind.Unit => Obj(List.empty, List.empty)
+
+                case Structure.Type.Optional(_, _, inner) =>
+                    Nullable(fromStructure(inner, seen))
+
+                case Structure.Type.Collection(_, _, elem) =>
+                    Arr(fromStructure(elem, seen))
+
+                case Structure.Type.Product(name, _, _, fields, _) =>
+                    if seen.contains(name) then Obj(List.empty, List.empty)
+                    else
+                        val newSeen    = seen + name
+                        val properties = fields.toList.map { f =>
+                            (f.name, withDescription(fromStructure(f.fieldType, newSeen), f.doc))
+                        }
+                        val required = fields.toList.collect {
+                            case f if f.default.isEmpty && !f.optional => f.name
+                        }
+                        Obj(properties, required)
+
+                case Structure.Type.Sum(name, _, _, variants, _, _) =>
+                    if seen.contains(name) then Obj(List.empty, List.empty)
+                    else
+                        val newSeen     = seen + name
+                        val variantList = variants.toList.map { v =>
+                            (v.name, fromStructure(v.variantType, newSeen))
+                        }
+                        OneOf(variantList)
+
+                case Structure.Type.Mapping(_, _, keyType, valueType, form) =>
+                    form match
+                        case Structure.MapForm.Object =>
+                            Obj(
+                                properties = List.empty,
+                                required = List.empty,
+                                additionalProperties = Maybe(fromStructure(valueType, seen))
+                            )
+                        case Structure.MapForm.Pairs =>
+                            Arr(Obj(
+                                properties = List("key" -> fromStructure(keyType, seen), "value" -> fromStructure(valueType, seen)),
+                                required = List("key", "value")
+                            ))
+
+                case _: Structure.Type.Open =>
+                    // The carrying Schema accepts arbitrary JSON; describe it as the JSON Schema
+                    // "any object" shape. This is byte-identical to the Unit arm above by design:
+                    // both empty-properties Obj renderings are the Draft 2020-12 encoding of
+                    // "no constraints". Downstream Scala consumers distinguish via the structure
+                    // tree's variant, not via the wire bytes.
+                    Obj(List.empty, List.empty)
+        end fromStructure
+
+        /** Recovers a `Structure.Type` from a JsonSchema: the runtime inverse of [[fromStructure]].
+          *
+          * A schema that only exists at runtime carries no Scala type, so nothing can validate a value
+          * against it: an MCP server's tool `inputSchema` and a hand-built descriptor both arrive as this
+          * AST and no further. The recovered type is the one `Structure.conform` reads, which is what lets
+          * a shape-dynamic `Schema[Structure.Value]` carry a schema it was never derived from.
+          *
+          * The recovery is structural, not total, and the losses are the parts no `Structure.Type` node
+          * can hold: JSON Schema's value constraints (`pattern`, `minLength`, numeric bounds) are dropped,
+          * a description survives only in property position (where `Structure.Field.doc` carries it), an
+          * object declaring both properties and `additionalProperties` recovers as its properties alone,
+          * and `type: null` recovers as `Unit`, which re-derives as `{}`. What a model acts on does
+          * survive a `toStructure` / `fromStructure` round trip: property names, types, nesting, the
+          * required set, and per-property descriptions.
+          *
+          * Product and sum nodes are named by their path from the root, because [[fromStructure]] guards
+          * recursion by name: two sibling objects sharing one name would re-derive the second as an empty
+          * `{}`, silently erasing its properties.
+          */
+        def toStructure(schema: JsonSchema): Structure.Type =
+            toStructure(schema, "Root")
+
+        private def toStructure(schema: JsonSchema, path: String): Structure.Type =
+            schema match
+                case _: Str     => stringStructure
+                case _: Integer => longStructure
+                case _: Num     => doubleStructure
+                case _: Bool    => booleanStructure
+                // `Unit` is the only kind `Structure.conform` accepts any value for, which is the closest
+                // reading of a JSON `null` type that the structural vocabulary offers.
+                case _: Null => unitStructure
+
+                case Nullable(inner, _) =>
+                    Structure.Type.Optional("Option", anyTag, toStructure(inner, path))
+
+                case arr: Arr =>
+                    Structure.Type.Collection("Chunk", anyTag, toStructure(arr.items, s"$path[]"))
+
+                case OneOf(variants, _) =>
+                    Structure.Type.Sum(
+                        path,
+                        anyTag,
+                        Chunk.empty,
+                        Chunk.from(variants.map((name, sub) => Structure.Variant(name, toStructure(sub, s"$path.$name")))),
+                        Chunk.empty
+                    )
+
+                case Obj(properties, required, additionalProperties, _, _, _) =>
+                    if properties.nonEmpty then
+                        val requiredNames = required.toSet
+                        Structure.Type.Product(
+                            path,
+                            anyTag,
+                            Chunk.empty,
+                            Chunk.from(properties.map { (name, sub) =>
+                                Structure.Field(
+                                    name,
+                                    toStructure(sub, s"$path.$name"),
+                                    doc = descriptionOf(sub),
+                                    optional = !requiredNames.contains(name)
+                                )
+                            })
+                        )
+                    else
+                        additionalProperties match
+                            // An object with no declared properties but a typed `additionalProperties` is
+                            // the JSON Schema spelling of a string-keyed map.
+                            case Present(valueSchema) =>
+                                Structure.Type.Mapping("Map", anyTag, stringStructure, toStructure(valueSchema, s"$path{}"))
+                            // `{}` declares no constraints, which is exactly what the open type means.
+                            case Absent => Structure.Type.Open(anyTag)
+                    end if
+            end match
+        end toStructure
+
+        /** The description a node carries, if its variant has one. */
+        private def descriptionOf(schema: JsonSchema): Maybe[String] =
+            schema match
+                case o: Obj      => o.description
+                case a: Arr      => a.description
+                case s: Str      => s.description
+                case n: Num      => n.description
+                case i: Integer  => i.description
+                case b: Bool     => b.description
+                case n: Null     => n.description
+                case n: Nullable => n.description
+                case o: OneOf    => o.description
+
+        // Reuse the derived structures so a recovered primitive is indistinguishable from the one a
+        // `Schema[String]` (and friends) produces, tag included.
+        private lazy val stringStructure: Structure.Type  = summon[Schema[String]].structure
+        private lazy val longStructure: Structure.Type    = summon[Schema[Long]].structure
+        private lazy val doubleStructure: Structure.Type  = summon[Schema[Double]].structure
+        private lazy val booleanStructure: Structure.Type = summon[Schema[Boolean]].structure
+        private lazy val unitStructure: Structure.Type    = summon[Schema[Unit]].structure
+
+        // A recovered node has no Scala type behind it, so every non-primitive carries the `Any` tag.
+        // Nothing downstream reads it: `conform` dispatches on the node kind and `fromStructure` on the
+        // node's shape.
+        private lazy val anyTag: Tag[Any] = Tag[Any]
+
+    end JsonSchema
+
+end Json

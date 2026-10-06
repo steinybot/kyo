@@ -4,23 +4,17 @@ import IOPromise.*
 import java.util.concurrent.locks.LockSupport
 import kyo.*
 import kyo.Result.Error
-import kyo.kernel.internal.Safepoint
 import scala.annotation.tailrec
-import scala.util.control.NonFatal
 
 sealed private[kyo] trait IOPromiseBase[+E, +A]:
     self: IOPromise[E, A] =>
 
-private[kyo] class IOPromise[E, A](init: State[E, A]) extends Safepoint.Interceptor with Serializable with IOPromiseBase[E, A]:
+private[kyo] class IOPromise[E, A](init: State[E, A]) extends Serializable with IOPromiseBase[E, A]:
 
     @volatile private var state = init
 
     def this() = this(Pending())
     def this(interrupts: IOPromise[?, ?]) = this(Pending().interrupts(interrupts))
-
-    def addFinalizer(f: Maybe[Error[Any]] => Unit): Unit    = {}
-    def removeFinalizer(f: Maybe[Error[Any]] => Unit): Unit = {}
-    def enter(frame: Frame, value: Any): Boolean            = true
 
     private def compareAndSet(curr: State[E, A], next: State[E, A]): Boolean =
         IOPromisePlatformSpecific.stateHandle match
@@ -79,38 +73,58 @@ private[kyo] class IOPromise[E, A](init: State[E, A]) extends Safepoint.Intercep
         interruptsLoop(this)
     end interrupts
 
-    final def removeInterrupt(other: IOPromise[?, ?])(using frame: Frame): Unit =
-        @tailrec def removeInterruptLoop(promise: IOPromise[E, A]): Unit =
+    /** Drops the registration made under `key`, matched by reference: the promise given to [[interrupts]], or the
+      * function given to [[onComplete]] / [[onInterrupt]].
+      *
+      * Returns whether it was there. The drop shares completion's CAS, so `true` means this promise will never fire
+      * that callback and the caller may fire it exactly once.
+      */
+    final def remove(key: IOPromise[?, ?] | Function1[?, ?]): Boolean =
+        @tailrec def removeLoop(promise: IOPromise[E, A]): Boolean =
             promise.state match
                 case p: Pending[E, A] @unchecked =>
-                    if !promise.compareAndSet(p, p.removeInterrupt(other)) then
-                        removeInterruptLoop(promise)
+                    val next = p.remove(key)
+                    if next eq p then false
+                    else if !promise.compareAndSet(p, next) then removeLoop(promise)
+                    else true
                 case l: Linked[E, A] @unchecked =>
-                    removeInterruptLoop(l.p)
-                case _ =>
-        removeInterruptLoop(this)
-    end removeInterrupt
-
-    final def mask(): IOPromise[E, A] =
-        val p = new IOPromise[E, A]:
-            override def interrupt(error: Error[E]): Boolean = false
-        onComplete(p.completeDiscard)
-        p
-    end mask
-
-    def interruptDiscard(error: Error[E]): Unit =
-        discard(interrupt(error))
-
-    def interrupt(error: Error[E]): Boolean =
-        @tailrec def interruptLoop(promise: IOPromise[E, A]): Boolean =
-            promise.state match
-                case p: Pending[E, A] @unchecked =>
-                    promise.interrupt(p, error) || interruptLoop(promise)
-                case l: Linked[E, A] @unchecked =>
-                    interruptLoop(l.p)
+                    removeLoop(l.p)
                 case _ =>
                     false
-        interruptLoop(this)
+        removeLoop(this)
+    end remove
+
+    /** Whether an interrupt may be attempted on this promise now. `false` refuses it without touching the state: a promise made
+      * uninterruptible, or a task that already took one and has not completed yet.
+      */
+    def preInterrupt(): Boolean = true
+
+    /** Returns a promise that mirrors this one's completion but refuses interrupts, so an interrupt aimed at the result cannot reach the
+      * computation producing it.
+      */
+    final def uninterruptible(): IOPromise[E, A] =
+        val p = new IOPromise[E, A]:
+            override def preInterrupt() = false
+        onComplete(p.completeDiscard)
+        p
+    end uninterruptible
+
+    inline def interruptDiscard(inline error: => Error[E]): Unit =
+        discard(interrupt(error))
+
+    inline def interrupt(inline error: => Error[E]): Boolean =
+        @tailrec def interruptLoop(promise: IOPromise[E, A], _error: Maybe[Error[E]]): Boolean =
+            promise.state match
+                case p: Pending[E, A] @unchecked =>
+                    val e = _error.getOrElse(error)
+                    // Asked again before a retry: a promise that takes an interrupt without completing stays
+                    // pending, and it is `preInterrupt` that refuses the next one.
+                    promise.interrupt(p, e) || (promise.preInterrupt() && interruptLoop(promise, Present(e)))
+                case l: Linked[E, A] @unchecked =>
+                    interruptLoop(l.p, _error)
+                case _ =>
+                    false
+        preInterrupt() && interruptLoop(this, Absent)
     end interrupt
 
     final private def compress(): IOPromise[E, A] =
@@ -180,12 +194,40 @@ private[kyo] class IOPromise[E, A](init: State[E, A]) extends Safepoint.Intercep
 
     protected def onComplete(): Unit = {}
 
-    final private def interrupt(p: Pending[E, A], v: Error[E]): Boolean =
+    /** Resets a completed promise back to Pending.Empty for reuse. Returns true if successful, false if not completed or CAS fails. Only
+      * valid when no callbacks are registered (i.e., the promise was used as a single-owner notification, not with onComplete listeners).
+      * Protected — only subclasses (e.g., ReadPump, WritePump) should call this.
+      */
+    protected def becomeAvailable(): Boolean =
+        state match
+            case _: Pending[?, ?] => false
+            case _: Linked[?, ?]  => false
+            case v                => compareAndSet(v, Pending())
+
+    /** Answers an interrupt that found this promise pending: by default, completes it with the error.
+      *
+      * `IOTask` overrides this to take the interrupt without completing, so a fiber's result is available only
+      * once what it held has been released, and completes through [[settleInterrupt]] when that is done. `false`
+      * means the attempt did not land.
+      */
+    protected def interrupt(p: Pending[E, A], v: Error[E]): Boolean =
+        settleInterrupt(p, v)
+
+    final protected def settleInterrupt(p: Pending[E, A], v: Error[E]): Boolean =
         compareAndSet(p, v) && {
             onComplete()
             p.flushInterrupt(v)
             true
         }
+
+    /** Completes this promise with an interrupt taken earlier, whatever pending state it holds by now. */
+    final protected def settleInterrupt(v: Error[E]): Boolean =
+        @tailrec def loop(): Boolean =
+            state match
+                case p: Pending[E, A] @unchecked => settleInterrupt(p, v) || loop()
+                case _                           => false
+        loop()
+    end settleInterrupt
 
     final private def complete(p: Pending[E, A], v: Result[E, A]): Boolean =
         compareAndSet(p, v) && {
@@ -226,8 +268,8 @@ private[kyo] class IOPromise[E, A](init: State[E, A]) extends Safepoint.Intercep
                     Scheduler.get.flush()
                     object state extends (Result[E, A] => Unit):
                         @volatile
-                        private var result = null.asInstanceOf[Result[E, A]]
-                        private val waiter = Thread.currentThread()
+                        private var result         = null.asInstanceOf[Result[E, A]]
+                        private val waiter         = Thread.currentThread()
                         def apply(v: Result[E, A]) =
                             result = v
                             LockSupport.unpark(waiter)
@@ -292,48 +334,48 @@ private[kyo] object IOPromise:
 
         def waiters: Int
         def interrupt(v: Error[E]): Pending[E, A]
-        def removeInterrupt(other: IOPromise[?, ?]): Pending[E, A]
+
+        /** Drops the first registration made under `key` and rebuilds the nodes above it. Returns `this`, not a copy,
+          * when nothing matched.
+          */
+        def remove(key: IOPromise[?, ?] | Function1[?, ?]): Pending[E, A]
         def run(v: Result[E, A]): Pending[E, A]
 
         final def onComplete(f: Result[E, A] => Any): Pending[E, A] =
-            new Pending[E, A]:
-                def waiters: Int = self.waiters + 1
-                def interrupt(error: Error[E]) =
+            new Node[E, A](self):
+                def matches(key: IOPromise[?, ?] | Function1[?, ?]) = key eq f
+                def readd(chain: Pending[E, A])                     = chain.onComplete(f)
+                def interrupt(error: Error[E])                      =
                     eval(discard(f(error)))
                     self
-                def removeInterrupt(other: IOPromise[?, ?]) =
-                    self.removeInterrupt(other).onComplete(f)
                 def run(v: Result[E, A]) =
                     eval(discard(f(v.asInstanceOf[Result[E, A]])))
                     self
                 end run
 
         final def interrupts(p: IOPromise[?, ?]): Pending[E, A] =
-            new Pending[E, A]:
-                def interrupt(error: Error[E]) =
+            new Node[E, A](self):
+                def matches(key: IOPromise[?, ?] | Function1[?, ?]) = key eq p
+                def readd(chain: Pending[E, A])                     = chain.interrupts(p)
+                def interrupt(error: Error[E])                      =
                     val ex =
                         error match
                             case error: Result.Panic => error
                             case _                   => interruptPanic
-
                     discard(p.interrupt(ex))
                     self
                 end interrupt
-                def removeInterrupt(other: IOPromise[?, ?]) =
-                    if p eq other then self
-                    else self.removeInterrupt(other).interrupts(p)
-                def waiters: Int = self.waiters + 1
                 def run(v: Result[E, A]) =
                     self
+        end interrupts
 
         def onInterrupt(f: Error[E] => Any): Pending[E, A] =
-            new Pending[E, A]:
-                def interrupt(error: Error[E]) =
+            new Node[E, A](self):
+                def matches(key: IOPromise[?, ?] | Function1[?, ?]) = key eq f
+                def readd(chain: Pending[E, A])                     = chain.onInterrupt(f)
+                def interrupt(error: Error[E])                      =
                     eval(discard(f(error)))
                     self
-                def removeInterrupt(other: IOPromise[?, ?]) =
-                    self.removeInterrupt(other).onInterrupt(f)
-                def waiters: Int = self.waiters + 1
                 def run(v: Result[E, A]) =
                     self
 
@@ -349,16 +391,21 @@ private[kyo] object IOPromise:
                     case _ if (p eq Pending.Empty) => tail
                     case p: Pending[E, A]          => interruptLoop(p.interrupt(error), error)
 
-            @tailrec def removeInterruptsLoop(p: Pending[E, A], other: IOPromise[?, ?]): Pending[E, A] =
-                p match
-                    case _ if (p eq Pending.Empty) => tail
-                    case p: Pending[E, A]          => removeInterruptsLoop(p.removeInterrupt(other), other)
-
             new Pending[E, A]:
-                def waiters: Int                            = self.waiters + tail.waiters
-                def interrupt(error: Error[E])              = interruptLoop(self, error)
-                def removeInterrupt(other: IOPromise[?, ?]) = removeInterruptsLoop(self, other)
-                def run(v: Result[E, A])                    = runLoop(self, v)
+                def waiters: Int               = self.waiters + tail.waiters
+                def interrupt(error: Error[E]) = interruptLoop(self, error)
+                // Not a step loop like the two above: `run` and `interrupt` consume a node and return the rest, while
+                // `remove` returns the whole chain rebuilt, so stepping over it never reaches Empty.
+                // `tail` holds what was registered on a promise before it became this one.
+                def remove(key: IOPromise[?, ?] | Function1[?, ?]) =
+                    val head = self.remove(key)
+                    if head ne self then head.merge(tail)
+                    else
+                        val rest = tail.remove(key)
+                        if rest eq tail then this else self.merge(rest)
+                    end if
+                end remove
+                def run(v: Result[E, A]) = runLoop(self, v)
             end new
         end merge
 
@@ -366,7 +413,7 @@ private[kyo] object IOPromise:
             @tailrec def flushInterruptLoop(p: Pending[E, A]): Unit =
                 p match
                     case _ if (p eq Pending.Empty) => ()
-                    case p: Pending[E, A] =>
+                    case p: Pending[E, A]          =>
                         flushInterruptLoop(p.interrupt(error))
             flushInterruptLoop(this)
         end flushInterrupt
@@ -375,27 +422,81 @@ private[kyo] object IOPromise:
             @tailrec def flushLoop(p: Pending[E, A]): Unit =
                 p match
                     case _ if (p eq Pending.Empty) => ()
-                    case p =>
+                    case p                         =>
                         flushLoop(p.run(v))
             flushLoop(this)
         end flush
 
     end Pending
 
+    /** One registration on top of `rest`, the chain it was registered on. `remove` and `waiters` walk a run of these in
+      * a loop rather than a frame per node: a chain can be long, and the registration being dropped can sit at its bottom.
+      */
+    sealed abstract class Node[E, A](val rest: Pending[E, A]) extends Pending[E, A]:
+
+        def matches(key: IOPromise[?, ?] | Function1[?, ?]): Boolean
+
+        /** The same registration made on `chain`. */
+        def readd(chain: Pending[E, A]): Pending[E, A]
+
+        final def waiters: Int =
+            @tailrec def loop(p: Pending[E, A], n: Int): Int =
+                p match
+                    case node: Node[E, A] @unchecked => loop(node.rest, n + 1)
+                    case other                       => n + other.waiters
+            loop(this, 0)
+        end waiters
+
+        final def remove(key: IOPromise[?, ?] | Function1[?, ?]): Pending[E, A] =
+            // The walk stops at the match or at the end of this run of nodes (Empty, or a merge, which searches both
+            // of its chains). Nothing is allocated until a match is known.
+            @tailrec def depth(p: Pending[E, A], n: Int): Int =
+                p match
+                    case node: Node[E, A] @unchecked if !node.matches(key) => depth(node.rest, n + 1)
+                    case _                                                 => n
+            @tailrec def at(p: Pending[E, A], i: Int): Pending[E, A] =
+                if i == 0 then p else at(p.asInstanceOf[Node[E, A]].rest, i - 1)
+            val n    = depth(this, 0)
+            val stop = at(this, n)
+            val base =
+                stop match
+                    case node: Node[E, A] @unchecked => node.rest
+                    case other                       => other.remove(key)
+            if base eq stop then this
+            else
+                val above                                            = new Array[Node[E, A]](n)
+                @tailrec def collect(p: Pending[E, A], i: Int): Unit =
+                    if i < n then
+                        val node = p.asInstanceOf[Node[E, A]]
+                        above(i) = node
+                        collect(node.rest, i + 1)
+                // deepest first, so the rebuilt chain keeps the original order
+                @tailrec def rebuild(chain: Pending[E, A], i: Int): Pending[E, A] =
+                    if i < 0 then chain else rebuild(above(i).readd(chain), i - 1)
+                collect(this, 0)
+                rebuild(base, n - 1)
+            end if
+        end remove
+    end Node
+
     object Pending:
         def apply[E, A](): Pending[E, A] = Empty.asInstanceOf[Pending[E, A]]
         case object Empty extends Pending[Nothing, Nothing]:
-            def waiters: Int                            = 0
-            def interrupt(v: Error[Nothing])            = this
-            def removeInterrupt(other: IOPromise[?, ?]) = this
-            def run(v: Result[Nothing, Nothing])        = this
+            def waiters: Int                                   = 0
+            def interrupt(v: Error[Nothing])                   = this
+            def remove(key: IOPromise[?, ?] | Function1[?, ?]) = this
+            def run(v: Result[Nothing, Nothing])               = this
         end Empty
     end Pending
 
     private inline def eval[A](inline f: => Unit): Unit =
         try f
         catch
-            case ex if NonFatal(ex) =>
+            // Completion callbacks run in a single loop over all of a promise's waiters; a throwable escaping here
+            // would abort that loop and leave the remaining waiters unnotified. A callback is an isolated
+            // side-effecting notification, not the fiber's own computation, so contain and log every failure
+            // (fatal included) rather than propagate.
+            case ex =>
                 given Frame = Frame.internal
                 import AllowUnsafe.embrace.danger
                 Log.live.unsafe.error("uncaught exception", ex)

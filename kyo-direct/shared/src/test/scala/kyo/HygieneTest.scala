@@ -1,6 +1,6 @@
 package kyo
 
-class HygieneTest extends Test:
+class HygieneTest extends kyo.test.Test[Any]:
 
     "use of var" in {
         typeCheckFailure("""
@@ -20,7 +20,7 @@ class HygieneTest extends Test:
             Sync.defer(1).now
           }
         """)(
-            "Exception occurred while executing macro expansion"
+            "return outside method definition"
         )
     }
 
@@ -151,7 +151,7 @@ class HygieneTest extends Test:
               new A(Sync.defer("blah").now)
           }
         """)(
-            "Can't find AsyncShift (Found:    cps.runtime.CpsMonadSelfAsyncShift[[A] =>> A < kyo.Sync"
+            ".now cannot appear inside a by-name parameter."
         )
     }
 
@@ -262,19 +262,24 @@ class HygieneTest extends Test:
                  val default: Unit < Abort[String] = ()
                  val x: Unit < Emit[Int] = direct(default.now)
                  
-               """.stripMargin
+               """
         )("Cannot lift `Unit < kyo.Abort[scala.Predef.String]` to the expected type (`Unit < ?`).")
     }
 
     "opaque types issue (#993)" in {
         val maybe1: Maybe[Int] < Sync = Maybe(1)
         val maybe0: Maybe[Int]        = Maybe(0)
-        direct:
+        val result1                   = direct:
             maybe1.now.fold(2)(_ + 1)
+        val result2 = direct:
             maybe1.now.contains(1)
-            maybe0.contains(1)
 
-        assertionSuccess
+        // Verify opaque type operations work correctly inside direct: blocks (#993)
+        result1.map(v => assert(v == 2)).andThen( // Maybe(1).fold(2)(_ + 1): Present(1) -> 1+1 = 2
+            result2.map(b => assert(b))           // Maybe(1).contains(1) = true
+        ).andThen(
+            assert(!maybe0.contains(1)) // Maybe(0).contains(1) = false
+        )
     }
 
     ".now outside of direct" in {
@@ -292,7 +297,7 @@ class HygieneTest extends Test:
         def f(i: Int): Int < Var[Int] = Var.set(i)
 
         val res = direct(f(x.now).now)
-        assertResult((1, -1))(Var.runTuple(-1)(res).eval)
+        assert(Var.runTuple(-1)(res).eval == (1, -1))
     }
 
     ".now in .later (#1366)" in {
@@ -306,8 +311,8 @@ class HygieneTest extends Test:
             stream.map(_ => g)
 
         Abort.run(res).eval match
-            case Result.Success(_) => assertionFailure("oups")
-            case Result.Error(_)   => assertionSuccess            """
+            case Result.Success(_) => fail("oups")
+            case Result.Error(_)   => ()            """
 
         typeCheckFailure(prg)(".now and .later should not be nested.")
     }
@@ -321,6 +326,38 @@ class HygieneTest extends Test:
             val g = f(x.later).later
             g.now
 
-        assertResult(2)(res.eval)
+        assert(res.eval == 2)
+    }
+
+    // Tests below codify currently-broken behavior surfaced during coverage analysis.
+    // Each uses typeCheckFailure to capture the spurious error. When the bug is fixed,
+    // these tests will fail (the error message disappears), prompting cleanup —
+    // remove the typeCheckFailure assertion and move the snippet to a positive test
+    // in the appropriate file (BlockTest / IfTest / PatMatchTest / etc.).
+
+    // Scala 3 limitation: the .now extension's `A` type parameter is bound by both the
+    // receiver and the expected return type. When they conflict (e.g. expected Long but
+    // receiver returns Int < Sync), inference picks the expected type and fails.
+    // Workaround: type-ascribe the .now result, or extract to a separate val.
+    "implicit widening of .now result requires explicit type ascription" in {
+        typeCheckFailure(
+            """
+            direct {
+              val n: Long = Sync.defer(7).now
+              n
+            }
+            """
+        )("value now is not a member of Int < kyo.Sync")
+    }
+
+    ".now in by-name parameter is rejected with a clear error" in {
+        typeCheckFailure(
+            """
+            def lazyArg(x: => Int): Int = x + 1
+            direct {
+              lazyArg(Sync.defer(10).now)
+            }
+            """
+        )(".now cannot appear inside a by-name parameter.")
     }
 end HygieneTest

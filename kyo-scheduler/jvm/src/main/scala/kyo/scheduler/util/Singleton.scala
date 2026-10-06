@@ -6,11 +6,12 @@ package kyo.scheduler.util
   * application servers or plugin systems), each classloader creates its own instance, breaking singleton semantics.
   *
   * This class is designed to be extended by companion objects to provide true JVM-wide singleton semantics. For example:
-  * {{{
+  *
+  * ```scala
   * object MyService extends Singleton[MyService] {
   *   override protected def init() = new MyService()
   * }
-  * }}}
+  * ```
   *
   * This is particularly important for systems that make adaptive decisions based on global state. For example, Kyo's scheduler dynamically
   * adjusts its behavior based on system-wide metrics like thread scheduling delays. Having multiple scheduler instances would lead to:
@@ -54,7 +55,7 @@ abstract class Singleton[A <: AnyRef] {
             val key      = getClass.getName // Singleton object's class name as key
 
             val existing = sysProps.get(key).asInstanceOf[A]
-            val result =
+            val result   =
                 if (existing ne null) {
                     // Another classloader created the instance, use it
                     existing

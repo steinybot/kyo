@@ -1,13 +1,12 @@
 package kyo
 
-import kyo.debug.Debug
 import kyo.kernel.ArrowEffect
 import scala.annotation.tailrec
 import scala.annotation.targetName
 import scala.util.NotGiven
 
 extension [A, S](effect: Unit < (Emit[Chunk[A]] & S))
-    /** Convert streaming Emit effect to a [[Stream[A, S]]]
+    /** Convert streaming Emit effect to a [[Stream]]`[A, S]`
       *
       * @return
       *   Stream representation of original effect
@@ -30,7 +29,7 @@ extension [A, B, S](effect: B < (Emit[A] & S))
       */
     def handleEmitDiscarding(using Tag[Emit[A]], Frame): Chunk[A] < S = Emit.run[A](effect).map(_._1)
 
-    /** Handle Emit[A], executing function [[fn]] on each emitted value
+    /** Handle Emit[A], executing function `fn` on each emitted value
       *
       * @param fn
       *   Function to handle each emitted value
@@ -44,12 +43,11 @@ extension [A, B, S](effect: B < (Emit[A] & S))
         tag: Tag[Emit[A]],
         f: Frame
     ): B < (S & S1) =
-        ArrowEffect.handle(tag, effect):
-            [C] =>
-                (a, cont) =>
-                    fn(a).andThen(cont(()))
+        ArrowEffect.handleCont(tag, effect): [C] =>
+            (a, cont) =>
+                fn(a).andThen(cont(()))
 
-    /** Handle Emit[A] by passing emitted values to [[channel]]. Fails with Abort[Closed] on channel closure
+    /** Handle Emit[A] by passing emitted values to `channel`. Fails with Abort[Closed] on channel closure
       *
       * @param channel
       *   Channel in which to put emitted values
@@ -59,12 +57,10 @@ extension [A, B, S](effect: B < (Emit[A] & S))
     def emitToChannel(channel: Channel[A])(using Tag[Emit[A]], Frame): B < (S & Async & Abort[Closed]) =
         effect.foreachEmit(a => channel.put(a))
 
-    /** Handle Emit[A], re-emitting in chunks according to [[chunkSize]]
+    /** Handle Emit[A], re-emitting in chunks according to `chunkSize`
       *
       * @param chunkSize
       *   maximum size of emitted chunks
-      *
-      * @return
       */
     def emitChunked(
         chunkSize: Int
@@ -74,15 +70,15 @@ extension [A, B, S](effect: B < (Emit[A] & S))
         fr: Frame,
         at: Tag[Emit[Chunk[A]]]
     ): B < (Emit[Chunk[A]] & S) =
-        ArrowEffect.handleLoop(tag, Chunk.empty[A], effect)(
+        ArrowEffect.handleLoopState(tag, Chunk.empty[A], effect)(
             [C] =>
-                (v, buffer, cont) =>
+                (buffer, v) =>
                     val b2 = buffer.append(v)
                     if b2.size >= chunkSize then
                         Emit.valueWith(b2):
-                            Loop.continue(Chunk.empty, cont(()))
+                            Loop.continue(Chunk.empty, ())
                     else
-                        Loop.continue(b2, cont(()))
+                        Loop.continue(b2, ())
                     end if
             ,
             (buffer, v) =>
@@ -90,7 +86,7 @@ extension [A, B, S](effect: B < (Emit[A] & S))
                 else Emit.valueWith(buffer)(v)
         )
 
-    /** Convert emitting effect to stream, chunking Emitted values in [[chunkSize]], and discarding result.
+    /** Convert emitting effect to stream, chunking Emitted values in `chunkSize`, and discarding result.
       *
       * @param chunkSize
       *   size of chunks to stream
@@ -108,14 +104,13 @@ extension [A, B, S](effect: B < (Emit[A] & S))
     ): Stream[A, S] =
         effect.emitChunked(chunkSize).emitToStreamDiscarding
 
-    /** Convert an effect that emits values of type [[A]] while computing a result of type [[B]] to an asynchronous stream of the emission
-      * type [[A]] along with a separate asynchronous effect that yields the result of the original effect after the stream has been
-      * handled.
+    /** Convert an effect that emits values of type `A` while computing a result of type `B` to an asynchronous stream of the emission type
+      * `A` along with a separate asynchronous effect that yields the result of the original effect after the stream has been handled.
       *
       * @param chunkSize
       *   Size of chunks to stream
       * @return
-      *   Tuple of async stream of type [[A]] and async effect yielding result [[B]]
+      *   Tuple of async stream of type `A` and async effect yielding result `B`
       */
     def emitChunkedToStreamAndResult(
         using
@@ -139,11 +134,11 @@ extension [A, B, S](effect: B < (Emit[Chunk[A]] & S))
     ): Stream[A, S] =
         Stream(effect.unit)
 
-    /** Convert an effect that emits chunks of type [[A]] while computing a result of type [[B]] to an asynchronous stream of the emission
-      * type [[A]] and a separate asynchronous effect that yields the result of the original effect after the stream has been handled.
+    /** Convert an effect that emits chunks of type `A` while computing a result of type `B` to an asynchronous stream of the emission type
+      * `A` and a separate asynchronous effect that yields the result of the original effect after the stream has been handled.
       *
       * @return
-      *   tuple of async stream of type [[A]] and async effect yielding result [[B]]
+      *   tuple of async stream of type `A` and async effect yielding result `B`
       */
     def emitToStreamAndResult(using Frame): (Stream[A, S & Async], B < Async) < Async =
         for
@@ -154,7 +149,7 @@ extension [A, B, S](effect: B < (Emit[Chunk[A]] & S))
 end extension
 
 extension [A, B, S](effect: Unit < (Emit[A] & S))
-    /** Convert emitting effect to stream, chunking Emitted values in [[chunkSize]].
+    /** Convert emitting effect to stream, chunking Emitted values in `chunkSize`.
       *
       * @param chunkSize
       *   Size of chunks to stream

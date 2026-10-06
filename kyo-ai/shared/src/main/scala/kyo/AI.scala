@@ -1,0 +1,367 @@
+package kyo
+
+import kyo.ai.Config
+import kyo.ai.Context
+import kyo.ai.Context.*
+import kyo.ai.Image
+
+/** First-class identity for one conversation slot. A reference object, so the threaded `State` holds its
+  * slot through a `WeakReference` (`LLM.internal.AIRef`): once nothing references an `AI`, GC reclaims it and
+  * the eval loop sweeps its dead slot, so instances never accumulate in a long-lived run. Minted by `init`
+  * with an id from the run's threaded counter, so identity is scoped to one `LLM.run` with no global state.
+  * It also remembers its creating run (`owner`), so use inside a different `LLM.run` fails fast rather than
+  * silently addressing that run's same-id slot.
+  */
+final class AI private[kyo] (private[kyo] val id: Long, private[kyo] val owner: AnyRef):
+    private[kyo] val ref: LLM.internal.AIRef = new LLM.internal.AIRef(this)
+
+/** The first-class instance API. `AI` is both the identity value (`ai`) and the namespace of operations.
+  *
+  * `AI.gen` is a one-shot: it mints a fresh ephemeral instance, generates against it, and drops it, so two
+  * one-shots never share state. `ai.gen` on a named instance (from `AI.init`) runs against a persistent slot
+  * whose conversation, enablements, and config survive across turns within a single `LLM.run`. Every method
+  * is a thin value over `LLM`'s `private[kyo]` interface; `AI` summons no `ArrowEffect` op directly.
+  */
+object AI:
+
+    given CanEqual[AI, AI] = CanEqual.derived
+
+    given Ordering[AI] = Ordering.by(_.id)
+
+    /** Surfaced under `AI` so `import kyo.*` reaches the settings and content types without a `kyo.ai` import:
+      * `AI.Config`, `AI.DeciderConfig`, `AI.Context`, `AI.Image`.
+      */
+    export kyo.ai.Config
+    export kyo.ai.Context
+    export kyo.ai.DeciderConfig
+    export kyo.ai.Image
+
+    /** A composable element of the generation surface that can be enabled on an `AI`: a [[kyo.Tool]], a
+      * [[kyo.Prompt]], a [[kyo.Thought]], a [[kyo.Mode]], or an [[kyo.Observe]].
+      *
+      * `AI.enable` layers enablements over a scoped computation; `ai.enable` layers them onto a single
+      * instance. Both take varargs or a `Seq` and accept a mix of kinds in one call. `S` is the capability an
+      * enablement's code requires (a tool's run, a thought's process hook, an effectful prompt, a mode's
+      * pipeline), which rides the row to the run boundary where it must be discharged.
+      */
+    trait Enablement[-S]:
+        // How this enablement layers itself onto the scope env (AI.enable) or one instance's session
+        // (ai.enable). private[kyo] so only the module's five kinds implement it; users compose, never extend.
+        private[kyo] def enableIn(env: AIEnv)(using Frame): AIEnv
+        private[kyo] def enableIn(session: AISession)(using Frame): AISession
+    end Enablement
+
+    /** Mints a fresh instance with an empty conversation and no enablements. */
+    def init(using Frame): AI < LLM = LLM.init
+
+    def initWith[A, S](f: AI => A < (LLM & S))(using Frame): A < (LLM & S) =
+        init.map(f)
+
+    /** Mints an instance carrying its own config, overriding the scope config for its generations. */
+    def init(config: Config)(using Frame): AI < LLM =
+        init(AISession.empty.config(config))
+
+    /** Mints an instance initialized from an `AISession`: its conversation, enablements, and config. */
+    def init(session: AISession)(using Frame): AI < LLM =
+        init.map(ai => LLM.setSession(ai, session).andThen(ai))
+
+    /** Recreates an instance from a snapshot, restoring its conversation, enablements, and config. */
+    def recover(session: AISession)(using Frame): AI < LLM =
+        init(session)
+
+    // Internal: read-modify-write one instance's AISession; returns the instance for chaining.
+    private[kyo] def updateSession(ai: AI)(f: AISession => AISession)(using Frame): AI < LLM =
+        LLM.session(ai).map(s => LLM.setSession(ai, f(s))).andThen(ai)
+
+    /** A one-shot generation: mints a fresh ephemeral instance, generates against it, then discards its slot
+      * on success. Two one-shots never share state.
+      */
+    def gen[A: Schema](using Frame): A < LLM =
+        init.map(ai => ai.gen[A].map(r => ai.reset.andThen(r)))
+
+    def gen[A: Schema](using Frame)[B: Schema](input: B): A < LLM =
+        init.map(ai => ai.gen[A](input).map(r => ai.reset.andThen(r)))
+
+    def gen[A: Schema](using Frame)[B: Schema, C: Schema](input1: B, input2: C): A < LLM =
+        gen[A]((input1, input2))
+
+    def gen[A: Schema](using Frame)[B: Schema, C: Schema, D: Schema](input1: B, input2: C, input3: D): A < LLM =
+        gen[A]((input1, input2, input3))
+
+    def gen[A: Schema](using Frame)[B: Schema, C: Schema, D: Schema, E: Schema](input1: B, input2: C, input3: D, input4: E): A < LLM =
+        gen[A]((input1, input2, input3, input4))
+
+    /** Projects a generation as a `Stream`, in one of two forms inferred from `A`. A `String` streams
+      * incremental text chunks whose concatenation is the final answer (the token-by-token chat-UI case).
+      * Any other type streams object by object: each `A` is emitted once complete, never half-filled (the
+      * iterable case, for extracting or generating multiple records). Mints a fresh ephemeral instance.
+      *
+      * A fully consumed stream joins the conversation, recorded once the element fold completes, so a later
+      * turn can read it; the `LLM` in the element row is why (consumption happens inside `LLM.run`). An
+      * abandoned or failed stream records nothing.
+      */
+    def stream[A: Schema](using Frame, Tag[Emit[Chunk[A]]]): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+        init.map(ai => ai.stream[A])
+
+    /** [[stream]] seeded with an input, the streaming counterpart of `gen(input)`. The input is appended
+      * as a user message before the stream is projected, so `AI.stream[String]("...")` reads the way
+      * `AI.gen[Answer]("...")` does rather than requiring the caller to seed the context by hand.
+      */
+    def stream[A: Schema](using
+        Frame,
+        Tag[Emit[Chunk[A]]]
+    )[B: Schema](input: B): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+        init.map(ai => ai.stream[A](input))
+
+    def stream[A: Schema](using
+        Frame,
+        Tag[Emit[Chunk[A]]]
+    )[B: Schema, C: Schema](input1: B, input2: C): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+        stream[A]((input1, input2))
+
+    def stream[A: Schema](using
+        Frame,
+        Tag[Emit[Chunk[A]]]
+    )[B: Schema, C: Schema, D: Schema](
+        input1: B,
+        input2: C,
+        input3: D
+    ): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+        stream[A]((input1, input2, input3))
+
+    def stream[A: Schema](using
+        Frame,
+        Tag[Emit[Chunk[A]]]
+    )[B: Schema, C: Schema, D: Schema, E: Schema](
+        input1: B,
+        input2: C,
+        input3: D,
+        input4: E
+    ): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+        stream[A]((input1, input2, input3, input4))
+
+    /** Reads the current scope `AIEnv`: the active config plus the scope's enablements (prompt, tools, thoughts, modes, observers). */
+    def env(using Frame): AIEnv < LLM = LLM.env
+
+    /** Reads the active config. The active env (the scope env, or the scope merged with an instance during a
+      * gen) always carries a `Present` config; the `Absent` case lives only in a stored instance env, which is
+      * merged into the scope before it is read.
+      */
+    def config(using Frame): Config < LLM = LLM.env.map(_.config.get)
+
+    /** Layers a transformed config for the duration of `v`, restoring the prior config after. */
+    def withConfig[A, S](f: Config => Config)(v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        LLM.updateEnv(_.mapConfig(f))(v)
+
+    def withConfig[A, S](config: Config)(v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        withConfig(_ => config)(v)
+
+    /** Layers enablements (tools, prompts, thoughts, modes, observers, in any mix) over a scoped computation, on top of
+      * the scope's current enablements. Each enablement's capability `S` rides the row, unified across the
+      * varargs to their intersection, so the requirements stay visible until discharged at the run boundary.
+      */
+    def enable[A, S](enablements: Enablement[S]*)(v: A < S)(using Frame): A < (S & LLM) =
+        if enablements.isEmpty then v
+        else LLM.updateEnv(env => enablements.foldLeft(env)((acc, e) => e.enableIn(acc)))(v)
+
+    /** The `Seq` form of the varargs `enable`. A `DummyImplicit` differentiates the erased signature from the
+      * varargs overload (a `T*` parameter erases to the same `Seq[T]`), so both calling forms can coexist.
+      */
+    def enable[A, S](enablements: Seq[Enablement[S]])(v: A < S)(using Frame, DummyImplicit): A < (S & LLM) =
+        enable(enablements*)(v)
+
+    /** Runs `v`, then restores ALL instances' conversations to their pre-`v` state: every write `v` made is
+      * discarded (a scope-wide rollback), so a mode that runs parallel sampling branches can isolate them.
+      */
+    def forget[A, S](v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        LLM.state.map(snapshot => v.map(a => LLM.setState(snapshot).andThen(a)))
+
+    /** Runs `v`, then restores ONLY the named instances to their pre-`v` state; every other instance's
+      * writes persist.
+      */
+    def forget[A, S](ais: AI*)(v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        LLM.state.map { before =>
+            v.map(a => LLM.state.map(after => LLM.setState(restoreInstances(before, after, ais)).andThen(a)))
+        }
+
+    /** Runs `v` with ALL instances' conversations hidden (blank history; enablements and config kept), then
+      * restores them on exit (discarding `v`'s writes).
+      */
+    def fresh[A, S](v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        LLM.state.map { snapshot =>
+            val blanked = snapshot.copy(instances = snapshot.instances.map((ref, s) => (ref, s.copy(rawContext = Context.empty))))
+            LLM.setState(blanked).andThen(v).map(a => LLM.setState(snapshot).andThen(a))
+        }
+
+    /** Runs `v` with ONLY the named instances' conversations hidden (blank; their enablements and config
+      * kept), then restores them on exit; other instances are untouched.
+      */
+    def fresh[A, S](ais: AI*)(v: A < (LLM & S))(using Frame): A < (LLM & S) =
+        LLM.state.map { before =>
+            val blanked = before.copy(instances =
+                ais.foldLeft(before.instances)((d, ai) => d.update(ai.ref, before.sessionOf(ai).copy(rawContext = Context.empty)))
+            )
+            LLM.setState(blanked).andThen(v).map(a =>
+                LLM.state.map(after => LLM.setState(restoreInstances(before, after, ais)).andThen(a))
+            )
+        }
+
+    extension (ai: AI)
+
+        def gen[A: Schema](using Frame): A < LLM =
+            LLM.gen(ai, summon[Schema[A]])
+
+        def gen[A: Schema](using Frame)[B: Schema](input: B): A < LLM =
+            ai.userMessage(Json.encode(input)).andThen(ai.gen[A])
+
+        def gen[A: Schema](using Frame)[B: Schema, C: Schema](input1: B, input2: C): A < LLM =
+            ai.gen[A]((input1, input2))
+
+        def gen[A: Schema](using Frame)[B: Schema, C: Schema, D: Schema](input1: B, input2: C, input3: D): A < LLM =
+            ai.gen[A]((input1, input2, input3))
+
+        def gen[A: Schema](using
+            Frame
+        )[B: Schema, C: Schema, D: Schema, E: Schema](
+            input1: B,
+            input2: C,
+            input3: D,
+            input4: E
+        ): A < LLM =
+            ai.gen[A]((input1, input2, input3, input4))
+
+        def stream[A: Schema](using Frame, Tag[Emit[Chunk[A]]]): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+            LLM.stream(ai, summon[Schema[A]])
+
+        def stream[A: Schema](using
+            Frame,
+            Tag[Emit[Chunk[A]]]
+        )[B: Schema](input: B): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+            ai.userMessage(Json.encode(input)).andThen(ai.stream[A])
+
+        def stream[A: Schema](using
+            Frame,
+            Tag[Emit[Chunk[A]]]
+        )[B: Schema, C: Schema](input1: B, input2: C): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+            ai.stream[A]((input1, input2))
+
+        def stream[A: Schema](using
+            Frame,
+            Tag[Emit[Chunk[A]]]
+        )[B: Schema, C: Schema, D: Schema](
+            input1: B,
+            input2: C,
+            input3: D
+        ): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+            ai.stream[A]((input1, input2, input3))
+
+        def stream[A: Schema](using
+            Frame,
+            Tag[Emit[Chunk[A]]]
+        )[B: Schema, C: Schema, D: Schema, E: Schema](
+            input1: B,
+            input2: C,
+            input3: D,
+            input4: E
+        ): Stream[A, LLM & Async & Scope & Abort[AIStreamException]] < LLM =
+            ai.stream[A]((input1, input2, input3, input4))
+
+        // ---- decisions: the conversation is the context; the question and the answer join it as two messages.
+
+        /** [[Decider.check]] against this conversation, recorded on it. */
+        def check[Q: Schema](question: Q)(using Frame): Boolean < LLM =
+            ai.check(question, Decider.internal.defaultThreshold)
+
+        /** [[Decider.check]] against this conversation with an explicit threshold, recorded on it. */
+        def check[Q: Schema](question: Q, threshold: Double)(using Frame): Boolean < LLM =
+            LLM.decide(ai, Decider.internal.checkPlan(Structure.encode(question), threshold), record = true)
+
+        /** [[Decider.choose]] against this conversation, recorded on it. */
+        def choose[Q: Schema, A: Schema](question: Q, options: Seq[A])(using Frame): A < LLM =
+            LLM.decide(ai, Decider.internal.choosePlan(Structure.encode(question), options), record = true)
+
+        /** [[Decider.score]] against this conversation, recorded on it. */
+        def score[Q: Schema, A: Schema](question: Q, levels: Seq[A])(using Frame): Double < LLM =
+            LLM.decide(ai, Decider.internal.scorePlan(Structure.encode(question), levels), record = true)
+
+        /** [[Decider.noul]] against this conversation, recorded on it. */
+        def noul[Q: Schema](question: Q)(using Frame): Double < LLM =
+            LLM.decide(ai, Decider.internal.noulPlan(Structure.encode(question)), record = true)
+
+        /** [[Decider.query]] against this conversation, recorded on it. */
+        def query[R](query: Decider.Query[R])(using Frame): R < LLM =
+            LLM.decide(ai, Decider.internal.queryPlan(query), record = true)
+
+        /** [[Decider.batch]] of any number of same-typed questions against this conversation, recorded on
+          * it as one exchange. Empty input asks nothing and records nothing.
+          */
+        def batch[R](queries: Seq[Decider.Query[R]])(using Frame): Chunk[R] < LLM =
+            if queries.isEmpty then Chunk.empty
+            else LLM.decide(ai, Decider.internal.batchPlan(queries), record = true)
+
+        /** [[Decider.batch]] of two questions against this conversation, recorded on it. */
+        def batch[A, B](q1: Decider.Query[A], q2: Decider.Query[B])(using Frame): (A, B) < LLM =
+            LLM.decide(ai, Decider.internal.batchPlan(q1, q2), record = true)
+
+        /** [[Decider.batch]] of three questions against this conversation, recorded on it. */
+        def batch[A, B, D](q1: Decider.Query[A], q2: Decider.Query[B], q3: Decider.Query[D])(using Frame): (A, B, D) < LLM =
+            LLM.decide(ai, Decider.internal.batchPlan(q1, q2, q3), record = true)
+
+        /** [[Decider.batch]] of four questions against this conversation, recorded on it. */
+        def batch[A, B, D, E](q1: Decider.Query[A], q2: Decider.Query[B], q3: Decider.Query[D], q4: Decider.Query[E])(using
+            Frame
+        ): (A, B, D, E) < LLM =
+            LLM.decide(ai, Decider.internal.batchPlan(q1, q2, q3, q4), record = true)
+
+        def systemMessage(content: String)(using Frame): Unit < LLM =
+            LLM.append(ai, SystemMessage(content))
+
+        def userMessage(content: String)(using Frame): Unit < LLM =
+            LLM.append(ai, UserMessage(content, Absent))
+
+        def userMessage(content: String, image: Image)(using Frame): Unit < LLM =
+            LLM.append(ai, UserMessage(content, Present(image)))
+
+        def assistantMessage(content: String)(using Frame): Unit < LLM =
+            LLM.append(ai, AssistantMessage(content))
+
+        def context(using Frame): Context < LLM = LLM.context(ai)
+
+        /** Resets this instance to empty: its conversation, enablements, and config override are dropped, and
+          * the instance reads as fresh again (it remains usable).
+          */
+        def reset(using Frame): Unit < LLM = LLM.discard(ai)
+
+        /** Replaces this instance's conversation `Context` wholesale (history only; enablements and config kept). */
+        def setContext(ctx: Context)(using Frame): Unit < LLM = LLM.setContext(ai, ctx)
+
+        /** Transforms this instance's conversation `Context` with `f` (read-modify-write). */
+        def updateContext(f: Context => Context)(using Frame): Unit < LLM =
+            ai.context.map(c => ai.setContext(f(c)))
+
+        /** Layers enablements (tools, prompts, thoughts, modes, observers, in any mix) onto this instance, on top of the
+          * scope's enablements. Each enablement's capability `S` rides the row, unified across the varargs to
+          * their intersection, so a tool/prompt/thought/mode needing more than `LLM` keeps that requirement
+          * visible at this instance's generations.
+          */
+        def enable[S](enablements: Enablement[S]*)(using Frame): AI < (S & LLM) =
+            AI.updateSession(ai)(s => enablements.foldLeft(s)((acc, e) => e.enableIn(acc)))
+
+        /** The `Seq` form of the varargs `enable`; a `DummyImplicit` differentiates the erased signature. */
+        def enable[S](enablements: Seq[Enablement[S]])(using Frame, DummyImplicit): AI < (S & LLM) =
+            ai.enable(enablements*)
+
+        /** Captures this instance's full state (conversation + enablements + config) as a `AISession`. */
+        def snapshot(using Frame): AISession < LLM =
+            LLM.session(ai)
+    end extension
+
+    // Restores the named instances' AISession to their `before` snapshot, keeping every other
+    // field of `after` (so non-named instances and the scope env retain their post-`v` changes).
+    private def restoreInstances(before: LLM.State, after: LLM.State, ais: Seq[AI]): LLM.State =
+        after.copy(instances =
+            ais.foldLeft(after.instances)((d, ai) =>
+                before.instances.get(ai.ref).fold(d.remove(ai.ref))(s => d.update(ai.ref, s))
+            )
+        )
+end AI

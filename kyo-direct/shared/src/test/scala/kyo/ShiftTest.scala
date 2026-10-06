@@ -1,12 +1,9 @@
 package kyo
 
-import kyo.internal.BaseKyoCoreTest
-import org.scalatest.Assertions
-import org.scalatest.freespec.AnyFreeSpec
 import scala.collection.IterableOps
 import scala.util.Try
 
-class ShiftHygieneTest extends Test:
+class ShiftHygieneTest extends kyo.test.Test[Any]:
     "invalid nested" in {
         typeCheckFailure(
             """
@@ -22,7 +19,7 @@ class ShiftHygieneTest extends Test:
     }
 end ShiftHygieneTest
 
-class ShiftTest extends AnyFreeSpec with Assertions:
+class ShiftTest extends kyo.test.Test[Any]:
 
     "basic" in {
         val x1: Seq[Int < Any] = Seq[Int < Any](1, 2, 3)
@@ -43,7 +40,7 @@ class ShiftTest extends AnyFreeSpec with Assertions:
 
     "valid nested" in {
         val x1: Seq[Int < Any] = Seq[Int < Any](1, 2, 3)
-        val x2 = direct:
+        val x2                 = direct:
             x1.map(x =>
                 def innerF(i: Int) = i + 1
                 innerF(x.now)
@@ -53,11 +50,24 @@ class ShiftTest extends AnyFreeSpec with Assertions:
             def innerF(i: Int) = i + 1
             Sync.defer(innerF(1)).now
 
+        assert(x2.eval == Seq(2, 3, 4))
+        forReference.map(v => assert(v == 2))
+    }
+
+    "val binding inside async-shifted lambda body" in {
+        val x: Seq[Int < Any]  = Seq[Int < Any](1, 2, 3)
+        val x2: Seq[Int] < Any = direct:
+            x.map { e =>
+                val v = e.now
+                v + 1
+            }
+
+        assert(x2.eval == Seq(2, 3, 4))
     }
 
 end ShiftTest
 
-class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
+class ShiftMethodSupportTest extends kyo.test.Test[Any]:
     "Option" - {
         val x: Option[Int < Any] = Option(1)
         val y: Option[Int]       = Option(1)
@@ -65,7 +75,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "filter" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 y.filter(i => f(i).now)
 
             assert(d.eval == Option(1))
@@ -80,7 +90,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "getOrElse" in {
             val w: Int < Any = 3
-            val d = direct:
+            val d            = direct:
                 z.now.getOrElse(w.now)
 
             assert(d.eval == 3)
@@ -103,7 +113,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "filter" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 y.filter(i => f(i).now)
 
             assert(d.eval == Try(1))
@@ -120,7 +130,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "getOrElse" in {
             val default: Int < Any = 2
-            val d = direct:
+            val d                  = direct:
                 z.getOrElse(default.now)
 
             assert(d.eval == 2)
@@ -155,7 +165,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "filter" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yMaybe.filter(i => f(i).now)
 
             assert(d.eval == Maybe(1))
@@ -163,7 +173,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "filterNot" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yMaybe.filterNot(i => f(i).now)
 
             assert(d.eval == Maybe.empty)
@@ -171,7 +181,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "exists" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yMaybe.exists(i => f(i).now)
 
             assert(d.eval)
@@ -179,7 +189,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "forall" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yMaybe.forall(i => f(i).now)
 
             assert(d.eval)
@@ -207,7 +217,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "fold" in {
             def identity(i: Int): Int < Any = i
-            val d = direct:
+            val d                           = direct:
                 yMaybe.fold(0)(i => identity(i).now)
 
             assert(d.eval == 1)
@@ -215,7 +225,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "getOrElse" in {
             val default: Int < Any = 2
-            val d = direct:
+            val d                  = direct:
                 zMaybe.getOrElse(default.now)
 
             assert(d.eval == 2)
@@ -253,7 +263,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "filter" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yResult.filter(i => f(i).now)
 
             assert(d.eval == Result(1))
@@ -261,7 +271,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "exists" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yResult.exists(i => f(i).now)
 
             assert(d.eval)
@@ -269,7 +279,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "forall" in {
             def f(i: Int): Boolean < Any = i < 3
-            val d = direct:
+            val d                        = direct:
                 yResult.forall(i => f(i).now)
 
             assert(d.eval)
@@ -277,7 +287,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "foreach" in {
             def f(i: Int): Unit < Var[Int] = Var.setDiscard(i)
-            val d = direct:
+            val d                          = direct:
                 yResult.foreach(i => f(i).now)
 
             Var.runTuple(0)(d).map((v, _) => assert(v == 1))
@@ -285,7 +295,7 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "fold" in {
             def identity(i: Int): Int < Any = i
-            val d = direct:
+            val d                           = direct:
                 yResult.fold(i => identity(i).now, x => 0, _ => -1)
 
             assert(d.eval == 1)
@@ -293,23 +303,32 @@ class ShiftMethodSupportTest extends AnyFreeSpec with Assertions:
 
         "getOrElse" in {
             val default: Int < Any = 2
-            val d = direct:
+            val d                  = direct:
                 zResult.getOrElse(default.now)
 
             assert(d.eval == 2)
         }
 
         "panic" in {
-            val x: Result[Throwable, Int] = Result.Panic(new Exception("panic"))
+            val ex                        = new Exception("panic")
+            val x: Result[Throwable, Int] = Result.Panic(ex)
 
-            def f(i: Int): Int < Any        = ???
-            def pred(i: Int): Boolean < Any = ???
+            def f(i: Int): Int < Any        = i
+            def pred(i: Int): Boolean < Any = true
 
             val prg = direct:
                 val x1 = x.map(i => f(i).now)
                 val x2 = x1.filter(i => pred(i).now)
                 val x3 = x2.flatMap(i => Result.succeed(f(i).now))
+                x3
 
+            // Panic propagates through all Result operations in direct: block
+            // f and pred are never called because Panic short-circuits map/filter/flatMap
+            val result = prg.eval
+            assert(result.isPanic)
+            result match
+                case Result.Panic(t) => assert(t eq ex) // panic identity is preserved through direct: block
+                case _               => fail("expected Panic result")
         }
 
     }

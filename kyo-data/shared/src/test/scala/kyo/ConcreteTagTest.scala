@@ -1,8 +1,10 @@
 package kyo
 
+import kyo.internal.Platform
+
 case class CustomInt(value: Int) extends AnyVal
 
-class ConcreteTagTest extends Test:
+class ConcreteTagTest extends kyo.test.Test[Any]:
 
     trait Animal
     trait Mammal  extends Animal
@@ -39,7 +41,41 @@ class ConcreteTagTest extends Test:
             "Double" in {
                 val doubleTag = ConcreteTag[Double]
                 assert(doubleTag.accepts(3.14))
-                assert(!doubleTag.accepts(42))
+                assert(!doubleTag.accepts("3.14"))
+                // A JS number carries no width, so every numeric value is a Double there and the
+                // widening a JVM box rules out is not observable.
+                if Platform.isJS then assert(doubleTag.accepts(42))
+                else assert(!doubleTag.accepts(42))
+            }
+
+            "Float" in {
+                val floatTag = ConcreteTag[Float]
+                assert(floatTag.accepts(1.5f))
+                assert(!floatTag.accepts("1.5"))
+            }
+
+            "Byte" in {
+                val byteTag = ConcreteTag[Byte]
+                assert(byteTag.accepts(42.toByte))
+                assert(!byteTag.accepts("42"))
+            }
+
+            "Short" in {
+                val shortTag = ConcreteTag[Short]
+                assert(shortTag.accepts(7.toShort))
+                assert(!shortTag.accepts("7"))
+            }
+
+            "Long" in {
+                val longTag = ConcreteTag[Long]
+                assert(longTag.accepts(9L))
+                assert(!longTag.accepts("9"))
+            }
+
+            "Char" in {
+                val charTag = ConcreteTag[Char]
+                assert(charTag.accepts('c'))
+                assert(!charTag.accepts("c"))
             }
 
             "Boolean" in {
@@ -627,10 +663,13 @@ class ConcreteTagTest extends Test:
 
             "nested unions and intersections" in {
                 val tag = ConcreteTag[((Int & 42) | (String & "hello")) & (Double | Boolean)]
-                assert(!tag.accepts(42))
                 assert(!tag.accepts("hello"))
                 assert(!tag.accepts(3.14))
                 assert(!tag.accepts(true))
+                // On JS the Double member of the right half accepts 42, so both halves of the
+                // intersection do and the whole tag does.
+                if Platform.isJS then assert(tag.accepts(42))
+                else assert(!tag.accepts(42))
             }
 
             "union of literal types and regular types" in {
@@ -639,9 +678,11 @@ class ConcreteTagTest extends Test:
                 assert(tag.accepts("hello"))
                 assert(tag.accepts(true))
                 assert(tag.accepts(3.14))
-                assert(!tag.accepts(43))
                 assert(!tag.accepts(false))
                 assert(tag <:< ConcreteTag[Int | String | Boolean | Double])
+                // On JS the Double member accepts 43, so the union does even though no literal matches.
+                if Platform.isJS then assert(tag.accepts(43))
+                else assert(!tag.accepts(43))
             }
 
             "complex union and intersection with traits" in {
@@ -676,6 +717,27 @@ class ConcreteTagTest extends Test:
                 assert(acceptsNumeric(42))
                 assert(acceptsNumeric(3.14))
             }
+        }
+    }
+
+    "derivation" - {
+        "derive, summon and apply produce the same tag" in {
+            val derived  = ConcreteTag.derive[Dog | Cat]
+            val summoned = summon[ConcreteTag[Dog | Cat]]
+            val applied  = ConcreteTag[Dog | Cat]
+            assert(derived == summoned)
+            assert(applied == derived)
+            assert(derived.accepts(new Cat))
+            assert(!derived.accepts(new Snake))
+        }
+
+        "derive is the given a using clause resolves to" in {
+            def tagOf[A](using tag: ConcreteTag[A]): ConcreteTag[A] = tag
+            assert(tagOf[Int | String] == ConcreteTag.derive[Int | String])
+        }
+
+        "a derives clause is rejected, since ConcreteTag is not a class type" in {
+            typeCheckFailure("case class Point(x: Int) derives kyo.ConcreteTag")("not a class type")
         }
     }
 
@@ -808,6 +870,315 @@ class ConcreteTagTest extends Test:
                     summon[ConcreteTag[A & B]]
 
                 assert(intersection[Int, Boolean] == (ConcreteTag[Int] & ConcreteTag[Boolean]))
+            }
+        }
+    }
+
+    "array operations" - {
+
+        "newArray" - {
+            "Int" in {
+                val arr = ConcreteTag.newArray[Int](5)
+                assert(arr.isInstanceOf[Array[Int]])
+                assert(arr.length == 5)
+                arr(0) = 42
+                assert(arr(0) == 42)
+            }
+
+            "Long" in {
+                val arr = ConcreteTag.newArray[Long](3)
+                assert(arr.isInstanceOf[Array[Long]])
+                assert(arr.length == 3)
+            }
+
+            "Double" in {
+                val arr = ConcreteTag.newArray[Double](4)
+                assert(arr.isInstanceOf[Array[Double]])
+            }
+
+            "Float" in {
+                val arr = ConcreteTag.newArray[Float](2)
+                assert(arr.isInstanceOf[Array[Float]])
+            }
+
+            "Byte" in {
+                val arr = ConcreteTag.newArray[Byte](8)
+                assert(arr.isInstanceOf[Array[Byte]])
+            }
+
+            "Short" in {
+                val arr = ConcreteTag.newArray[Short](3)
+                assert(arr.isInstanceOf[Array[Short]])
+            }
+
+            "Char" in {
+                val arr = ConcreteTag.newArray[Char](3)
+                assert(arr.isInstanceOf[Array[Char]])
+            }
+
+            "Boolean" in {
+                val arr = ConcreteTag.newArray[Boolean](2)
+                assert(arr.isInstanceOf[Array[Boolean]])
+            }
+
+            "String (reference type)" in {
+                val arr = ConcreteTag.newArray[String](3)
+                assert(arr.isInstanceOf[Array[String]])
+                arr(0) = "hello"
+                assert(arr(0) == "hello")
+            }
+
+            "custom class" in {
+                val arr = ConcreteTag.newArray[Dog](2)
+                assert(arr.isInstanceOf[Array[Dog]])
+            }
+
+            "with explicit tag" in {
+                val ct  = ConcreteTag[Int]
+                val arr = ConcreteTag.newArray[Int](5)(using ct)
+                assert(arr.isInstanceOf[Array[Int]])
+            }
+        }
+
+        "fromArray" - {
+            "Int array" in {
+                val arr = new Array[Int](3)
+                val tag = ConcreteTag.fromArray(arr)
+                assert(tag == ConcreteTag[Int])
+            }
+
+            "Long array" in {
+                val tag = ConcreteTag.fromArray(new Array[Long](1))
+                assert(tag == ConcreteTag[Long])
+            }
+
+            "Double array" in {
+                val tag = ConcreteTag.fromArray(new Array[Double](1))
+                assert(tag == ConcreteTag[Double])
+            }
+
+            "Float array" in {
+                val tag = ConcreteTag.fromArray(new Array[Float](1))
+                assert(tag == ConcreteTag[Float])
+            }
+
+            "Byte array" in {
+                val tag = ConcreteTag.fromArray(new Array[Byte](1))
+                assert(tag == ConcreteTag[Byte])
+            }
+
+            "Short array" in {
+                val tag = ConcreteTag.fromArray(new Array[Short](1))
+                assert(tag == ConcreteTag[Short])
+            }
+
+            "Char array" in {
+                val tag = ConcreteTag.fromArray(new Array[Char](1))
+                assert(tag == ConcreteTag[Char])
+            }
+
+            "Boolean array" in {
+                val tag = ConcreteTag.fromArray(new Array[Boolean](1))
+                assert(tag == ConcreteTag[Boolean])
+            }
+
+            "String array" in {
+                assume(!Platform.isNative)
+                val tag = ConcreteTag.fromArray(new Array[String](1))
+                assert(tag == ConcreteTag[String])
+            }
+
+            "roundtrip: fromArray -> newArray preserves type" in {
+                val original = new Array[Int](3)
+                val tag      = ConcreteTag.fromArray(original)
+                val created  = ConcreteTag.newArray[Int](5)(using tag)
+                assert(created.isInstanceOf[Array[Int]])
+            }
+        }
+
+        "copyOf" - {
+            "Int array - grow" in {
+                val src = Array(1, 2, 3)
+                val dst = ConcreteTag.copyOf(src, 5)
+                assert(dst.isInstanceOf[Array[Int]])
+                assert(dst.length == 5)
+                assert(dst(0) == 1)
+                assert(dst(1) == 2)
+                assert(dst(2) == 3)
+                assert(dst(3) == 0)
+            }
+
+            "Int array - shrink" in {
+                val src = Array(1, 2, 3)
+                val dst = ConcreteTag.copyOf(src, 2)
+                assert(dst.isInstanceOf[Array[Int]])
+                assert(dst.length == 2)
+                assert(dst(0) == 1)
+                assert(dst(1) == 2)
+            }
+
+            "Long array" in {
+                val src = Array(1L, 2L, 3L)
+                val dst = ConcreteTag.copyOf(src, 4)
+                assert(dst.isInstanceOf[Array[Long]])
+                assert(dst(0) == 1L)
+                assert(dst(1) == 2L)
+                assert(dst(2) == 3L)
+            }
+
+            "Double array" in {
+                val src = Array(1.0, 2.0)
+                val dst = ConcreteTag.copyOf(src, 3)
+                assert(dst.isInstanceOf[Array[Double]])
+                assert(dst(0) == 1.0)
+            }
+
+            "String array" in {
+                val src = Array("a", "b", "c")
+                val dst = ConcreteTag.copyOf(src, 4)
+                assert(dst.isInstanceOf[Array[String]])
+                assert(dst(0) == "a")
+                assert(dst(1) == "b")
+                assert(dst(2) == "c")
+                assert(dst(3) == null)
+            }
+
+            "Boolean array" in {
+                val src = Array(true, false)
+                val dst = ConcreteTag.copyOf(src, 3)
+                assert(dst.isInstanceOf[Array[Boolean]])
+                assert(dst(0) == true)
+                assert(dst(1) == false)
+                assert(dst(2) == false)
+            }
+
+            "same length (exact copy)" in {
+                val src = Array(1, 2, 3)
+                val dst = ConcreteTag.copyOf(src, 3)
+                assert(dst.isInstanceOf[Array[Int]])
+                assert(java.util.Arrays.equals(src, dst))
+                assert(!(src eq dst))
+            }
+
+            "empty source" in {
+                val src = Array.emptyIntArray
+                val dst = ConcreteTag.copyOf(src, 0)
+                assert(dst.isInstanceOf[Array[Int]])
+                assert(dst.length == 0)
+            }
+        }
+
+        "Unit tag produces BoxedUnit arrays" in {
+            val arr = ConcreteTag.newArray[Unit](2)
+            assert(arr.getClass eq classOf[Array[scala.runtime.BoxedUnit]])
+        }
+
+        "union tag produces Object arrays" in {
+            val arr = ConcreteTag.newArray[Int | String](2)
+            assert(arr.getClass eq classOf[Array[AnyRef]])
+        }
+
+        "length zero is the shared empty array of the class" in {
+            assert(ConcreteTag.newArray[Int](0) eq Array.emptyIntArray)
+            assert(ConcreteTag.newArray[String](0) eq ConcreteTag.newArray[String](0))
+            assert(ConcreteTag.copyOf(Array("a"), 0) eq ConcreteTag.newArray[String](0))
+        }
+
+        "Any tag produces Object arrays" in {
+            val arr = ConcreteTag.newArray[Any](3)
+            assert(arr.isInstanceOf[Array[AnyRef]])
+            assert(arr.length == 3)
+        }
+
+        "fromClass" - {
+            "primitive classes" in {
+                assert(ConcreteTag.fromClass[Int](java.lang.Integer.TYPE) == ConcreteTag[Int])
+                assert(ConcreteTag.fromClass[Long](java.lang.Long.TYPE) == ConcreteTag[Long])
+                assert(ConcreteTag.fromClass[Double](java.lang.Double.TYPE) == ConcreteTag[Double])
+                assert(ConcreteTag.fromClass[Float](java.lang.Float.TYPE) == ConcreteTag[Float])
+                assert(ConcreteTag.fromClass[Byte](java.lang.Byte.TYPE) == ConcreteTag[Byte])
+                assert(ConcreteTag.fromClass[Short](java.lang.Short.TYPE) == ConcreteTag[Short])
+                assert(ConcreteTag.fromClass[Char](java.lang.Character.TYPE) == ConcreteTag[Char])
+                assert(ConcreteTag.fromClass[Boolean](java.lang.Boolean.TYPE) == ConcreteTag[Boolean])
+            }
+
+            "reference classes" in {
+                assert(ConcreteTag.fromClass[String](classOf[String]) == ConcreteTag[String])
+                assert(ConcreteTag.fromClass[Dog](classOf[Dog]) == ConcreteTag[Dog])
+            }
+
+            "roundtrip with fromArray" in {
+                val arr = new Array[Int](1)
+                assert(ConcreteTag.fromArray(arr) == ConcreteTag.fromClass[Int](java.lang.Integer.TYPE))
+            }
+        }
+
+        "toClass" - {
+            "primitive tags" in {
+                assert(ConcreteTag[Int].toClass eq java.lang.Integer.TYPE)
+                assert(ConcreteTag[Long].toClass eq java.lang.Long.TYPE)
+                assert(ConcreteTag[Double].toClass eq java.lang.Double.TYPE)
+                assert(ConcreteTag[Float].toClass eq java.lang.Float.TYPE)
+                assert(ConcreteTag[Byte].toClass eq java.lang.Byte.TYPE)
+                assert(ConcreteTag[Short].toClass eq java.lang.Short.TYPE)
+                assert(ConcreteTag[Char].toClass eq java.lang.Character.TYPE)
+                assert(ConcreteTag[Boolean].toClass eq java.lang.Boolean.TYPE)
+                assert(ConcreteTag[Unit].toClass eq java.lang.Void.TYPE)
+            }
+
+            "reference types" in {
+                assert(ConcreteTag[String].toClass eq classOf[String])
+                assert(ConcreteTag[Dog].toClass eq classOf[Dog])
+            }
+
+            "complex types fall back to AnyRef" in {
+                assert((ConcreteTag[Int] | ConcreteTag[String]).toClass eq classOf[AnyRef])
+                assert((ConcreteTag[Int] & ConcreteTag[String]).toClass eq classOf[AnyRef])
+            }
+
+            "roundtrip fromClass -> toClass" in {
+                assert(ConcreteTag.fromClass[Int](java.lang.Integer.TYPE).toClass eq java.lang.Integer.TYPE)
+                assert(ConcreteTag.fromClass[String](classOf[String]).toClass eq classOf[String])
+            }
+
+            "roundtrip toClass -> fromClass" in {
+                assert(ConcreteTag.fromClass[Int](ConcreteTag[Int].toClass) == ConcreteTag[Int])
+                assert(ConcreteTag.fromClass[Long](ConcreteTag[Long].toClass) == ConcreteTag[Long])
+                assert(ConcreteTag.fromClass[String](ConcreteTag[String].toClass) == ConcreteTag[String])
+            }
+        }
+
+        "showType" - {
+
+            "renders the type with no wrapper, where show wraps it" in {
+                assert(ConcreteTag[Int].showType == "Int")
+                assert(ConcreteTag[String].showType == "String")
+                assert(ConcreteTag[Dog].showType == "Dog")
+            }
+
+            "show is showType inside the wrapper, so existing callers are unchanged" in {
+                assert(ConcreteTag[Int].show == "ConcreteTag[Int]")
+                assert(ConcreteTag[String].show == "ConcreteTag[String]")
+                assert(ConcreteTag[Dog].show == s"ConcreteTag[${ConcreteTag[Dog].showType}]")
+            }
+
+            // The reason showType exists rather than callers using toClass.getSimpleName, which is the
+            // cheaper spelling and is lossy: every one of these collapses to Object under toClass.
+            "is lossless where toClass is not" in {
+                val union        = ConcreteTag[Int] | ConcreteTag[String]
+                val intersection = ConcreteTag[Swimmer] & ConcreteTag[Flyer]
+                assert(union.showType == "(Int | String)")
+                assert(intersection.showType == "(Swimmer & Flyer)")
+                assert(ConcreteTag[Nothing].showType == "Nothing")
+                assert(union.toClass eq classOf[AnyRef])
+                assert(intersection.toClass eq classOf[AnyRef])
+            }
+
+            // A primitive's erased class renders lowercase, which is what the PostgreSQL empty-range
+            // refusal used to print: `Range[int]` for a `Range[Int]`.
+            "renders a primitive as its Scala name, not its erased lowercase one" in {
+                assert(ConcreteTag[Int].showType == "Int")
+                assert(ConcreteTag[Int].toClass.getSimpleName == "int")
             }
         }
     }

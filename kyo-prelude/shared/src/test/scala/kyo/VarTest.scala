@@ -1,6 +1,6 @@
 package kyo
 
-class VarTest extends Test:
+class VarTest extends kyo.test.Test[Any]:
 
     "get" in {
         val r = Var.run(1)(Var.get[Int].map(_ + 1)).eval
@@ -93,7 +93,7 @@ class VarTest extends Test:
     }
 
     "side effect" in {
-        var calls = 0
+        var calls  = 0
         val result =
             Var.run(1) {
                 for
@@ -118,7 +118,7 @@ class VarTest extends Test:
 
     "isolate" - {
         "merge" - {
-            "combines values from isolated and outer scopes" in run {
+            "combines values from isolated and outer scopes" in {
                 val result = Var.runTuple(42) {
                     Var.isolate.merge[Int](_ + _).run {
                         for
@@ -131,15 +131,15 @@ class VarTest extends Test:
                 assert(result.eval == (52, (42, 10)))
             }
 
-            "proper state restoration after nested isolations" in run {
+            "proper state restoration after nested isolations" in {
                 val result = Var.runTuple(1) {
                     for
                         start <- Var.get[Int]
-                        v1 <- Var.isolate.merge[Int](_ + _).run {
+                        v1    <- Var.isolate.merge[Int](_ + _).run {
                             Var.update[Int](_ + 1).andThen(Var.get[Int])
                         }
                         middle <- Var.get[Int]
-                        v2 <- Var.isolate.merge[Int](_ + _).run {
+                        v2     <- Var.isolate.merge[Int](_ + _).run {
                             Var.update[Int](_ + 2).andThen(Var.get[Int])
                         }
                         end <- Var.get[Int]
@@ -148,7 +148,7 @@ class VarTest extends Test:
                 assert(result.eval == (8, (1, 2, 3, 5, 8)))
             }
 
-            "with multishot" in run {
+            "with multishot" in {
                 val result: (Int, Chunk[Int]) < Any = Var.runTuple(1) {
                     Choice.run:
                         Choice.eval(1, 2, 3).map: i =>
@@ -170,11 +170,11 @@ class VarTest extends Test:
         }
 
         "update" - {
-            "replaces outer value with inner value" in run {
+            "replaces outer value with inner value" in {
                 val result = Var.runTuple(42) {
                     for
                         before <- Var.get[Int]
-                        _ <- Var.isolate.update[Int].run {
+                        _      <- Var.isolate.update[Int].run {
                             Var.set(10)
                         }
                         after <- Var.get[Int]
@@ -183,11 +183,11 @@ class VarTest extends Test:
                 assert(result.eval == (10, (42, 10)))
             }
 
-            "nested updates apply in order" in run {
+            "nested updates apply in order" in {
                 val result = Var.runTuple(1) {
                     for
                         start <- Var.get[Int]
-                        _ <- Var.isolate.update[Int].run {
+                        _     <- Var.isolate.update[Int].run {
                             Var.update[Int](_ + 1).andThen {
                                 Var.isolate.update[Int].run {
                                     Var.update[Int](_ * 2)
@@ -200,12 +200,12 @@ class VarTest extends Test:
                 assert(result.eval == (4, (1, 4)))
             }
 
-            "value changes preserved after effects" in run {
+            "value changes preserved after effects" in {
                 val result = Var.runTuple(5) {
                     Env.run(2) {
                         for
                             start <- Var.get[Int]
-                            _ <- Var.isolate.update[Int].run {
+                            _     <- Var.isolate.update[Int].run {
                                 Env.use[Int] { multiplier =>
                                     Var.update[Int](_ * multiplier)
                                 }
@@ -219,11 +219,11 @@ class VarTest extends Test:
         }
 
         "discard" - {
-            "inner modifications don't affect outer scope" in run {
+            "inner modifications don't affect outer scope" in {
                 val result = Var.runTuple(42) {
                     for
                         before <- Var.get[Int]
-                        _ <- Var.isolate.discard[Int].run {
+                        _      <- Var.isolate.discard[Int].run {
                             Var.set(10)
                         }
                         after <- Var.get[Int]
@@ -232,11 +232,11 @@ class VarTest extends Test:
                 assert(result.eval == (42, (42, 42)))
             }
 
-            "nested discards maintain isolation" in run {
+            "nested discards maintain isolation" in {
                 val result = Var.runTuple(1) {
                     for
                         start <- Var.get[Int]
-                        _ <- Var.isolate.discard[Int].run {
+                        _     <- Var.isolate.discard[Int].run {
                             Var.update[Int](_ + 1).andThen {
                                 Var.isolate.discard[Int].run {
                                     Var.update[Int](_ * 2)
@@ -249,12 +249,12 @@ class VarTest extends Test:
                 assert(result.eval == (1, (1, 1)))
             }
 
-            "effects execute but state changes discarded" in run {
+            "effects execute but state changes discarded" in {
                 var sideEffect = 0
-                val result = Var.runTuple(5) {
+                val result     = Var.runTuple(5) {
                     for
                         start <- Var.get[Int]
-                        _ <- Var.isolate.discard[Int].run {
+                        _     <- Var.isolate.discard[Int].run {
                             Var.update[Int] { x =>
                                 sideEffect += 1
                                 x * 2
@@ -269,7 +269,7 @@ class VarTest extends Test:
         }
 
         "composition" - {
-            "can combine multiple isolates" in run {
+            "can combine multiple isolates" in {
                 val i1 = Var.isolate.merge[Int](_ + _)
                 val i2 = Var.isolate.update[Int]
 
@@ -278,7 +278,7 @@ class VarTest extends Test:
                 val result = Var.runTuple(1) {
                     for
                         start <- Var.get[Int]
-                        _ <- combined.run {
+                        _     <- combined.run {
                             Var.update[Int](_ + 1)
                         }
                         end <- Var.get[Int]
@@ -287,18 +287,18 @@ class VarTest extends Test:
                 assert(result.eval == (2, (1, 2)))
             }
 
-            "preserves individual isolation behaviors when composed" in run {
+            "preserves individual isolation behaviors when composed" in {
                 val i1 = Var.isolate.discard[Int]
                 val i2 = Var.isolate.update[Int]
 
                 val result = Var.runTuple(1) {
                     for
                         start <- Var.get[Int]
-                        _ <- i1.run {
+                        _     <- i1.run {
                             Var.set(10)
                         }
                         middle <- Var.get[Int]
-                        _ <- i2.run {
+                        _      <- i2.run {
                             Var.set(20)
                         }
                         end <- Var.get[Int]
@@ -307,7 +307,7 @@ class VarTest extends Test:
                 assert(result.eval == (20, (1, 1, 20)))
             }
 
-            "with Emit isolate" in run {
+            "with Emit isolate" in {
                 val varIsolate  = Var.isolate.discard[Int]
                 val emitIsolate = Emit.isolate.merge[Int]
 
@@ -400,5 +400,19 @@ class VarTest extends Test:
 
             assert(Var.run(Nil)(sequence.flatten).eval == List("first", "second", "third"))
         }
+    }
+
+    // #531's own program, through Var's ArrowEffect dispatch. The for-comprehension desugars to a map after the
+    // recursive suspension, so each level leaves a continuation behind rather than recursing in tail position. The
+    // assertion is on the value, so a rescue that unwinds by dropping continuations fails too.
+    "stack-safe when a for-comprehension follows a recursive Var suspension" in {
+        def program: Int < Var[Int] =
+            for
+                n <- Var.get[Int]
+                // Ascribed because a generator gives its right-hand side no expected type, so the branches would
+                // unify to a union before the lift can fire.
+                x <- (if n <= 0 then n else Var.set(n - 1).andThen(program)): Int < Var[Int]
+            yield x
+        assert(Var.run(100000)(program).eval == 0)
     }
 end VarTest

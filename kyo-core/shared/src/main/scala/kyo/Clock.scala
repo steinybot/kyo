@@ -6,6 +6,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kyo.Clock.Deadline
 import kyo.Clock.Stopwatch
+import kyo.internal.Reducible
 import kyo.scheduler.IOPromise
 import kyo.scheduler.util.Threads
 import scala.annotation.tailrec
@@ -14,12 +15,14 @@ import scala.collection.mutable.PriorityQueue
 /** A clock that provides time-related operations and utilities for managing temporal aspects of computations.
   *
   * Clock offers a comprehensive set of functionality for:
+  *
   *   - Accessing current time (both wall-clock via `now` and monotonic via `nowMonotonic`)
   *   - Measuring elapsed time with `stopwatch` and the `Stopwatch` class
   *   - Setting deadlines with `deadline` and checking timeouts with `isOverdue`
   *   - Controlling execution timing with `sleep` for suspending execution
   *   - Scheduling recurring tasks with `repeatWithDelay` and `repeatAtInterval`
   *   - Controlling time flow for testing with `withTimeShift` and `withTimeControl`
+  *   - Displacing the wall reading alone with `withTimeOffset`
   *
   * The Clock API has both stateful methods (bound to a specific Clock instance) and stateless methods (using the local Clock in context).
   * This design allows most code to use the simpler stateless API while still supporting custom Clock implementations when needed.
@@ -52,6 +55,7 @@ final case class Clock(unsafe: Clock.Unsafe):
     /** Gets the current time as an Instant.
       *
       * This method returns the current wall-clock time, which corresponds to actual calendar time. Use this method when you need:
+      *
       *   - Human-readable timestamps for logs, reports, or user interfaces
       *   - Date/time calculations related to real-world time (dates, time zones, etc.)
       *   - Time values that will be persisted or communicated outside the application
@@ -64,12 +68,13 @@ final case class Clock(unsafe: Clock.Unsafe):
       * @see
       *   [[nowMonotonic]] for measuring elapsed time between events
       */
-    def now(using Frame): Instant < Sync = Sync.Unsafe(unsafe.now())
+    def now(using Frame): Instant < Sync = Sync.Unsafe.defer(unsafe.now())
 
     /** Gets the current monotonic time as a Duration.
       *
       * This method returns a strictly monotonically increasing time value, guaranteed to always move forward. Use this method when you
       * need:
+      *
       *   - Measuring elapsed time between operations
       *   - Calculating timeouts and deadlines
       *   - Performance timing or benchmarking
@@ -86,14 +91,14 @@ final case class Clock(unsafe: Clock.Unsafe):
       * @see
       *   [[now]] for calendar time/date operations
       */
-    def nowMonotonic(using Frame): Duration < Sync = Sync.Unsafe(unsafe.nowMonotonic())
+    def nowMonotonic(using Frame): Duration < Sync = Sync.Unsafe.defer(unsafe.nowMonotonic())
 
     /** Creates a new stopwatch.
       *
       * @return
       *   A new Stopwatch instance
       */
-    def stopwatch(using Frame): Clock.Stopwatch < Sync = Sync.Unsafe(unsafe.stopwatch().safe)
+    def stopwatch(using Frame): Clock.Stopwatch < Sync = Sync.Unsafe.defer(unsafe.stopwatch().safe)
 
     /** Creates a new deadline with the specified duration.
       *
@@ -102,12 +107,12 @@ final case class Clock(unsafe: Clock.Unsafe):
       * @return
       *   A new Deadline instance
       */
-    def deadline(duration: Duration)(using Frame): Clock.Deadline < Sync = Sync.Unsafe(unsafe.deadline(duration).safe)
+    def deadline(duration: Duration)(using Frame): Clock.Deadline < Sync = Sync.Unsafe.defer(unsafe.deadline(duration).safe)
 
     private[kyo] def sleep(duration: Duration)(using Frame): Fiber[Unit, Any] < Sync =
         if duration == Duration.Zero then Fiber.unit
         else if !duration.isFinite then Fiber.never
-        else Sync.Unsafe(unsafe.sleep(duration).safe)
+        else Sync.Unsafe.defer(unsafe.sleep(duration).safe)
 end Clock
 
 /** Companion object for creating and managing Clock instances. */
@@ -126,13 +131,13 @@ object Clock:
           * @return
           *   The elapsed time as a Duration
           */
-        def elapsed(using Frame): Duration < Sync = Sync.Unsafe(unsafe.elapsed())
+        def elapsed(using Frame): Duration < Sync = Sync.Unsafe.defer(unsafe.elapsed())
     end Stopwatch
 
     object Stopwatch:
         /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
         final class Unsafe(start: Duration, clock: Clock.Unsafe) extends Serializable:
-            def elapsed()(using AllowUnsafe): Duration = clock.nowMonotonic() - start
+            def elapsed()(using AllowUnsafe): Duration = clock.nowMonotonic().minusOrZero(start)
             def safe: Stopwatch                        = Stopwatch(this)
         end Unsafe
     end Stopwatch
@@ -149,24 +154,24 @@ object Clock:
           * @return
           *   The remaining time as a Duration
           */
-        def timeLeft(using Frame): Duration < Sync = Sync.Unsafe(unsafe.timeLeft())
+        def timeLeft(using Frame): Duration < Sync = Sync.Unsafe.defer(unsafe.timeLeft())
 
         /** Checks if the deadline is overdue.
           *
           * @return
           *   A boolean indicating if the deadline is overdue
           */
-        def isOverdue(using Frame): Boolean < Sync = Sync.Unsafe(unsafe.isOverdue())
+        def isOverdue(using Frame): Boolean < Sync = Sync.Unsafe.defer(unsafe.isOverdue())
     end Deadline
 
     object Deadline:
         /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
-        final class Unsafe(endInstant: Maybe[Instant], clock: Clock.Unsafe) extends Serializable:
+        final class Unsafe(endMonotonic: Maybe[Duration], clock: Clock.Unsafe) extends Serializable:
 
             def timeLeft()(using AllowUnsafe): Duration =
-                endInstant.map(_ - clock.now()).getOrElse(Duration.Infinity)
+                endMonotonic.map(_.minusOrZero(clock.nowMonotonic())).getOrElse(Duration.Infinity)
 
-            def isOverdue()(using AllowUnsafe): Boolean = endInstant.exists(_ < clock.now())
+            def isOverdue()(using AllowUnsafe): Boolean = endMonotonic.exists(_ < clock.nowMonotonic())
 
             def safe: Deadline = Deadline(this)
         end Unsafe
@@ -229,13 +234,13 @@ object Clock:
             Sync.Unsafe.withLocal(local) { clock =>
                 val shifted =
                     new Unsafe:
-                        val underlying  = clock.unsafe
-                        val start       = underlying.now()
-                        val sleepFactor = (1.toDouble / factor)
+                        val underlying                        = clock.unsafe
+                        val start                             = underlying.now()
+                        val sleepFactor                       = (1.toDouble / factor)
                         def nowMonotonic()(using AllowUnsafe) =
                             now().toDuration
                         def now()(using AllowUnsafe) =
-                            val diff = underlying.now() - start
+                            val diff = underlying.now().minusOrZero(start)
                             start + (diff * factor)
                         end now
                         override def sleep(duration: Duration) =
@@ -244,6 +249,106 @@ object Clock:
             }
         end if
     end withTimeShift
+
+    /** A signed displacement of the wall clock, in nanoseconds, applied by [[withTimeOffset]].
+      *
+      * It is signed because a displaced clock may read ahead of the clock it derives from or behind it, which a [[Duration]] cannot carry:
+      * a `Duration` is never negative. [[TimeOffset.between]] is the displacement that makes a reading of `from` read `to`, negative when
+      * `to` precedes `from`.
+      *
+      * `toNanos` and [[TimeOffset.fromNanos]] round-trip exactly, which makes the signed nanosecond count the form to persist an offset
+      * in and reapply it later.
+      *
+      * Note: an offset of `ahead(Duration.Infinity)` pins the displaced reading at `Instant.Max`, and `behind(Duration.Infinity)` at
+      * `Instant.Min`. Sums of offsets saturate at those two bounds rather than wrapping.
+      *
+      * @see
+      *   [[withTimeOffset]] For running an effect under a displaced clock
+      * @see
+      *   [[withTimeShift]] For scaling the rate of the clock instead
+      */
+    opaque type TimeOffset = Long
+
+    object TimeOffset:
+
+        given CanEqual[TimeOffset, TimeOffset] = CanEqual.derived
+
+        /** No displacement. */
+        val Zero: TimeOffset = 0L
+
+        /** Displaces the reading forward, later than the underlying clock. */
+        def ahead(by: Duration): TimeOffset = by.toNanos
+
+        /** Displaces the reading backward, earlier than the underlying clock. */
+        def behind(by: Duration): TimeOffset = -by.toNanos
+
+        /** The displacement that makes a reading of `from` read `to`: `to` minus `from`, negative when `to` precedes `from`. */
+        def between(from: Instant, to: Instant): TimeOffset =
+            to.minus(from) match
+                case Present(forward) => ahead(forward)
+                case Absent           => behind(from.minusOrZero(to))
+
+        /** The offset of `nanos` signed nanoseconds, the inverse of `toNanos`. */
+        def fromNanos(nanos: Long): TimeOffset = Math.max(nanos, -Long.MaxValue)
+
+        extension (self: TimeOffset)
+
+            /** The signed displacement in nanoseconds. */
+            def toNanos: Long = self
+        end extension
+    end TimeOffset
+
+    /** Runs an effect with a Clock whose wall reading is displaced by `offset` from the current Clock's.
+      *
+      * Only the wall reading moves: `now` is the current Clock's `now` plus `offset`, while `nowMonotonic` and sleeps are the current
+      * Clock's, unchanged and unscaled. Stopwatches, deadlines, `Async.sleep` and `Async.timeout` therefore measure the same durations as
+      * outside the scope. Nested offsets sum. Fibers forked inside the scope inherit the displaced Clock.
+      *
+      * Under [[withTimeControl]], `now` is the controlled time plus `offset`, and a sleep fires when the control advances past its
+      * duration.
+      *
+      * IMPORTANT: a [[withTimeControl]] opened inside the scope does not reuse an outer control. The displaced Clock is not a
+      * [[TimeControl]], so it starts a new controlled Clock at `Instant.Epoch`, with neither the offset nor the outer control's time.
+      *
+      * @param offset
+      *   The signed displacement of the wall reading
+      * @param v
+      *   The effect to run with the displaced clock
+      * @return
+      *   The result of running the effect with the displaced clock
+      */
+    def withTimeOffset[A, S](offset: TimeOffset)(v: => A < S)(using Frame): A < (Sync & S) =
+        if offset == TimeOffset.Zero then v
+        else
+            Sync.Unsafe.withLocal(local) { clock =>
+                val displaced =
+                    clock.unsafe match
+                        case outer: OffsetUnsafe => OffsetUnsafe(outer.underlying, addOffsets(outer.offset, offset))
+                        case underlying          => OffsetUnsafe(underlying, offset)
+                let(Clock(displaced))(v)
+            }
+        end if
+    end withTimeOffset
+
+    // Flat rather than stacked, so nested offsets sum before saturating: ahead(Infinity) inside behind(Infinity) reads the underlying time.
+    final private class OffsetUnsafe(val underlying: Unsafe, val offset: TimeOffset) extends Unsafe:
+        def now()(using AllowUnsafe) =
+            val base = underlying.now()
+            if offset >= 0 then base + Duration.fromNanos(offset)
+            else base - Duration.fromNanos(-offset)
+        end now
+        def nowMonotonic()(using AllowUnsafe) = underlying.nowMonotonic()
+        def sleep(duration: Duration)         = underlying.sleep(duration)
+    end OffsetUnsafe
+
+    private def addOffsets(a: TimeOffset, b: TimeOffset): TimeOffset =
+        val sum = a + b
+        // Overflow is two operands of one sign producing a sum of the other.
+        if ((a ^ sum) & (b ^ sum)) < 0 then
+            if a > 0 then Long.MaxValue else -Long.MaxValue
+        else TimeOffset.fromNanos(sum)
+        end if
+    end addOffsets
 
     /** Interface for controlling time in a test environment.
       *
@@ -298,6 +403,21 @@ object Clock:
           */
         def advance(duration: Duration, wallClockDelay: Duration): Unit < Async
 
+        /** Suspends until at least `count` sleep operations are registered and not yet triggered.
+          *
+          * A periodic task re-arms its next sleep only after `advance` triggers the current one and its body runs on another fiber. Fencing on
+          * the re-armed sleeper lets a test advance exactly one interval per tick, so the tick count is exact regardless of fiber interleaving.
+          */
+        def awaitPendingSleepers(count: Int): Unit < Async
+
+        /** Suspends until a sleep armed for exactly `duration` is registered and not yet triggered.
+          *
+          * A count fence cannot tell which sleeper it saw: a timeout, a pool's idle timer or any other sleep on the same clock satisfies it
+          * before the one a test waits for is armed, and an `advance` taken then fires nothing for that one. Fencing on the duration waits for
+          * the sleeper itself, whatever else shares the clock.
+          */
+        def awaitPendingSleeper(duration: Duration): Unit < Async
+
     end TimeControl
 
     /** Runs an effect with a controlled Clock that allows manual time manipulation. This is primarily intended for testing scenarios where
@@ -311,61 +431,99 @@ object Clock:
       *   The result of running the effect with controlled time
       */
     def withTimeControl[A, S](f: TimeControl => A < S)(using Frame): A < (Sync & S) =
-        Sync.Unsafe {
-            val controlled =
-                new Unsafe with TimeControl:
-                    @volatile var current = Instant.Epoch
+        Sync.Unsafe.withLocal(local) { clock =>
+            clock.unsafe match
+                case control: TimeControl =>
+                    f(control)
+                case _ =>
+                    Sync.Unsafe.defer {
+                        val controlled =
+                            new Unsafe with TimeControl:
+                                @volatile var current = Instant.Epoch
 
-                    case class Task(deadline: Instant) extends IOPromise[Nothing, Unit < Any]
-                    val queue = new PriorityQueue[Task](using Ordering.fromLessThan((a, b) => b.deadline < a.deadline))
+                                case class Task(deadline: Instant, duration: Duration) extends IOPromise[Nothing, Unit < Any]
+                                val queue = new PriorityQueue[Task](using Ordering.fromLessThan((a, b) => b.deadline < a.deadline))
 
-                    def now()(using AllowUnsafe) = current
+                                // Test seam: waiters installed by the pending-sleeper fences, each completed by the next sleep enqueue.
+                                // Guarded by the queue monitor; the completion runs outside the lock, mirroring tick. A list, so two fences
+                                // waiting at once both wake.
+                                var armWaiters: Chunk[IOPromise[Nothing, Unit < Any]] = Chunk.empty
 
-                    def nowMonotonic()(using AllowUnsafe) = current.toDuration
+                                def now()(using AllowUnsafe) = current
 
-                    def sleep(duration: Duration): Fiber.Unsafe[Unit, Any] =
-                        val task = new Task(current + duration)
-                        queue.synchronized {
-                            queue.enqueue(task)
-                        }
-                        Promise.Unsafe.fromIOPromise(task)
-                    end sleep
+                                def nowMonotonic()(using AllowUnsafe) = current.toDuration
 
-                    def set(now: Instant) = set(now, 100.millis)
+                                def sleep(duration: Duration): Fiber.Unsafe[Unit, Any] =
+                                    val task     = new Task(current + duration, duration)
+                                    val toSignal =
+                                        queue.synchronized {
+                                            queue.enqueue(task)
+                                            val w = armWaiters
+                                            armWaiters = Chunk.empty
+                                            w
+                                        }
+                                    toSignal.foreach(_.completeDiscard(Result.succeed(())))
+                                    Promise.Unsafe.fromIOPromise(task)
+                                end sleep
 
-                    def set(now: Instant, wallClockDelay: Duration) =
-                        Sync.defer {
-                            current = now
-                            tick()
-                            Clock.live.unsafe.sleep(wallClockDelay).safe.get
-                        }
+                                def awaitPendingSleepers(count: Int): Unit < Async =
+                                    awaitPending(pending => pending.count(!_.done()) >= count)
 
-                    def advance(duration: Duration) = advance(duration, duration.min(100.millis))
+                                def awaitPendingSleeper(duration: Duration): Unit < Async =
+                                    awaitPending(pending => pending.exists(task => !task.done() && task.duration == duration))
 
-                    def advance(duration: Duration, wallClockDelay: Duration) =
-                        Sync.defer {
-                            current = current + duration
-                            tick()
-                            Clock.live.unsafe.sleep(wallClockDelay).safe.get
-                        }
+                                // Re-checks after every sleep enqueue until `satisfied` holds for the queue.
+                                def awaitPending(satisfied: PriorityQueue[Task] => Boolean): Unit < Async =
+                                    Loop.foreach {
+                                        val waiter: Maybe[IOPromise[Nothing, Unit < Any]] =
+                                            queue.synchronized {
+                                                if satisfied(queue) then Maybe.empty
+                                                else
+                                                    val w = new IOPromise[Nothing, Unit < Any]()
+                                                    armWaiters = armWaiters.append(w)
+                                                    Present(w)
+                                            }
+                                        waiter match
+                                            case Absent     => Loop.done
+                                            case Present(w) => Promise.Unsafe.fromIOPromise(w).safe.get.andThen(Loop.continue)
+                                    }
 
-                    def tick(): Unit =
-                        queue.synchronized {
-                            queue.headOption match
-                                case Some(task) if task.deadline <= current =>
-                                    Maybe(queue.dequeue())
-                                case Some(task) if task.done() =>
-                                    discard(queue.dequeue())
-                                    Maybe.empty
-                                case _ =>
-                                    Maybe.empty
-                        } match
-                            case Present(task) =>
-                                task.completeDiscard(Result.succeed(()))
-                                tick()
-                            case Absent =>
-                                ()
-            let(Clock(controlled))(f(controlled))
+                                def set(now: Instant) = set(now, 100.millis)
+
+                                def set(now: Instant, wallClockDelay: Duration) =
+                                    Sync.defer {
+                                        current = now
+                                        tick()
+                                        Clock.live.unsafe.sleep(wallClockDelay).safe.get
+                                    }
+
+                                def advance(duration: Duration) = advance(duration, duration.min(100.millis))
+
+                                def advance(duration: Duration, wallClockDelay: Duration) =
+                                    Sync.defer {
+                                        current = current + duration
+                                        tick()
+                                        Clock.live.unsafe.sleep(wallClockDelay).safe.get
+                                    }
+
+                                def tick(): Unit =
+                                    queue.synchronized {
+                                        queue.headOption match
+                                            case Some(task) if task.deadline <= current =>
+                                                Maybe(queue.dequeue())
+                                            case Some(task) if task.done() =>
+                                                discard(queue.dequeue())
+                                                Maybe.empty
+                                            case _ =>
+                                                Maybe.empty
+                                    } match
+                                        case Present(task) =>
+                                            task.completeDiscard(Result.succeed(()))
+                                            tick()
+                                        case Absent =>
+                                            ()
+                        let(Clock(controlled))(f(controlled))
+                    }
         }
     end withTimeControl
 
@@ -375,7 +533,11 @@ object Clock:
       *   The current time
       */
     def now(using Frame): Instant < Sync =
-        Sync.Unsafe.withLocal(local)(_.unsafe.now())
+        nowWith(identity)
+
+    /** Gets the current time and passes it to a continuation function. */
+    inline def nowWith[A, S](inline f: Instant => A < S)(using Frame): A < (S & Sync) =
+        Sync.Unsafe.withLocal(local)(clock => f(clock.unsafe.now()))
 
     /** Gets the current monotonic time using the local Clock instance. Unlike `now`, this is guaranteed to be strictly monotonic and
       * suitable for measuring elapsed time.
@@ -542,7 +704,7 @@ object Clock:
                 Loop(state, delaySchedule) { (state, schedule) =>
                     clock.now.map { now =>
                         schedule.next(now) match
-                            case Absent => Loop.done(state)
+                            case Absent                            => Loop.done(state)
                             case Present((duration, nextSchedule)) =>
                                 clock.sleep(duration).map(_.use(_ => f(state).map(Loop.continue(_, nextSchedule))))
                     }
@@ -552,8 +714,9 @@ object Clock:
 
     /** Repeatedly executes a task at fixed time intervals.
       *
-      * Unlike repeatWithDelay, this ensures consistent execution intervals regardless of task duration. If a task takes longer than the
-      * interval, the next execution will start immediately after completion.
+      * Unlike repeatWithDelay, the interval is measured between scheduled starts, so the time a task takes does not shift the runs after
+      * it. If a task takes longer than the interval, the next execution starts immediately after it completes and the one after that
+      * returns to the interval; starts missed meanwhile are not replayed.
       *
       * @param interval
       *   The fixed time interval between task starts
@@ -628,9 +791,13 @@ object Clock:
         frame: Frame,
         reduce: Reducible[Abort[E]]
     ): Fiber[A, reduce.SReduced] < (Sync & S) =
-        repeatAtInterval(Schedule.delay(startAfter).andThen(Schedule.fixed(interval)), state)(f)
+        repeatAtInterval(Schedule.internal.FixedRate(startAfter, interval, Absent), state)(f)
 
     /** Repeatedly executes a task with intervals determined by a custom schedule.
+      *
+      * Before each run this sleeps exactly the delay the schedule answers, asked with the time the previous run ended. A schedule that
+      * measures from that time, such as `Schedule.anchored`, keeps a fixed rate; one that does not, such as `Schedule.fixed`, measures from
+      * the end of the previous run, as repeatWithDelay does.
       *
       * @param intervalSchedule
       *   A schedule that determines the timing between executions
@@ -677,21 +844,7 @@ object Clock:
         frame: Frame,
         reduce: Reducible[Abort[E]]
     ): Fiber[A, reduce.SReduced] < (Sync & S) =
-        Fiber.initUnscoped {
-            Clock.use { clock =>
-                clock.now.map { now =>
-                    Loop(now, state, intervalSchedule) { (lastExecution, state, period) =>
-                        clock.now.map { now =>
-                            period.next(now) match
-                                case Absent => Loop.done(state)
-                                case Present((duration, nextSchedule)) =>
-                                    val nextExecution = lastExecution + duration
-                                    clock.sleep(duration).map(_.use(_ => f(state).map(Loop.continue(nextExecution, _, nextSchedule))))
-                        }
-                    }
-                }
-            }
-        }
+        repeatWithDelay(intervalSchedule, state)(f)
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
     sealed abstract class Unsafe:
@@ -706,7 +859,7 @@ object Clock:
 
         final def deadline(duration: Duration)(using AllowUnsafe): Deadline.Unsafe =
             if !duration.isFinite then Deadline.Unsafe(Maybe.empty, this)
-            else Deadline.Unsafe(Maybe(now() + duration), this)
+            else Deadline.Unsafe(Maybe(nowMonotonic() + duration), this)
 
         final def safe: Clock = Clock(this)
     end Unsafe
@@ -716,16 +869,25 @@ object Clock:
             new Unsafe:
                 def now()(using AllowUnsafe)          = Instant.fromJava(java.time.Instant.now())
                 def nowMonotonic()(using AllowUnsafe) = java.lang.System.nanoTime().nanos
-                def sleep(duration: Duration) =
+                def sleep(duration: Duration)         =
                     Promise.Unsafe.fromIOPromise {
                         new IOPromise[Any, Unit < Any] with Callable[Unit]:
-                            val task = executor.schedule(this, duration.toNanos, TimeUnit.NANOSECONDS)
-                            override def interrupt(error: Result.Error[Any]): Boolean =
+                            val task                    = executor.schedule(this, duration.toNanos, TimeUnit.NANOSECONDS)
+                            override def preInterrupt() =
                                 discard(task.cancel(true))
-                                super.interrupt(error)
+                                true
                             def call(): Unit = completeDiscard(Result.succeed(()))
                     }
                 end sleep
+
+        /** A clock whose wall reading is `wall` while its monotonic time and sleeps are `underlying`'s. It models a wall clock stepping on
+          * its own, as an NTP correction or a manual change does, which no public clock does within one scope.
+          */
+        private[kyo] def withWall(underlying: Unsafe)(wall: () => Instant): Unsafe =
+            new Unsafe:
+                def now()(using AllowUnsafe)          = wall()
+                def nowMonotonic()(using AllowUnsafe) = underlying.nowMonotonic()
+                def sleep(duration: Duration)         = underlying.sleep(duration)
     end Unsafe
 
 end Clock

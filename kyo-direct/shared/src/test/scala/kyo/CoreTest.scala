@@ -1,9 +1,42 @@
 package kyo
 
-class CoreTest extends Test:
+import scala.util.Try
+
+class CoreTest extends kyo.test.Test[Any]:
+
+    "abort operations" - {
+        // Regression for issue #1617: a `val` binding whose RHS is an `Abort` effect's
+        // `.now` previously caused the macro to emit trees with mismatched owners
+        // (assertion only fires under -Xcheck-macros, but the wrong-owner trees are
+        // produced regardless).
+        "val binding with Abort[Throwable]" in {
+            def divide(a: Int, b: Int)(using Frame): Int < Abort[Throwable] = Abort.get(Try(a / b))
+            def double(x: Int): Int                                         = x * 2
+
+            val computation: Int < Abort[Throwable] =
+                direct {
+                    val b = divide(10, 2).now
+                    double(b)
+                }
+
+            Abort.run(computation).map(r => assert(r.contains(10)))
+        }
+
+        "val binding with combined Sync & Abort" in {
+            def divide(a: Int, b: Int)(using Frame): Int < Abort[Throwable] = Abort.get(Try(a / b))
+
+            Abort.run {
+                direct {
+                    val a = Sync.defer(20).now
+                    val b = divide(a, 4).now
+                    a + b
+                }
+            }.map(r => assert(r.contains(25)))
+        }
+    }
 
     "atomic operations" - {
-        "AtomicInt" in run {
+        "AtomicInt" in {
             direct {
                 val counter = AtomicInt.init(0).now
                 counter.incrementAndGet.now
@@ -13,7 +46,7 @@ class CoreTest extends Test:
             }
         }
 
-        "AtomicRef" in run {
+        "AtomicRef" in {
             direct {
                 val ref = AtomicRef.init("initial").now
                 ref.set("updated").now
@@ -23,16 +56,24 @@ class CoreTest extends Test:
     }
 
     "clock operations" - {
-        "sleep and timeout" in run {
-            direct {
-                val start = Clock.now.now
-                Async.sleep(5.millis).now
-                val elapsed = Clock.now.now - start
-                assert(elapsed >= 4.millis)
+        "sleep and timeout" in {
+            // Async.sleep suspends until the clock passes its deadline, so under a controlled clock the post-sleep
+            // instant is strictly after the pre-sleep instant, no wall-clock skew.
+            Clock.withTimeControl { control =>
+                for
+                    fiber <- Fiber.initUnscoped(direct {
+                        val start = Clock.now.now
+                        Async.sleep(50.millis).now
+                        Clock.now.now > start
+                    })
+                    advancer <- Fiber.initUnscoped(Loop.forever(control.advance(50.millis)))
+                    advanced <- fiber.get
+                    _        <- advancer.interrupt
+                yield assert(advanced)
             }
         }
 
-        "deadline" in run {
+        "deadline" in {
             direct {
                 val deadline = Clock.deadline(1.second).now
                 assert(!deadline.isOverdue.now)
@@ -42,7 +83,7 @@ class CoreTest extends Test:
     }
 
     "queue operations" - {
-        "basic queue" in run {
+        "basic queue" in {
             direct {
                 val queue = Queue.init[Int](3).now
                 assert(queue.offer(1).now)
@@ -52,7 +93,7 @@ class CoreTest extends Test:
             }
         }
 
-        "unbounded queue" in run {
+        "unbounded queue" in {
             direct {
                 val queue = Queue.Unbounded.init[Int]().now
                 queue.add(1).now
@@ -64,7 +105,7 @@ class CoreTest extends Test:
     }
 
     "random operations" - {
-        "basic random" in run {
+        "basic random" in {
             direct {
                 val r1 = Random.nextInt(10).now
                 val r2 = Random.nextInt(10).now
@@ -73,7 +114,7 @@ class CoreTest extends Test:
             }
         }
 
-        "with seed" in run {
+        "with seed" in {
             direct {
                 val results1 = Random.withSeed(42) {
                     direct {
@@ -96,7 +137,7 @@ class CoreTest extends Test:
         }
     }
 
-    "console operations" in run {
+    "console operations" in {
         Console.withOut {
             direct {
                 Console.printLine("test output").now
@@ -108,7 +149,7 @@ class CoreTest extends Test:
     }
 
     "meter operations" - {
-        "semaphore" in run {
+        "semaphore" in {
             direct {
                 val sem = Meter.initSemaphore(2).now
                 assert(sem.availablePermits.now == 2)
@@ -121,7 +162,7 @@ class CoreTest extends Test:
             }
         }
 
-        "mutex" in run {
+        "mutex" in {
             direct {
                 val mutex = Meter.initMutex.now
                 assert(mutex.availablePermits.now == 1)
@@ -135,7 +176,7 @@ class CoreTest extends Test:
         }
     }
 
-    "channel operations" in run {
+    "channel operations" in {
         direct {
             val channel = Channel.init[Int](2).now
             assert(channel.offer(1).now)
@@ -147,34 +188,32 @@ class CoreTest extends Test:
         }
     }
 
-    "barrier operations" in run {
+    "gate operations" in {
         direct {
-            val barrier = Barrier.init(2).now
-            assert(barrier.pending.now == 2)
+            val gate = Gate.initUnscoped(2).now
+            assert(gate.pendingCount.now == 2)
 
-            // Start two fibers that will wait at the barrier
+            // Start two fibers that will pass through the gate
             val fiber1 = Fiber.initUnscoped {
                 direct {
-                    barrier.await.now
-                    true
+                    Abort.run[Closed](gate.pass).now
                 }
             }.now
 
             val fiber2 = Fiber.initUnscoped {
                 direct {
-                    barrier.await.now
-                    true
+                    Abort.run[Closed](gate.pass).now
                 }
             }.now
 
             // Both fibers should complete successfully
-            assert(fiber1.get.now)
-            assert(fiber2.get.now)
-            assert(barrier.pending.now == 0)
+            assert(fiber1.get.now.isSuccess)
+            assert(fiber2.get.now.isSuccess)
+            assert(gate.passCount.now == 1)
         }
     }
 
-    "latch operations" in run {
+    "latch operations" in {
         direct {
             val latch = Latch.init(2).now
             assert(latch.pending.now == 2)

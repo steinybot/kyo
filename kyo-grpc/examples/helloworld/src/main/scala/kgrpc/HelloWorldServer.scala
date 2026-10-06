@@ -18,7 +18,7 @@ object HelloWorldServer extends KyoApp:
 
     run {
         for
-            _ <- Console.printLine(s"Server is running on port $port. Press Ctrl-C to stop.")
+            _      <- Console.printLine(s"Server is running on port $port. Press Ctrl-C to stop.")
             server <- Server.start(port)(
                 _.addService(GreeterService),
                 { (server, duration) =>

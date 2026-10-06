@@ -4,7 +4,6 @@ import StreamSubscriber.*
 import java.util.concurrent.Flow.*
 import kyo.*
 import kyo.Result.Error
-import kyo.Result.Panic
 import scala.annotation.tailrec
 
 final private[kyo] class StreamSubscriber[V](
@@ -17,12 +16,16 @@ final private[kyo] class StreamSubscriber[V](
     private enum UpstreamState derives CanEqual:
         case Uninitialized                                                               extends UpstreamState
         case WaitForRequest(subscription: Subscription, items: Chunk[V], remaining: Int) extends UpstreamState
-        case Finished(reason: Maybe[Error[Any]], leftOver: Chunk[V])                     extends UpstreamState
+        case Finished(reason: Maybe[Throwable], leftOver: Chunk[V])                      extends UpstreamState
     end UpstreamState
 
     private val state = AtomicRef.Unsafe.init(
         UpstreamState.Uninitialized -> Maybe.empty[Fiber.Promise.Unsafe[Unit, Any]]
     )
+
+    // Completed when the subscriber first leaves Uninitialized (onSubscribe delivered). Lets a caller await
+    // establishment without touching the consumption `await` above, whose promise slot the emit loop owns.
+    private val subscribed = Fiber.Promise.Unsafe.init[Unit, Any]()
 
     private inline def throwIfNull[A](b: A): Unit = if isNull(b) then throw new NullPointerException()
 
@@ -34,6 +37,7 @@ final private[kyo] class StreamSubscriber[V](
                 case (UpstreamState.Uninitialized, maybePromise) =>
                     val nextState = UpstreamState.WaitForRequest(subscription, Chunk.empty, 0) -> Absent
                     if state.compareAndSet(curState, nextState) then
+                        subscribed.completeUnitDiscard()
                         maybePromise.foreach(_.completeUnitDiscard())
                     else
                         handleSubscribe()
@@ -77,7 +81,7 @@ final private[kyo] class StreamSubscriber[V](
             val curState = state.get()
             curState match
                 case (UpstreamState.WaitForRequest(_, items, _), maybePromise) =>
-                    val nextState = UpstreamState.Finished(Maybe(Panic(throwable)), items) -> Absent
+                    val nextState = UpstreamState.Finished(Maybe(throwable), items) -> Absent
                     if state.compareAndSet(curState, nextState) then
                         maybePromise.foreach(_.completeUnitDiscard())
                     else
@@ -157,6 +161,11 @@ final private[kyo] class StreamSubscriber[V](
         Sync.defer(handleAwait())
     end await
 
+    // Resolves once onSubscribe has been delivered. Orders a downstream action (e.g. a publisher interruption)
+    // after every subscriber is subscribed, so it can't race setup and orphan a still-Uninitialized subscriber.
+    private[interop] def awaitSubscribed(using Frame): Unit < Async =
+        subscribed.safe.use(_ => ())
+
     private[interop] def request(using Frame): Long < Sync =
         @tailrec def handleRequest(): Long < Sync =
             val curState = state.get()
@@ -194,7 +203,7 @@ final private[kyo] class StreamSubscriber[V](
                         if state.compareAndSet(curState, s) then
                             Sync.defer {
                                 reason match
-                                    case Present(error) => Result.fail(error)
+                                    case Present(error) => Result.panic(error)
                                     case Absent         => Result.fail(SubscriberDone)
                             }
                         else
@@ -250,7 +259,7 @@ final private[kyo] class StreamSubscriber[V](
             Loop.foreach {
                 await
                     .map {
-                        case true => request.andThen(Loop.continue)
+                        case true  => request.andThen(Loop.continue)
                         case false => poll.map {
                                 case Result.Success(nextChunk)  => Emit.value(nextChunk).andThen(Loop.continue)
                                 case Result.Error(e: Throwable) => Abort.panic(e)
@@ -281,5 +290,5 @@ object StreamSubscriber:
         strategy: EmitStrategy = EmitStrategy.Eager
     )(
         using Frame
-    ): StreamSubscriber[V] < Sync = Sync.Unsafe(new StreamSubscriber(bufferSize, strategy))
+    ): StreamSubscriber[V] < Sync = Sync.Unsafe.defer(new StreamSubscriber(bufferSize, strategy))
 end StreamSubscriber

@@ -1,0 +1,262 @@
+package kyo.internal
+
+import kyo.*
+
+/** The forked-worker backend: drives a per-config worker JVM over an aeron request/response session.
+  *
+  * `init` spawns `java -cp <worker + scala3-pc:vN> kyo.internal.CompilerWorker` via [[kyo.Command]], connects
+  * an aeron client to the pool's shared embedded medium, and wires a [[kyo.Exchange]] over two
+  * `aeron:ipc` streams. The request and reply ride distinct aeron `stream-id`s (per direction and per
+  * config), so a host never reads its own request back and two configs' workers never cross-talk on
+  * the one shared medium. The host computes the stream ids and threads them to the worker, so both
+  * sides agree on them across the process boundary. The op calls `exchange(req)`; the Exchange owns the request/reply id correlation,
+  * the pending-promise map, the reader fiber, and the cleanup on a broken session. A `TransportError`
+  * or a closed session maps to `CompilerTransportException` at this boundary so the op surface stays
+  * `Abort[CompilerException]`; a broken session fails every pending op, and a stuck worker is reclaimed by
+  * force-killing the process. The wire codec is the kyo-schema [[Compiler.AsMessage]] the `Envelope`
+  * derives, carried directly by kyo-aeron's native `Topic.publish`/`Topic.stream`.
+  *
+  * The process, aeron client, and Exchange are acquired without binding them to an ambient `Scope`
+  * (the pool resolves backends outside any per-backend scope); `close` releases all three, and the
+  * pool's close-on-evict cache finalizer drives `close` on eviction.
+  */
+final private[kyo] class SpawnBackend(
+    private[kyo] val process: Process,
+    aeron: AeronClient,
+    exchange: Exchange[Request, Response, Nothing, TransportError]
+) extends Backend:
+
+    def run(request: Request)(using Frame): Response < (Async & Abort[CompilerException]) =
+        exchange(request)
+            .handle(Abort.run[TransportError | Closed])
+            .map {
+                case Result.Success(Response.Failed(error)) => Abort.fail(error)
+                case Result.Success(response)               => response
+                case Result.Failure(TransportError(m))      => Abort.fail(CompilerTransportException(m))
+                case Result.Failure(_)                      => Abort.fail(CompilerTransportException("worker session closed"))
+                case Result.Panic(err)                      => Abort.fail(CompilerTransportException(err))
+            }
+
+    def close(using Frame): Unit < (Async & Abort[Throwable]) =
+        exchange.close
+            .andThen(Sync.Unsafe.defer(aeron.unsafe.close()))
+            .andThen(process.destroyForcibly)
+            .andThen(awaitWorkerExit)
+
+    /** Confirms the worker is dead before close returns. Windows completes the exit wait slightly
+      * before `isAlive` flips false, so the wait alone is not proof of death; a closed backend must
+      * never leave a worker alive holding the shared medium files, so liveness is polled (bounded)
+      * after the exit wait.
+      */
+    private def awaitWorkerExit(using Frame): Unit < Async =
+        def poll(attempts: Int): Unit < Async =
+            process.isAlive.map { alive =>
+                if !alive || attempts <= 0 then ()
+                else Async.sleep(10.millis).andThen(poll(attempts - 1))
+            }
+        process.waitFor(SpawnBackend.exitTimeout).andThen(poll(100))
+    end awaitWorkerExit
+
+end SpawnBackend
+
+private[kyo] object SpawnBackend:
+
+    /** Bounds the post-kill exit wait so `close` never blocks unboundedly if the OS is slow to reap the worker. */
+    private[kyo] val exitTimeout: Duration = 10.seconds
+
+    /** Spawns the worker JVM, connects the aeron client, wires the Exchange, and wraps all three in a
+      * SpawnBackend.
+      *
+      * `onSpawn` is a test-only observation seam, handed the spawned worker process once the
+      * interrupt-safe kill is armed and immediately before the readiness probe runs, so a test can
+      * interrupt mid-probe and assert the partial worker is force-killed. The real call site uses the
+      * no-op default, so production behavior is unchanged.
+      */
+    def init(
+        config: Compiler.Config,
+        driver: AeronDriver,
+        streamIdBase: Int,
+        onSpawn: Process => Unit = _ => (),
+        readyTimeout: Duration = 30.seconds
+    )(using Frame): SpawnBackend < (Async & Abort[CompilerException]) =
+        // Both directions share the one `aeron:ipc` medium, so req and resp take the even and odd ids
+        // off the base to keep a host from reading its own request, and the pool allocates each config a
+        // distinct base from a monotonic counter to keep two workers from cross-talking. The host passes
+        // the ids to the worker so both sides agree across the process boundary.
+        val reqStreamId  = streamIdBase * 2
+        val respStreamId = streamIdBase * 2 + 1
+        Abort.run[Throwable] {
+            Abort.catching[Throwable] {
+                // `close` owns the process and aeron client only once init succeeds; until then a failure or interrupt
+                // must force-kill the partial worker and close the client. Each is its own bracket, released unless the
+                // `started` flag is set, so a stop on the aeron connect or the exchange wiring still kills the worker.
+                AtomicBoolean.init(false).map { started =>
+                    Sync.acquireReleaseWith(spawnWorker(config, driver, reqStreamId, respStreamId)) { process =>
+                        started.get.map(ok => if ok then () else process.destroyForcibly)
+                    } { process =>
+                        Sync.acquireReleaseWith(aeronClient(driver)) { aeron =>
+                            started.get.map(ok => if ok then () else Sync.Unsafe.defer(aeron.unsafe.close()))
+                        } { aeron =>
+                            connect(aeron, reqStreamId, respStreamId).map { exchange =>
+                                val backend = new SpawnBackend(process, aeron, exchange)
+                                // onSpawn fires with the kill armed, so a test observing the process knows the
+                                // kill-on-interrupt path is live before it interrupts.
+                                Sync.defer(onSpawn(process))
+                                    .andThen(ready(backend, config.toolchain.scalaVersion, readyTimeout))
+                                    .andThen(started.set(true).andThen(backend))
+                            }
+                        }
+                    }
+                }
+            }
+        }.map {
+            case Result.Success(value) => value
+            // Log the failure; CompilerWorkerSpawnException carries the Scala version and the cause.
+            case Result.Failure(t) =>
+                Log.error("worker backend failed to initialize", t)
+                    .andThen(Abort.fail(CompilerWorkerSpawnException(config.toolchain.scalaVersion, t)))
+            case Result.Panic(t) =>
+                Log.error("worker backend failed to initialize", t)
+                    .andThen(Abort.fail(CompilerWorkerSpawnException(config.toolchain.scalaVersion, t)))
+        }
+    end init
+
+    /** A bounded readiness round-trip so a worker that cannot start (e.g. an unusable classpath, whose
+      * publication never sees a subscriber and would otherwise retry forever) or hangs surfaces as
+      * InitializationFailed here, not as a forever-retrying publish on the caller's first real op. A
+      * `DidClose` probe is cheap and idempotent on the worker; if no reply arrives within the bound the
+      * worker is taken as failed to start.
+      */
+    private def ready(backend: SpawnBackend, scalaVersion: String, readyTimeout: Duration)(using
+        Frame
+    ): Unit < (Async & Abort[CompilerException]) =
+        val probe = backend.run(Request.DidClose(Compiler.Uri("kyo-compiler-readiness-probe.scala")))
+        Abort.run[CompilerException | Timeout](Async.timeout(readyTimeout)(probe)).map {
+            case Result.Success(_) => ()
+            case _                 => Abort.fail(CompilerWorkerReadyException(scalaVersion, readyTimeout))
+        }
+    end ready
+
+    /** Builds and spawns the worker Command, threading the config (classpath, version, source roots,
+      * options), the aeron uris, and the shared medium's directory through `-D` system properties (read
+      * by `WorkerConfig.fromEnv`/`CompilerWorker` on the worker side); the parent JVM's module-opener flags are
+      * forwarded so the worker's presentation compiler reaches the same internal modules. The process
+      * is spawned unscoped (released in `close`); a `CommandException` launch failure surfaces as
+      * CompilerWorkerSpawnException.
+      */
+    private[kyo] def spawnWorker(config: Compiler.Config, driver: AeronDriver, reqStreamId: Int, respStreamId: Int)(using
+        Frame
+    ): Process < (Sync & Abort[CompilerException]) =
+        val targetClasspath = (config.classpath ++ config.toolchain.compilerClasspath).map(_.toString).mkString(Path.pathSeparator)
+        // The current JVM's own java launcher, not whatever a bare "java" resolves to on PATH.
+        val javaBin = Path(java.lang.System.getProperty("java.home"), "bin", "java").toString
+        val args    =
+            Chunk(javaBin) ++
+                moduleArgs ++
+                Chunk(
+                    s"-Dkyo.internal.WorkerFlags.reqStreamId=$reqStreamId",
+                    s"-Dkyo.internal.WorkerFlags.respStreamId=$respStreamId",
+                    s"-Dkyo.internal.WorkerFlags.aeronDir=${driver.directory.unsafe.show}",
+                    s"-Dkyo.internal.WorkerFlags.scalaVersion=${config.toolchain.scalaVersion}",
+                    s"-Dkyo.internal.WorkerFlags.classpath=${config.classpath.map(_.toString).mkString(Path.pathSeparator)}",
+                    s"-Dkyo.internal.WorkerFlags.sourceRoots=${config.sourceRoots.map(_.toString).mkString(Path.pathSeparator)}",
+                    s"-Dkyo.internal.WorkerFlags.options=${config.scalacOptions.mkString(" ")}"
+                ) ++
+                Chunk("-cp", targetClasspath, "kyo.internal.CompilerWorker")
+        // The worker is spawned unscoped: its lifetime is owned by this backend's `close` (and the
+        // pool's close-on-evict finalizer), not by an enclosing scope.
+        //
+        // The fork and the error translation are one unsafe step, so the process reaches `init`'s bracket from
+        // `Abort.get` with no kernel `.map` a stop could park on. `.map(_.safe)` and `mapError` are pure `Result` ops.
+        Sync.Unsafe.defer {
+            Abort.get(
+                Command(args*).inheritStderr.unsafe.spawn()
+                    .map(_.safe)
+                    .mapError(e => CompilerWorkerSpawnException(config.toolchain.scalaVersion, e.failureOrPanic))
+            )
+        }
+    end spawnWorker
+
+    /** The parent JVM's module-system flags (`--add-opens`/`--add-exports`/`--add-modules`/
+      * `--enable-native-access`), forwarded to the worker so its presentation compiler reaches the same
+      * internal modules the host opened.
+      */
+    private def moduleArgs: Chunk[String] =
+        import scala.jdk.CollectionConverters.*
+        Chunk.from(
+            java.lang.management.ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
+                .filter(a =>
+                    a.startsWith("--add-opens") || a.startsWith("--add-exports") ||
+                        a.startsWith("--add-modules") || a.startsWith("--enable-native-access")
+                )
+                .toSeq
+        )
+    end moduleArgs
+
+    /** Connects an aeron client to the pool's shared driver directory; closed in `close`. Unscoped
+      * because the backend owns the client across its whole lifetime and releases it in `close`.
+      */
+    private def aeronClient(driver: AeronDriver)(using Frame): AeronClient < (Async & Abort[TopicTransportFailedException]) =
+        AeronClient.connectUnscoped(driver.directory)
+
+    /** Wires the Exchange over the two aeron streams against the captured client: `send` publishes an
+      * `Envelope.Req` via `Topic.publish[Envelope]`, `receive` is the reply `Topic.stream[Envelope]`,
+      * `encode` stamps the id into an `Envelope.Req`, and `decode` routes an `Envelope.Resp` by id.
+      * Built unscoped; the Exchange and its reader fiber are closed by `SpawnBackend.close`.
+      */
+    private def connect(aeron: AeronClient, reqStreamId: Int, respStreamId: Int)(using
+        Frame
+    ): Exchange[Request, Response, Nothing, TransportError] < Sync =
+        Exchange.initUnscoped[Request, Response, Envelope, Nothing, TransportError](
+            encode = (id, req) => Envelope.Req(id, req),
+            send = frame => sendFrame(aeron, reqStreamId, frame),
+            receive = replyStream(aeron, respStreamId),
+            decode = frame => decodeFrame(frame)
+        )
+
+    /** Publishes one `Envelope` to the request stream against the captured client, the `Topic` effect
+      * discharged locally so the row is `Async & Abort[TransportError]`; a `Closed`/`Backpressured`
+      * transport break maps to one typed `TransportError`.
+      */
+    private def sendFrame(aeron: AeronClient, reqStreamId: Int, frame: Envelope)(using Frame): Unit < (Async & Abort[TransportError]) =
+        transportErrors(Topic.run(aeron)(Topic.publish[Envelope](
+            "aeron:ipc",
+            Topic.defaultRetrySchedule,
+            Present(reqStreamId)
+        )(Stream.init(Chunk(frame)))))
+
+    /** The reply stream against the captured client, the `Topic` effect discharged so the row is
+      * `Async & Abort[TransportError]` as Exchange's `receive` requires.
+      */
+    private def replyStream(aeron: AeronClient, respStreamId: Int)(using Frame): Stream[Envelope, Async & Abort[TransportError]] =
+        Stream(transportErrors(Topic.run(aeron)(Topic.stream[Envelope](
+            "aeron:ipc",
+            Topic.defaultRetrySchedule,
+            Present(respStreamId)
+        ).emit)))
+
+    /** Classifies one inbound `Envelope`: an `Envelope.Resp(id, response)` is a solicited response
+      * routed by id; any other frame is ignored (the reader fiber never parks and never throws).
+      */
+    private def decodeFrame(frame: Envelope)(using Frame): Exchange.Message[Int, Response, Nothing] < Sync =
+        Sync.defer {
+            frame match
+                case Envelope.Resp(id, response) => Exchange.Message.Response(id, response)
+                case _                           => Exchange.Message.Skip
+        }
+
+    /** Maps a `Topic` transport break (`Closed`, or any `TopicException` the publish/stream rows carry)
+      * onto the Exchange's `TransportError`, so a broken session fails every pending op with one typed
+      * error. An unexpected panic is not a transport break, so it re-raises unchanged and its live
+      * `Throwable` (stack included) reaches the op's `CompilerTransportException` rather than being
+      * flattened to a message.
+      */
+    private def transportErrors[A, S](
+        v: A < (S & Abort[TopicBackpressureException | TopicPublishException | TopicTransportException])
+    )(using Frame): A < (S & Abort[TransportError]) =
+        Abort.run[TopicBackpressureException | TopicPublishException | TopicTransportException](v).map {
+            case Result.Success(value)  => value
+            case Result.Failure(closed) => Abort.fail(TransportError(closed.toString))
+            case Result.Panic(err)      => Abort.panic(err)
+        }
+end SpawnBackend

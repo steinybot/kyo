@@ -7,10 +7,10 @@ import kyo.Channel
 import kyo.grpc.CallClosed
 
 private[grpc] class UnaryClientCallListener[Response](
-                                                         val headersPromise: Promise[Metadata, Any],
-                                                         val responsePromise: Promise[Response, Abort[StatusException]],
-                                                         val completionPromise: Promise[CallClosed, Any],
-                                                         val readySignal: SignalRef[Boolean]
+    val headersPromise: Promise[Metadata, Any],
+    val responsePromise: Promise[Response, Abort[StatusException]],
+    val completionPromise: Promise[CallClosed, Any],
+    val readySignal: SignalRef[Boolean]
 ) extends Listener[Response]:
 
     import AllowUnsafe.embrace.danger
@@ -26,9 +26,12 @@ private[grpc] class UnaryClientCallListener[Response](
     override def onClose(status: Status, trailers: Metadata): Unit =
         responsePromise.unsafe.completeDiscard(Result.fail(status.asException(trailers)))
         completionPromise.unsafe.completeDiscard(Result.succeed(CallClosed(status, trailers)))
+        readySignal.unsafe.set(true)
+    end onClose
 
     override def onReady(): Unit =
         // May not be called if the method type is unary.
         readySignal.unsafe.set(true)
+    end onReady
 
 end UnaryClientCallListener

@@ -43,7 +43,7 @@ class GrpcServerManyToManyBench extends ArenaBench2(sizeSquared):
                 val observer = new StreamObserver[Response]:
                     private var count: Int               = 0
                     def onNext(response: Response): Unit = count += 1
-                    def onError(t: Throwable): Unit =
+                    def onError(t: Throwable): Unit      =
                         import AllowUnsafe.embrace.danger
                         discard(promise.unsafe.complete(Result.fail(t)))
                     end onError

@@ -1,7 +1,8 @@
 package kyo
 
 import kyo.*
-import kyo.Tag
+import kyo.internal.NotIntersection
+import kyo.internal.Reducible
 import kyo.kernel.*
 import scala.util.NotGiven
 
@@ -47,7 +48,7 @@ object Env:
       * @return
       *   A computation that retrieves the value from the environment
       */
-    inline def get[R](using inline tag: Tag[R])(using inline frame: Frame): R < Env[R] =
+    inline def get[R](using inline tag: Tag[R], inline ni: NotIntersection[R])(using inline frame: Frame): R < Env[R] =
         use[R](identity)
 
     /** Retrieves the entire TypeMap containing all environment values specified by the type intersection R.
@@ -94,7 +95,7 @@ object Env:
         reduce: Reducible[Env[VR]],
         frame: Frame
     ): A < (S & reduce.SReduced) =
-        reduce(ContextEffect.handle(erasedTag[R], env, _.union(env))(v): A < (Env[VR] & S))
+        reduce(ContextEffect.handleInheritable(erasedTag[R], env, _.union(env))(v): A < (Env[VR] & S))
 
     /** Runs a computation with an environment created from provided layers.
       *
@@ -122,10 +123,12 @@ object Env:
     inline def use[R](
         using Frame
     )[A, S](inline f: R => A < S)(
-        using inline tag: Tag[R]
+        using
+        inline tag: Tag[R],
+        inline ni: NotIntersection[R]
     ): A < (Env[R] & S) =
         ContextEffect.suspendWith(erasedTag[R]) { map =>
-            f(map.asInstanceOf[TypeMap[R]].get(using tag))
+            f(map.asInstanceOf[TypeMap[R]].get(using tag, ni))
         }
 
     /** Applies a function to the entire TypeMap of environment values specified by the type intersection R.

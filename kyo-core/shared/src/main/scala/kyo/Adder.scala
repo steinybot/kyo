@@ -9,6 +9,7 @@ import java.util.concurrent.atomic as j
   * distributed across threads, which are then combined on read operations.
   *
   * This approach offers significant performance benefits in high-contention scenarios:
+  *
   *   - Write operations (add, increment) are extremely fast with minimal thread interference
   *   - Read operations (get) are slightly slower as they must sum across all internal counters
   *
@@ -16,6 +17,7 @@ import java.util.concurrent.atomic as j
   * implementations.
   *
   * Ideal for:
+  *
   *   - High-throughput statistics collection
   *   - Concurrent request counters
   *   - Performance monitoring systems
@@ -36,7 +38,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def add(v: Long)(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.add(v))
+    inline def add(v: Long)(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.add(v))
 
     /** Decrements the sum by one.
       *
@@ -45,7 +47,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def decrement(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.decrement())
+    inline def decrement(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.decrement())
 
     /** Increments the sum by one.
       *
@@ -54,7 +56,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def increment(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.increment())
+    inline def increment(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.increment())
 
     /** Returns the current sum.
       *
@@ -64,7 +66,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   The current sum
       */
-    inline def get(using inline frame: Frame): Long < Sync = Sync.Unsafe(unsafe.get())
+    inline def get(using inline frame: Frame): Long < Sync = Sync.Unsafe.defer(unsafe.get())
 
     /** Resets the sum to zero.
       *
@@ -73,7 +75,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def reset(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.reset())
+    inline def reset(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.reset())
 
     /** Returns the current sum and resets it to zero.
       *
@@ -83,7 +85,7 @@ final case class LongAdder private (unsafe: LongAdder.Unsafe):
       * @return
       *   The sum before reset,
       */
-    inline def sumThenReset(using inline frame: Frame): Long < Sync = Sync.Unsafe(unsafe.sumThenReset())
+    inline def sumThenReset(using inline frame: Frame): Long < Sync = Sync.Unsafe.defer(unsafe.sumThenReset())
 
 end LongAdder
 
@@ -103,7 +105,7 @@ object LongAdder:
       *   The result of applying the function
       */
     inline def initWith[A, S](inline f: LongAdder => A < S)(using inline frame: Frame): A < (Sync & S) =
-        Sync.Unsafe(f(LongAdder(Unsafe.init())))
+        Sync.Unsafe.defer(f(LongAdder(Unsafe.init())))
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
     opaque type Unsafe = j.LongAdder
@@ -131,6 +133,7 @@ end LongAdder
   * operations.
   *
   * This approach significantly reduces thread contention:
+  *
   *   - Addition operations have minimal thread synchronization overhead
   *   - Read operations are relatively more expensive as they must combine values from all internal cells
   *
@@ -138,6 +141,7 @@ end LongAdder
   * implementations.
   *
   * Ideal for:
+  *
   *   - Accumulating floating-point measurements
   *   - Scientific computing with concurrent updates
   *   - Financial calculations requiring high throughput
@@ -158,7 +162,7 @@ final case class DoubleAdder private (unsafe: DoubleAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def add(v: Double)(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.add(v))
+    inline def add(v: Double)(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.add(v))
 
     /** Returns the current sum.
       *
@@ -168,7 +172,7 @@ final case class DoubleAdder private (unsafe: DoubleAdder.Unsafe):
       * @return
       *   The current sum
       */
-    inline def get(using inline frame: Frame): Double < Sync = Sync.Unsafe(unsafe.get())
+    inline def get(using inline frame: Frame): Double < Sync = Sync.Unsafe.defer(unsafe.get())
 
     /** Resets the sum to zero.
       *
@@ -177,7 +181,7 @@ final case class DoubleAdder private (unsafe: DoubleAdder.Unsafe):
       * @return
       *   Unit
       */
-    inline def reset(using inline frame: Frame): Unit < Sync = Sync.Unsafe(unsafe.reset())
+    inline def reset(using inline frame: Frame): Unit < Sync = Sync.Unsafe.defer(unsafe.reset())
 
     /** Returns the current sum and resets it to zero.
       *
@@ -187,7 +191,7 @@ final case class DoubleAdder private (unsafe: DoubleAdder.Unsafe):
       * @return
       *   The sum before reset,
       */
-    inline def sumThenReset(using inline frame: Frame): Double < Sync = Sync.Unsafe(unsafe.sumThenReset())
+    inline def sumThenReset(using inline frame: Frame): Double < Sync = Sync.Unsafe.defer(unsafe.sumThenReset())
 
 end DoubleAdder
 
@@ -207,7 +211,7 @@ object DoubleAdder:
       *   The result of applying the function
       */
     inline def initWith[A, S](inline f: DoubleAdder => A < S)(using inline frame: Frame): A < (Sync & S) =
-        Sync.Unsafe(f(DoubleAdder(Unsafe.init())))
+        Sync.Unsafe.defer(f(DoubleAdder(Unsafe.init())))
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
     opaque type Unsafe = j.DoubleAdder

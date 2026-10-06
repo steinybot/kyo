@@ -3,24 +3,34 @@ package kyo
 import kyo.Clock.Deadline
 import kyo.Clock.Stopwatch
 
-class ClockTest extends Test:
+class ClockTest extends kyo.test.Test[Any]:
+
+    // The `now`/`nowWith`/`unsafe now` leaves assert live `Clock.now` stays within a sub-millisecond window of
+    // `java.time.Instant.now()`, which cannot tolerate preemption by concurrent leaves, so run this suite sequentially.
+    override def config = super.config.sequential
 
     "Clock" - {
         def javaNow() = Instant.fromJava(java.time.Instant.now())
 
-        "now" in run {
+        "now" in {
             Clock.now.map { now =>
-                assert(now - javaNow() < 1.milli)
+                assert(now.minusOrZero(javaNow()) < 1.milli)
+            }
+        }
+
+        "nowWith" in {
+            Clock.nowWith { now =>
+                assert(now.minusOrZero(javaNow()) < 1.milli)
             }
         }
 
         "unsafe now" in {
             import AllowUnsafe.embrace.danger
             val now = Clock.live.unsafe.now()
-            assert(now - javaNow() < 1.milli)
+            assert(now.minusOrZero(javaNow()) < 1.milli)
         }
 
-        "now at epoch" in run {
+        "now at epoch" in {
             Clock.withTimeControl { control =>
                 for
                     _   <- control.set(Instant.Epoch)
@@ -29,7 +39,7 @@ class ClockTest extends Test:
             }
         }
 
-        "now at max instant" in run {
+        "now at max instant" in {
             Clock.withTimeControl { control =>
                 for
                     _   <- control.set(Instant.Max)
@@ -37,10 +47,27 @@ class ClockTest extends Test:
                 yield assert(now == Instant.Max)
             }
         }
+
+        "nested time control reuses current control" in {
+            Clock.withTimeControl { outer =>
+                for
+                    _      <- outer.set(Instant.Epoch)
+                    result <- Clock.withTimeControl { inner =>
+                        for
+                            _   <- inner.advance(1.second)
+                            now <- Clock.now
+                        yield (outer.asInstanceOf[AnyRef] eq inner.asInstanceOf[AnyRef], now)
+                    }
+                    now <- Clock.now
+                yield
+                    assert(result == (true, Instant.Epoch + 1.second))
+                    assert(now == Instant.Epoch + 1.second)
+            }
+        }
     }
 
     "Stopwatch" - {
-        "elapsed time" in run {
+        "elapsed time" in {
             Clock.withTimeControl { control =>
                 for
                     stopwatch <- Clock.stopwatch
@@ -51,19 +78,19 @@ class ClockTest extends Test:
             }
         }
 
-        "unsafe elapsed time" in run {
+        "unsafe elapsed time" in {
             import AllowUnsafe.embrace.danger
             Clock.withTimeControl { control =>
                 for
                     clock     <- Clock.get
-                    stopwatch <- Sync.Unsafe(clock.unsafe.stopwatch())
+                    stopwatch <- Sync.Unsafe.defer(clock.unsafe.stopwatch())
                     _         <- control.advance(5.seconds)
                 yield assert(stopwatch.elapsed() == 5.seconds)
                 end for
             }
         }
 
-        "zero elapsed time" in run {
+        "zero elapsed time" in {
             Clock.withTimeControl { control =>
                 for
                     stopwatch <- Clock.stopwatch
@@ -75,7 +102,7 @@ class ClockTest extends Test:
     }
 
     "Deadline" - {
-        "timeLeft" in run {
+        "timeLeft" in {
             Clock.withTimeControl { control =>
                 for
                     deadline <- Clock.deadline(10.seconds)
@@ -86,7 +113,7 @@ class ClockTest extends Test:
             }
         }
 
-        "isOverdue" in run {
+        "isOverdue" in {
             Clock.withTimeControl { control =>
                 for
                     deadline   <- Clock.deadline(5.seconds)
@@ -97,29 +124,29 @@ class ClockTest extends Test:
             }
         }
 
-        "unsafe timeLeft" in run {
+        "unsafe timeLeft" in {
             import AllowUnsafe.embrace.danger
             Clock.withTimeControl { control =>
                 for
                     clock    <- Clock.get
-                    deadline <- Sync.Unsafe(clock.unsafe.deadline(10.seconds))
+                    deadline <- Sync.Unsafe.defer(clock.unsafe.deadline(10.seconds))
                     _        <- control.advance(3.seconds)
                 yield assert(deadline.timeLeft() == 7.seconds)
             }
         }
 
-        "unsafe isOverdue" in run {
+        "unsafe isOverdue" in {
             import AllowUnsafe.embrace.danger
             Clock.withTimeControl { control =>
                 for
                     deadline <- Clock.deadline(5.seconds)
-                    _        <- Sync.Unsafe(assert(!deadline.unsafe.isOverdue()))
+                    _        <- Sync.Unsafe.defer(assert(!deadline.unsafe.isOverdue()))
                     _        <- control.advance(6.seconds)
                 yield assert(deadline.unsafe.isOverdue())
             }
         }
 
-        "zero duration deadline" in run {
+        "zero duration deadline" in {
             Clock.withTimeControl { control =>
                 for
                     deadline  <- Clock.deadline(Duration.Zero)
@@ -129,7 +156,7 @@ class ClockTest extends Test:
             }
         }
 
-        "deadline exactly at expiration" in run {
+        "deadline exactly at expiration" in {
             Clock.withTimeControl { control =>
                 for
                     deadline  <- Clock.deadline(5.seconds)
@@ -140,7 +167,7 @@ class ClockTest extends Test:
             }
         }
 
-        "handle Zero timeLeft" in run {
+        "handle Zero timeLeft" in {
             Clock.withTimeControl { control =>
                 for
                     deadline  <- Clock.deadline(1.second)
@@ -153,7 +180,7 @@ class ClockTest extends Test:
             }
         }
 
-        "handle Infinity timeLeft" in run {
+        "handle Infinity timeLeft" in {
             Clock.withTimeControl { control =>
                 for
                     deadline  <- Clock.deadline(Duration.Infinity)
@@ -166,7 +193,7 @@ class ClockTest extends Test:
         }
 
         "handle Duration.Zero and Duration.Infinity" - {
-            "deadline with Zero duration" in run {
+            "deadline with Zero duration" in {
                 Clock.withTimeControl { control =>
                     for
                         deadline  <- Clock.deadline(Duration.Zero)
@@ -178,7 +205,7 @@ class ClockTest extends Test:
                 }
             }
 
-            "deadline with Infinity duration" in run {
+            "deadline with Infinity duration" in {
                 Clock.withTimeControl { control =>
                     for
                         deadline  <- Clock.deadline(Duration.Infinity)
@@ -190,10 +217,87 @@ class ClockTest extends Test:
                 }
             }
         }
+
+        "a wall-clock step" - {
+            import AllowUnsafe.embrace.danger
+
+            val start = Instant.Epoch + 1000.days
+
+            def stepped[A](f: (Clock.TimeControl, Clock, java.util.concurrent.atomic.AtomicReference[Instant]) => A < (Async & Abort[Any]))(
+                using Frame
+            ): A < (Async & Abort[Any]) =
+                Clock.withTimeControl { control =>
+                    Clock.get.map { controlled =>
+                        val wall = new java.util.concurrent.atomic.AtomicReference(start)
+                        f(control, Clock(Clock.Unsafe.withWall(controlled.unsafe)(() => wall.get())), wall)
+                    }
+                }
+
+            "forward leaves timeLeft and isOverdue alone" in {
+                stepped { (control, clock, wall) =>
+                    for
+                        deadline <- clock.deadline(10.seconds)
+                        _        <- Sync.defer(wall.set(start + 1.hour))
+                        left     <- deadline.timeLeft
+                        overdue  <- deadline.isOverdue
+                    yield
+                        assert(left == 10.seconds)
+                        assert(!overdue)
+                }
+            }
+
+            "backward leaves timeLeft alone" in {
+                stepped { (control, clock, wall) =>
+                    for
+                        deadline <- clock.deadline(10.seconds)
+                        _        <- Sync.defer(wall.set(start - 1.hour))
+                        left     <- deadline.timeLeft
+                    yield assert(left == 10.seconds)
+                }
+            }
+
+            "backward leaves an overdue deadline overdue" in {
+                stepped { (control, clock, wall) =>
+                    for
+                        deadline <- clock.deadline(5.seconds)
+                        _        <- control.advance(6.seconds)
+                        _        <- Sync.defer(wall.set(start - 1.hour))
+                        overdue  <- deadline.isOverdue
+                        left     <- deadline.timeLeft
+                    yield
+                        assert(overdue)
+                        assert(left == Duration.Zero)
+                }
+            }
+
+            "monotonic progress still drains the deadline" in {
+                stepped { (control, clock, wall) =>
+                    for
+                        deadline <- clock.deadline(10.seconds)
+                        _        <- Sync.defer(wall.set(start + 1.day))
+                        _        <- control.advance(4.seconds)
+                        left     <- deadline.timeLeft
+                    yield assert(left == 6.seconds)
+                }
+            }
+
+            "an infinite deadline is never overdue" in {
+                stepped { (control, clock, wall) =>
+                    for
+                        deadline <- clock.deadline(Duration.Infinity)
+                        _        <- Sync.defer(wall.set(Instant.Max))
+                        overdue  <- deadline.isOverdue
+                        left     <- deadline.timeLeft
+                    yield
+                        assert(!overdue)
+                        assert(left == Duration.Infinity)
+                }
+            }
+        }
     }
 
     "Integration" - {
-        "using stopwatch with deadline" in run {
+        "using stopwatch with deadline" in {
             Clock.withTimeControl { control =>
                 for
                     stopwatch <- Clock.stopwatch
@@ -205,7 +309,7 @@ class ClockTest extends Test:
             }
         }
 
-        "multiple stopwatches and deadlines" in run {
+        "multiple stopwatches and deadlines" in {
             Clock.withTimeControl { control =>
                 for
                     stopwatch1 <- Clock.stopwatch
@@ -228,94 +332,367 @@ class ClockTest extends Test:
     }
 
     "Sleep" - {
-        "sleep for specified duration" in run {
-            for
-                clock     <- Clock.get
-                stopwatch <- Clock.stopwatch
-                fiber     <- clock.sleep(5.millis)
-                _         <- fiber.get
-                elapsed   <- stopwatch.elapsed
-            yield assert(elapsed >= 3.millis && elapsed < 100.millis)
+        "sleep for specified duration" in {
+            Clock.withTimeControl { control =>
+                for
+                    clock     <- Clock.get
+                    stopwatch <- Clock.stopwatch
+                    fiber     <- clock.sleep(5.millis)
+                    _         <- control.advance(5.millis)
+                    _         <- fiber.get
+                    elapsed   <- stopwatch.elapsed
+                yield assert(elapsed == 5.millis)
+            }
         }
 
-        "multiple sequential sleeps" in run {
-            for
-                clock     <- Clock.get
-                stopwatch <- Clock.stopwatch
-                fiber1    <- clock.sleep(5.millis)
-                _         <- fiber1.get
-                mid       <- stopwatch.elapsed
-                fiber2    <- clock.sleep(5.millis)
-                _         <- fiber2.get
-                end       <- stopwatch.elapsed
-            yield
-                assert(mid >= 3.millis)
-                assert(end >= 8.millis)
+        "multiple sequential sleeps" in {
+            Clock.withTimeControl { control =>
+                for
+                    clock     <- Clock.get
+                    stopwatch <- Clock.stopwatch
+                    fiber1    <- clock.sleep(5.millis)
+                    _         <- control.advance(5.millis)
+                    _         <- fiber1.get
+                    mid       <- stopwatch.elapsed
+                    fiber2    <- clock.sleep(5.millis)
+                    _         <- control.advance(5.millis)
+                    _         <- fiber2.get
+                    end       <- stopwatch.elapsed
+                yield
+                    assert(mid == 5.millis)
+                    assert(end == 10.millis)
+            }
         }
 
-        "sleep with zero duration" in run {
-            for
-                clock     <- Clock.get
-                stopwatch <- Clock.stopwatch
-                fiber     <- clock.sleep(Duration.Zero)
-                _         <- fiber.get
-                elapsed   <- stopwatch.elapsed
-            yield assert(elapsed < 10.millis)
+        "sleep with zero duration" in {
+            Clock.withTimeControl { control =>
+                for
+                    clock     <- Clock.get
+                    stopwatch <- Clock.stopwatch
+                    fiber     <- clock.sleep(Duration.Zero)
+                    _         <- fiber.get
+                    elapsed   <- stopwatch.elapsed
+                yield assert(elapsed == Duration.Zero)
+            }
         }
 
-        "concurrency" in run {
+        // An infinite sleep is a park, and on Node it silently was not one. Duration.Infinity is 9223372036854 ms, past the 32-bit signed
+        // millisecond argument the host's timers take, so the delay overflowed and Node clamped it to 1 ms. The sleep returned at once, the
+        // run block completed, the application's Scope closed, and every Scope-managed resource shut down, while unscoped fibers kept the
+        // process alive and logging: an HTTP server with no listener behind a process whose every liveness signal said it was healthy.
+        "sleep with an infinite duration parks instead of returning" in {
             for
-                clock     <- Clock.get
-                stopwatch <- Clock.stopwatch
-                fibers    <- Kyo.fill(100)(clock.sleep(5.millis))
-                _         <- Kyo.foreachDiscard(fibers)(_.get)
-                elapsed   <- stopwatch.elapsed
-            yield assert(elapsed >= 3.millis && elapsed < 100.millis)
+                fiber   <- Clock.sleep(Duration.Infinity)
+                settled <- Async.timeout(200.millis)(fiber.get).handle(Abort.run[Timeout])
+            // A failure here is the timeout firing, which is the sleep still parked. A success is the sleep having returned.
+            yield assert(settled.isFailure, s"an infinite sleep completed: $settled")
+        }
+
+        "concurrency" in {
+            Clock.withTimeControl { control =>
+                for
+                    clock     <- Clock.get
+                    stopwatch <- Clock.stopwatch
+                    fibers    <- Kyo.fill(100)(clock.sleep(5.millis))
+                    _         <- control.advance(5.millis)
+                    _         <- Kyo.foreachDiscard(fibers)(_.get)
+                    elapsed   <- stopwatch.elapsed
+                yield assert(elapsed == 5.millis)
+            }
         }
     }
 
     "TimeShift" - {
-        "speed up time" in run {
-            for
-                wallStart  <- Clock.now
-                shiftedEnd <- Clock.withTimeShift(2)(Clock.sleep(10.millis).map(_.get.andThen(Clock.now)))
-                wallEnd    <- Clock.now
-            yield
-                val elapsedWall    = wallEnd - wallStart
-                val elapsedShifted = shiftedEnd - wallStart
-                assert(elapsedWall >= 4.millis && elapsedWall < 40.millis)
-                assert(elapsedShifted > elapsedWall)
+        "speed up time" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeShift(2.0) {
+                    for
+                        start <- Clock.now
+                        fiber <- Clock.sleep(80.millis)
+                        _     <- control.advance(40.millis)
+                        _     <- fiber.get
+                        end   <- Clock.now
+                    yield assert(end.minus(start) == Present(80.millis))
+                }
+            }
         }
 
-        "slow down time" in run {
-            for
-                wallStart  <- Clock.now
-                shiftedEnd <- Clock.withTimeShift(0.1)(Clock.sleep(2.millis).map(_.get.andThen(Clock.now)))
-                wallEnd    <- Clock.now
-            yield
-                val elapsedWall    = wallEnd - wallStart
-                val elapsedShifted = shiftedEnd - wallStart
-                assert(elapsedWall >= 18.millis && elapsedWall < 50.millis)
-                assert(elapsedShifted < elapsedWall)
+        "slow down time" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeShift(0.1) {
+                    for
+                        start <- Clock.now
+                        fiber <- Clock.sleep(2.millis)
+                        _     <- control.advance(20.millis)
+                        _     <- fiber.get
+                        end   <- Clock.now
+                    yield assert(end.minus(start) == Present(2.millis))
+                }
+            }
         }
 
-        "with time control" in run {
+        "with time control" in {
             Clock.withTimeControl { control =>
                 Clock.withTimeShift(2.0) {
                     for
                         start <- Clock.now
                         _     <- control.advance(5.seconds)
                         end   <- Clock.now
-                    yield
-                        val elapsed = end - start
-                        assert(elapsed == 10.seconds)
+                    yield assert(end.minus(start) == Present(10.seconds))
                 }
             }
         }
     }
 
+    "TimeOffset" - {
+        import Clock.TimeOffset
+
+        val start = Instant.Epoch + 1000.days
+
+        "ahead and behind are signed nanoseconds" in {
+            assert(TimeOffset.ahead(5.seconds).toNanos == 5.seconds.toNanos)
+            assert(TimeOffset.behind(5.seconds).toNanos == -(5.seconds.toNanos))
+            assert(TimeOffset.ahead(Duration.Zero) == TimeOffset.Zero)
+            assert(TimeOffset.behind(Duration.Zero) == TimeOffset.Zero)
+        }
+
+        "between is to minus from" in {
+            assert(TimeOffset.between(start, start + 3.seconds) == TimeOffset.ahead(3.seconds))
+            assert(TimeOffset.between(start + 3.seconds, start) == TimeOffset.behind(3.seconds))
+            assert(TimeOffset.between(start, start) == TimeOffset.Zero)
+        }
+
+        "fromNanos round-trips toNanos" in {
+            val nanos = Seq(0L, 1L, -1L, 7.days.toNanos, -(7.days.toNanos), Long.MaxValue, -Long.MaxValue)
+            assert(nanos.map(n => TimeOffset.fromNanos(n).toNanos) == nanos)
+        }
+
+        "fromNanos clamps Long.MinValue so the offset has a negation" in {
+            assert(TimeOffset.fromNanos(Long.MinValue).toNanos == -Long.MaxValue)
+        }
+    }
+
+    "withTimeOffset" - {
+        import Clock.TimeOffset
+
+        val start = Instant.Epoch + 1000.days
+
+        "zero offset keeps the current clock" in {
+            for
+                outer <- Clock.get
+                inner <- Clock.withTimeOffset(TimeOffset.Zero)(Clock.get)
+            yield assert(inner eq outer)
+        }
+
+        "ahead displaces now forward" in {
+            Clock.withTimeControl { control =>
+                for
+                    _   <- control.set(start)
+                    now <- Clock.withTimeOffset(TimeOffset.ahead(5.minutes))(Clock.now)
+                yield assert(now == start + 5.minutes)
+            }
+        }
+
+        "behind displaces now backward" in {
+            Clock.withTimeControl { control =>
+                for
+                    _   <- control.set(start)
+                    now <- Clock.withTimeOffset(TimeOffset.behind(5.minutes))(Clock.now)
+                yield assert(now == start - 5.minutes)
+            }
+        }
+
+        "now follows the control plus the offset" in {
+            Clock.withTimeControl { control =>
+                for
+                    _        <- control.set(start)
+                    readings <- Clock.withTimeOffset(TimeOffset.behind(1.hour)) {
+                        for
+                            before <- Clock.now
+                            _      <- control.advance(10.seconds)
+                            after  <- Clock.now
+                        yield (before, after)
+                    }
+                yield assert(readings == (start - 1.hour, start - 1.hour + 10.seconds))
+            }
+        }
+
+        "nowMonotonic is the underlying clock's" in {
+            Clock.withTimeControl { control =>
+                for
+                    _       <- control.set(start)
+                    outside <- Clock.nowMonotonic
+                    inside  <- Clock.withTimeOffset(TimeOffset.ahead(1.day))(Clock.nowMonotonic)
+                    behind  <- Clock.withTimeOffset(TimeOffset.behind(1.day))(Clock.nowMonotonic)
+                yield
+                    assert(inside == outside)
+                    assert(behind == outside)
+            }
+        }
+
+        "nested offsets sum" in {
+            Clock.withTimeControl { control =>
+                for
+                    _      <- control.set(start)
+                    nested <- Clock.withTimeOffset(TimeOffset.behind(3.seconds)) {
+                        Clock.withTimeOffset(TimeOffset.ahead(5.seconds))(Clock.now)
+                    }
+                    cancelled <- Clock.withTimeOffset(TimeOffset.ahead(2.hours)) {
+                        Clock.withTimeOffset(TimeOffset.behind(2.hours))(Clock.now)
+                    }
+                yield
+                    assert(nested == start + 2.seconds)
+                    assert(cancelled == start)
+            }
+        }
+
+        "nested offsets sum before saturating" in {
+            Clock.withTimeControl { control =>
+                for
+                    _   <- control.set(start)
+                    now <- Clock.withTimeOffset(TimeOffset.behind(Duration.Infinity)) {
+                        Clock.withTimeOffset(TimeOffset.ahead(Duration.Infinity))(Clock.now)
+                    }
+                yield assert(now == start)
+            }
+        }
+
+        "an infinite offset pins now at the instant bounds" in {
+            Clock.withTimeControl { control =>
+                for
+                    _      <- control.set(start)
+                    ahead  <- Clock.withTimeOffset(TimeOffset.ahead(Duration.Infinity))(Clock.now)
+                    behind <- Clock.withTimeOffset(TimeOffset.behind(Duration.Infinity))(Clock.now)
+                yield
+                    assert(ahead == Instant.Max)
+                    assert(behind == Instant.Min)
+            }
+        }
+
+        "a sleep fires when the control advances past its duration" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.behind(1.hour)) {
+                    for
+                        fiber <- Fiber.initUnscoped(Async.sleep(5.seconds))
+                        _     <- control.awaitPendingSleepers(1)
+                        _     <- control.advance(4.seconds)
+                        early <- fiber.done
+                        _     <- control.advance(1.second)
+                        _     <- fiber.get
+                    yield assert(!early)
+                }
+            }
+        }
+
+        "a sleep is not scaled by the offset" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.ahead(1.day)) {
+                    for
+                        clock     <- Clock.get
+                        stopwatch <- Clock.stopwatch
+                        fiber     <- clock.sleep(5.millis)
+                        _         <- control.advance(5.millis)
+                        _         <- fiber.get
+                        elapsed   <- stopwatch.elapsed
+                    yield assert(elapsed == 5.millis)
+                }
+            }
+        }
+
+        "stopwatch measures the underlying duration" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.behind(1.day)) {
+                    for
+                        stopwatch <- Clock.stopwatch
+                        _         <- control.advance(3.seconds)
+                        elapsed   <- stopwatch.elapsed
+                    yield assert(elapsed == 3.seconds)
+                }
+            }
+        }
+
+        "deadline measures the underlying duration" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.ahead(1.day)) {
+                    for
+                        deadline <- Clock.deadline(10.seconds)
+                        _        <- control.advance(3.seconds)
+                        left     <- deadline.timeLeft
+                        pending  <- deadline.isOverdue
+                        _        <- control.advance(8.seconds)
+                        overdue  <- deadline.isOverdue
+                    yield
+                        assert(left == 7.seconds)
+                        assert(!pending)
+                        assert(overdue)
+                }
+            }
+        }
+
+        "Async.timeout fires by duration" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.behind(1.day)) {
+                    for
+                        fiber   <- Fiber.initUnscoped(Abort.run[Timeout](Async.timeout(5.seconds)(Async.never[Int])))
+                        _       <- control.awaitPendingSleepers(1)
+                        _       <- control.advance(4.seconds)
+                        early   <- fiber.done
+                        _       <- control.advance(1.second)
+                        outcome <- fiber.get
+                    yield
+                        assert(!early)
+                        assert(outcome.isFailure)
+                }
+            }
+        }
+
+        "Async.timeout lets a body that finishes in time complete" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeOffset(TimeOffset.ahead(1.day)) {
+                    for
+                        fiber   <- Fiber.initUnscoped(Abort.run[Timeout](Async.timeout(5.seconds)(Async.delay(2.seconds)(42))))
+                        _       <- control.awaitPendingSleepers(2)
+                        _       <- control.advance(2.seconds)
+                        outcome <- fiber.get
+                    yield assert(outcome == Result.succeed(42))
+                }
+            }
+        }
+
+        "forked fibers read the displaced clock" in {
+            Clock.withTimeControl { control =>
+                for
+                    _   <- control.set(start)
+                    now <- Clock.withTimeOffset(TimeOffset.behind(2.hours)) {
+                        Fiber.initUnscoped(Clock.now).map(_.get)
+                    }
+                yield assert(now == start - 2.hours)
+            }
+        }
+
+        "withTimeControl inside the offset starts a new control" in {
+            Clock.withTimeControl { outer =>
+                for
+                    _      <- outer.set(start)
+                    result <- Clock.withTimeOffset(TimeOffset.ahead(1.hour)) {
+                        Clock.withTimeControl { inner =>
+                            for
+                                initial <- Clock.now
+                                _       <- inner.advance(1.second)
+                                after   <- Clock.now
+                            yield (outer.asInstanceOf[AnyRef] eq inner.asInstanceOf[AnyRef], initial, after)
+                        }
+                    }
+                    outerNow <- Clock.now
+                yield
+                    assert(result == (false, Instant.Epoch, Instant.Epoch + 1.second))
+                    assert(outerNow == start)
+            }
+        }
+    }
+
     "TimeControl wallClockDelay" - {
-        "custom delay" in run {
+        "custom delay" in {
             Clock.withTimeControl { control =>
                 for
                     executed    <- AtomicBoolean.init(false)
@@ -326,7 +703,7 @@ class ClockTest extends Test:
             }
         }
 
-        "default behavior" in run {
+        "default behavior" in {
             Clock.withTimeControl { control =>
                 for
                     executed    <- AtomicBoolean.init(false)
@@ -336,43 +713,130 @@ class ClockTest extends Test:
                 yield assert(wasExecuted)
             }
         }
+
+        "a fence on a sleeper's duration waits for that sleeper while an unrelated timer is pending" in {
+            Clock.withTimeControl { control =>
+                // A retry armed on another fiber after its trigger, the way a client arms its backoff after a failed call. The advance
+                // carries no wall-clock grace, so it fires the retry only if the fence held until the retry's sleeper was registered.
+                // Repeated because each round's arm races the fence.
+                def round: Unit < Async =
+                    for
+                        trigger <- Latch.init(1)
+                        retry   <- Fiber.initUnscoped(trigger.await.andThen(Async.sleep(5.seconds)))
+                        _       <- trigger.release
+                        _       <- control.awaitPendingSleeper(5.seconds)
+                        _       <- control.advance(5.seconds, Duration.Zero)
+                        _       <- retry.get
+                    yield ()
+                for
+                    unrelated <- Fiber.initUnscoped(Async.sleep(365.days))
+                    _         <- control.awaitPendingSleepers(1)
+                    _         <- Loop.repeat(50)(round)
+                    _         <- unrelated.interrupt
+                yield succeed
+                end for
+            }
+        }
     }
 
+    /** Records each run's start, and holds the run starting at `at` in its body until `gate` opens. */
+    def holdingAt(queue: Queue.Unbounded[Instant], at: Instant, entered: Latch, gate: Latch)(using Frame): Unit < (Async & Abort[Closed]) =
+        Clock.now.map { now =>
+            queue.add(now).andThen(if now == at then entered.release.andThen(gate.await) else Kyo.unit)
+        }
+
     def intervals(instants: Seq[Instant]): Seq[Duration] =
-        instants.drop(1).sliding(2, 1).filter(_.size == 2).map(seq => seq(1) - seq(0)).toSeq
+        instants.drop(1).sliding(2, 1).filter(_.size == 2).map(seq => seq(1).minusOrZero(seq(0))).toSeq
 
     "repeatAtInterval" - {
-        "executes function at interval" in run {
-            for
-                channel  <- Channel.init[Instant](10)
-                task     <- Clock.repeatAtInterval(5.millis)(Clock.now.map(channel.put))
-                instants <- Kyo.fill(10)(channel.take)
-                _        <- task.interrupt
-            yield
-                val avgInterval = intervals(instants).reduce(_ + _) * (1.toDouble / (instants.size - 2))
-                assert(avgInterval >= 4.millis && avgInterval < 20.millis)
+        "with time control".notJs in {
+            Clock.withTimeControl { control =>
+                val ticks = 12
+                for
+                    queue <- Queue.Unbounded.init[Instant]()
+                    task  <- Clock.repeatAtInterval(5.millis)(Clock.now.map(queue.add))
+                    // startAfter is zero, so the first execution fires at Epoch during startup. Fence on the fiber re-arming its next sleep
+                    // before each advance, so it fires exactly once per interval: the Epoch fire plus one per tick makes the count exact.
+                    _        <- control.awaitPendingSleepers(1)
+                    _        <- Loop.repeat(ticks)(control.advance(5.millis).andThen(control.awaitPendingSleepers(1)))
+                    _        <- task.interrupt
+                    instants <- queue.drain
+                yield
+                    val expected = (0 to ticks).map(i => Instant.Epoch + (5 * i).millis)
+                    assert(instants.size == ticks + 1)
+                    assert(instants.toSeq == expected)
+                end for
+            }
         }
-        "respects interrupt" in run {
+        "a run that takes time leaves the next start on the interval".notJs in {
+            Clock.withTimeControl { control =>
+                for
+                    queue   <- Queue.Unbounded.init[Instant]()
+                    entered <- Latch.init(1)
+                    gate    <- Latch.init(1)
+                    task    <- Clock.repeatAtInterval(10.millis)(holdingAt(queue, Instant.Epoch + 10.millis, entered, gate))
+                    _       <- control.awaitPendingSleepers(1)
+                    _       <- control.advance(10.millis)
+                    _       <- entered.await
+                    // The run at 10ms is still in its body, so its next sleep is not armed yet.
+                    _        <- control.advance(5.millis)
+                    _        <- gate.release
+                    _        <- control.awaitPendingSleepers(1)
+                    _        <- Loop.repeat(3)(control.advance(5.millis).andThen(control.awaitPendingSleepers(1)))
+                    _        <- task.interrupt
+                    instants <- queue.drain
+                yield assert(instants.toSeq == Seq(0, 10, 20, 30).map(i => Instant.Epoch + i.millis), instants.toSeq.mkString(", "))
+            }
+        }
+        "a run longer than the interval is followed at once, and the next start returns to the interval".notJs in {
+            Clock.withTimeControl { control =>
+                for
+                    queue    <- Queue.Unbounded.init[Instant]()
+                    entered  <- Latch.init(1)
+                    gate     <- Latch.init(1)
+                    task     <- Clock.repeatAtInterval(10.millis)(holdingAt(queue, Instant.Epoch + 10.millis, entered, gate))
+                    _        <- control.awaitPendingSleepers(1)
+                    _        <- control.advance(10.millis)
+                    _        <- entered.await
+                    _        <- control.advance(15.millis)
+                    _        <- gate.release
+                    _        <- control.awaitPendingSleepers(1)
+                    _        <- control.advance(5.millis)
+                    _        <- control.awaitPendingSleepers(1)
+                    _        <- task.interrupt
+                    instants <- queue.drain
+                yield assert(instants.toSeq == Seq(0, 10, 25, 30).map(i => Instant.Epoch + i.millis), instants.toSeq.mkString(", "))
+            }
+        }
+        "a schedule that measures from now is slept as it answers".notJs in {
+            Clock.withTimeControl { control =>
+                for
+                    queue   <- Queue.Unbounded.init[Instant]()
+                    entered <- Latch.init(1)
+                    gate    <- Latch.init(1)
+                    task <- Clock.repeatAtInterval(Schedule.anchored(10.millis))(holdingAt(queue, Instant.Epoch + 10.millis, entered, gate))
+                    _    <- control.awaitPendingSleepers(1)
+                    _    <- control.advance(10.millis)
+                    _    <- entered.await
+                    _    <- control.advance(5.millis)
+                    _    <- gate.release
+                    _    <- control.awaitPendingSleepers(1)
+                    _    <- Loop.repeat(3)(control.advance(5.millis).andThen(control.awaitPendingSleepers(1)))
+                    _    <- task.interrupt
+                    instants <- queue.drain
+                yield assert(instants.toSeq == Seq(10, 20, 30).map(i => Instant.Epoch + i.millis), instants.toSeq.mkString(", "))
+            }
+        }
+        "respects interrupt" in {
             for
                 channel  <- Channel.init[Instant](10)
                 task     <- Clock.repeatAtInterval(1.millis)(Clock.now.map(channel.put))
                 instants <- Kyo.fill(10)(channel.take)
                 _        <- task.interrupt
-                _        <- Async.sleep(2.millis)
-                _        <- untilTrue(channel.poll.map(_.isEmpty))
-            yield succeed
+                _        <- assertEventually(channel.poll.map(_.isEmpty))
+            yield ()
         }
-        "with Schedule parameter" in run {
-            for
-                channel  <- Channel.init[Instant](10)
-                task     <- Clock.repeatAtInterval(Schedule.fixed(5.millis))(Clock.now.map(channel.put))
-                instants <- Kyo.fill(10)(channel.take)
-                _        <- task.interrupt
-            yield
-                val avgInterval = intervals(instants).reduce(_ + _) * (1.toDouble / (instants.size - 2))
-                assert(avgInterval >= 4.millis && avgInterval < 40.millis)
-        }
-        "with Schedule and state" in run {
+        "with Schedule and state" in {
             for
                 channel <- Channel.init[Int](10)
                 task    <- Clock.repeatAtInterval(Schedule.fixed(1.millis), 0)(st => channel.put(st).andThen(st + 1))
@@ -380,7 +844,7 @@ class ClockTest extends Test:
                 _       <- task.interrupt
             yield assert(numbers.toSeq == (0 until 10))
         }
-        "completes when schedule completes" in run {
+        "completes when schedule completes" in {
             for
                 channel <- Channel.init[Int](10)
                 task    <- Clock.repeatAtInterval(Schedule.fixed(1.millis).maxDuration(10.millis), 0)(st => channel.put(st).andThen(st + 1))
@@ -391,28 +855,17 @@ class ClockTest extends Test:
     }
 
     "repeatWithDelay" - {
-        "executes function with delay" in run {
-            for
-                channel  <- Channel.init[Instant](10)
-                task     <- Clock.repeatWithDelay(5.millis)(Clock.now.map(channel.put))
-                instants <- Kyo.fill(10)(channel.take)
-                _        <- task.interrupt
-            yield
-                val avgDelay = intervals(instants).reduce(_ + _) * (1.toDouble / (instants.size - 2))
-                assert(avgDelay >= 4.millis && avgDelay < 20.millis)
-        }
-
-        "respects interrupt" in run {
+        "respects interrupt" in {
             for
                 channel  <- Channel.init[Instant](10)
                 task     <- Clock.repeatWithDelay(1.millis)(Clock.now.map(channel.put))
                 instants <- Kyo.fill(10)(channel.take)
                 _        <- task.interrupt
-                _        <- untilTrue(channel.poll.map(_.isEmpty))
-            yield succeed
+                _        <- assertEventually(channel.poll.map(_.isEmpty))
+            yield ()
         }
 
-        "with time control" in runNotJS {
+        "with time control".notJs in {
             Clock.withTimeControl { control =>
                 for
                     running  <- Latch.init(1)
@@ -426,25 +879,14 @@ class ClockTest extends Test:
                     instants <- queue.drain
                 yield
                     intervals(instants).foreach(v => assert(v <= 2.millis))
-                    succeed
+                    ()
             }
         }
 
-        "works with Schedule parameter" in run {
-            for
-                channel  <- Channel.init[Instant](10)
-                task     <- Clock.repeatWithDelay(Schedule.fixed(5.millis))(Clock.now.map(channel.put))
-                instants <- Kyo.fill(10)(channel.take)
-                _        <- task.interrupt
-            yield
-                val avgDelay = intervals(instants).reduce(_ + _) * (1.toDouble / (instants.size - 2))
-                assert(avgDelay >= 4.millis && avgDelay < 20.millis)
-        }
-
-        "works with Schedule and state" in run {
+        "works with Schedule and state" in {
             for
                 channel <- Channel.init[Int](10)
-                task <- Clock.repeatWithDelay(Schedule.fixed(1.millis), 0) { state =>
+                task    <- Clock.repeatWithDelay(Schedule.fixed(1.millis), 0) { state =>
                     channel.put(state).andThen(state + 1)
                 }
                 numbers <- Kyo.fill(10)(channel.take)
@@ -453,7 +895,7 @@ class ClockTest extends Test:
             end for
         }
 
-        "completes when schedule completes" in run {
+        "completes when schedule completes" in {
             for
                 channel <- Channel.init[Int](10)
                 task    <- Clock.repeatWithDelay(Schedule.fixed(1.millis).maxDuration(10.millis), 0)(st => channel.put(st).andThen(st + 1))
@@ -464,36 +906,41 @@ class ClockTest extends Test:
     }
 
     "Monotonic Time" - {
-        "nowMonotonic" in run {
-            for
-                time1 <- Clock.nowMonotonic
-                _     <- Clock.sleep(5.millis).map(_.get)
-                time2 <- Clock.nowMonotonic
-            yield
-                assert(time2 > time1)
-                assert(time2 - time1 >= 4.millis)
-                assert(time2 - time1 < 40.millis)
+        "nowMonotonic" in {
+            Clock.withTimeControl { control =>
+                for
+                    time1 <- Clock.nowMonotonic
+                    fiber <- Clock.sleep(5.millis)
+                    _     <- control.advance(5.millis)
+                    _     <- fiber.get
+                    time2 <- Clock.nowMonotonic
+                yield
+                    assert(time2 > time1)
+                    assert(time2.minus(time1) == Present(5.millis))
+            }
         }
 
-        "with time control" in run {
+        "with time control" in {
             Clock.withTimeControl { control =>
                 for
                     time1 <- Clock.nowMonotonic
                     _     <- control.advance(5.seconds)
                     time2 <- Clock.nowMonotonic
-                yield assert(time2 - time1 == 5.seconds)
+                yield assert(time2.minus(time1) == Present(5.seconds))
             }
         }
 
-        "with time shift" in run {
-            Clock.withTimeShift(2.0) {
-                for
-                    time1 <- Clock.nowMonotonic
-                    _     <- Clock.sleep(10.millis).map(_.get)
-                    time2 <- Clock.nowMonotonic
-                yield
-                    assert(time2 - time1 >= 4.millis)
-                    assert(time2 - time1 < 40.millis)
+        "with time shift" in {
+            Clock.withTimeControl { control =>
+                Clock.withTimeShift(2.0) {
+                    for
+                        time1 <- Clock.nowMonotonic
+                        fiber <- Clock.sleep(10.millis)
+                        _     <- control.advance(5.millis)
+                        _     <- fiber.get
+                        time2 <- Clock.nowMonotonic
+                    yield assert(time2.minus(time1) == Present(10.millis))
+                }
             }
         }
     }

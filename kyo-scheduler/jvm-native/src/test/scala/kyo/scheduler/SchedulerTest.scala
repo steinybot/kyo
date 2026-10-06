@@ -1,18 +1,35 @@
 package kyo.scheduler
 
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import kyo.scheduler.util.Threads
+import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import org.scalatest.NonImplicitAssertions
-import org.scalatest.concurrent.Eventually.*
+import org.scalatest.concurrent.Eventually
 import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.time.Millis
+import org.scalatest.time.Seconds
+import org.scalatest.time.Span
 import scala.util.control.NoStackTrace
 
-class SchedulerTest extends AnyFreeSpec with NonImplicitAssertions {
+class SchedulerTest extends AnyFreeSpec with NonImplicitAssertions with Eventually {
+
+    /** Every assertion here is about a state the scheduler reaches, never about how fast it reaches it, so the budget is a hang guard and
+      * only a wedged scheduler ever spends it.
+      *
+      * ScalaTest's default is 150ms, and its failure mode is worse than a short wait: `eventually` checks the elapsed time only after an
+      * attempt returns, so one attempt that overruns the budget ends the loop having sampled once. On a saturated runner that turns any
+      * scheduling stall into a failure reporting whatever the single sample happened to hold.
+      */
+    implicit override val patienceConfig: PatienceConfig =
+        PatienceConfig(timeout = Span(15, Seconds), interval = Span(50, Millis))
 
     "schedule" - {
         "enqueues tasks to workers" in withScheduler { scheduler =>
-            val cdl = new CountDownLatch(1)
+            val cdl   = new CountDownLatch(1)
             val task1 = TestTask(_run = () => {
                 cdl.await()
                 Task.Done
@@ -37,7 +54,7 @@ class SchedulerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
 
         "handles scheduling from within a task" in withScheduler { scheduler =>
-            val cdl = new CountDownLatch(1)
+            val cdl  = new CountDownLatch(1)
             val task = TestTask(_run =
                 () => {
                     scheduler.schedule(TestTask(_run = () => {
@@ -103,14 +120,497 @@ class SchedulerTest extends AnyFreeSpec with NonImplicitAssertions {
         }
     }
 
-    private def withScheduler[A](testCode: Scheduler => A): A = {
-        val executor          = Executors.newCachedThreadPool(Threads("test-scheduler-worker"))
-        val scheduledExecutor = Executors.newSingleThreadScheduledExecutor(Threads("test-scheduler-timer"))
-        val scheduler         = new Scheduler(executor, scheduledExecutor)
+    "busyFiberTraces" - {
+        // loadAvg scans currentWorkers, busyFiberTraces scans allocatedWorkers, and the latter is the wider
+        // range. A task queued on an allocated worker past currentWorkers, whose thread has not mounted yet,
+        // is invisible to loadAvg and visible here as BusyWorker("", ""): no mount name and no current task.
+        // Gating on loadAvg therefore does not establish what this asserts, so wait for the snapshot itself.
+        //
+        // The window is narrow enough that a single pass cannot tell a settled scheduler from a lucky one, so
+        // the leaf runs against a fresh scheduler many times over. A regression that reopens the window fails
+        // here instead of intermittently on one CI pole.
+        "returns empty when the scheduler is idle" in {
+            (1 to idleSnapshotRepeats).foreach { _ =>
+                withScheduler { scheduler =>
+                    eventually(assert(scheduler.busyFiberTraces().isEmpty))
+                }
+            }
+        }
+
+        "covers all busy workers, not first-only" in withScheduler { scheduler =>
+            val n     = 3
+            val cdl   = new CountDownLatch(1)
+            val tasks = List.fill(n)(TestTask(_run = () => {
+                cdl.await()
+                Task.Done
+            }))
+            tasks.foreach(scheduler.schedule)
+            // The snapshot deliberately includes loaded-but-unmounted workers (a task queued on a
+            // worker whose thread has not mounted yet) with an empty mount name, so the coverage
+            // assertions read the mounted entries: all n busy workers must appear, each on a
+            // distinct mount.
+            eventually(assert(scheduler.busyFiberTraces().count(_.mount.nonEmpty) >= n))
+            val result = scheduler.busyFiberTraces().filter(_.mount.nonEmpty)
+            assert(result.size >= n)
+            assert(result.map(_.mount).distinct.size == result.size)
+            assert(result.forall(_.fiberTrace == ""))
+            cdl.countDown()
+            eventually(assert(scheduler.loadAvg() == 0))
+        }
+
+        "is total under concurrent worker mutation" in withScheduler { scheduler =>
+            val cdl  = new CountDownLatch(1)
+            val task = TestTask(_run = () => {
+                cdl.await()
+                Task.Done
+            })
+            scheduler.schedule(task)
+            eventually(assert(scheduler.busyFiberTraces().nonEmpty))
+            // Release the latch so the worker completes and nulls currentTask concurrently with the probe loop below,
+            // exercising the busy -> idle transition the accessor must read without throwing.
+            cdl.countDown()
+            val results = (1 to 100).map(_ => scheduler.busyFiberTraces())
+            assert(results.forall(_ != null))
+            assert(results.forall(_.forall(_.mount != null)))
+            eventually(assert(scheduler.loadAvg() == 0))
+        }
+    }
+
+    "blocking compensation" - {
+        // The scheduler's contract (class scaladoc: "When blocking occurs, the concurrency regulator observes increased scheduling delays
+        // and responds by expanding the worker pool"): a task that blocks its carrier (a parked I/O driver, a blocking fiber) must NOT
+        // starve a runnable task. A blocker here parks its carrier (latch await = LockSupport.park, detected by the BlockingMonitor) and is
+        // not interruptible (needsInterrupt=false, the default), so a fresh runnable task runs only if the pool keeps runnable capacity
+        // while the carrier stays parked. If it does not, that task is queued behind the blockers indefinitely.
+
+        "blocked carriers under host CPU load must not wedge the pool (blocked-carrier floor)" in {
+            // Every carrier is blocked while the host is busy with non-scheduler CPU work. The concurrency regulator probes by sleeping
+            // 1ms and measuring the wakeup delay; under host CPU contention that delay exceeds its ~800us shrink threshold, so it shrinks
+            // (or fails to grow) the pool below the blocked count and a freshly scheduled task is never served. The blocked-carrier floor
+            // clamps currentWorkers >= blocked + minWorkers regardless of jitter, keeping minWorkers runnable carriers, so the task runs.
+            // The load is real CPU contention, not an injected jitter value, so this exercises the real probe -> shrink -> floor path;
+            // keep it that way rather than reducing it to a mocked measurement.
+            val cfg         = Scheduler.Config.default.copy(cores = 4, coreWorkers = 4, minWorkers = 2, maxWorkers = 400)
+            val hostThreads =
+                Runtime.getRuntime().availableProcessors() *
+                    4 // 4x oversubscription: reliably drives the regulator's probe jitter over its shrink threshold, even on a 4-vCPU CI runner
+            val load = java.util.concurrent.Executors.newFixedThreadPool(hostThreads, kyo.scheduler.util.Threads("host-load"))
+            withScheduler(cfg) { s =>
+                val gate   = new CountDownLatch(1)
+                val canary = new CountDownLatch(1)
+                try {
+                    // Real host CPU load (NOT scheduler tasks): pure external contention delaying the regulator's probe wakeup.
+                    (0 until hostThreads).foreach(_ =>
+                        load.execute(() => {
+                            var x = 0L
+                            while (!Thread.currentThread().isInterrupted()) { x += 1; if (x == Long.MinValue) println(x) }
+                        })
+                    )
+                    // More blockers than carriers (2x coreWorkers): the extra blockers stay queued and refill any carrier the pool
+                    // grows, so a transient growth cannot un-wedge it (many producers contending for few carriers). Real,
+                    // non-interruptible, indefinitely parked, like a parked I/O driver carrier.
+                    (0 until 8).foreach(_ =>
+                        s.schedule(new Task {
+                            def run(startMillis: Long, clock: InternalClock, deadline: Long): Task.Result = {
+                                try gate.await()
+                                catch { case _: InterruptedException => Thread.interrupted(): Unit }
+                                Task.Done
+                            }
+                        })
+                    )
+                    // Wait (poll interval, not a fixed sleep) until the carriers are blocked, so the canary is scheduled into the
+                    // wedge. The 4x host load runs throughout, so the regulator sees sustained jitter and shrinks the pool. Assert on
+                    // the loop's own read that broke the wait, not a fresh re-sample: under heavy load the BlockingMonitor is
+                    // CPU-starved and its blocked flags flicker, so a second sample can momentarily dip below 4.
+                    // 60s hang-guard: the barrier is "at least 4 carriers eventually park"; under sustained 4x host load the parking can take many
+                    // seconds, so the deadline only breaks a pool that never parks, never a slow one.
+                    val deadline = java.lang.System.nanoTime() + 60000000000L
+                    var blk0     = 0
+                    while (
+                        {
+                            blk0 = s.status().workers.count(w => (w ne null) && w.isBlocked); blk0 < 4
+                        } && java.lang.System.nanoTime() < deadline
+                    )
+                        Thread.sleep(5)
+                    assert(blk0 >= 4, s"carriers never became blocked within the hang-guard (blocked=$blk0)")
+                    // Fresh runnable canary: it must be served. Without the floor the jitter-driven regulator shrinks the pool below
+                    // the blocked count and the canary is starved; the floor keeps minWorkers runnable carriers, so it runs.
+                    s.schedule(TestTask(_run = () => { canary.countDown(); Task.Done }))
+                    val served = canary.await(60, java.util.concurrent.TimeUnit.SECONDS)
+                    val st     = s.status()
+                    val r      = st.concurrency.regulator
+                    val blk    = st.workers.count(w => (w ne null) && w.isBlocked)
+                    assert(
+                        served,
+                        s"WEDGE: a fresh task was starved while $blk carriers blocked and host jitter high. The regulator shrank / failed to " +
+                            s"grow the pool below the blocked count instead of holding a blocked-carrier floor. " +
+                            s"[currentWorkers=${st.currentWorkers} blocked=$blk runnable=${st.currentWorkers - blk} " +
+                            s"jitter=${r.measurementsJitter}ns step=${r.step} updates=${r.updates}]"
+                    )
+                } finally {
+                    gate.countDown()
+                    load.shutdownNow()
+                    load.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS): Unit
+                }
+            }
+        }
+    }
+
+    "stalled workers" - {
+        // A worker whose task runs past its slice without honoring preemption (a nested evaluation such as a finalizer, or a step with
+        // no suspension point) is Stalled but not blocked, and stays so until the task yields. Only the worker itself serves its queue,
+        // so a task placed there waits for as long as the task spins, however many other workers are idle: an idle worker is woken only
+        // by an enqueue onto itself. Two things keep such a task from stranding: schedule places on an unavailable worker only when no
+        // worker at all is available, and the cycle drains a stalled worker's queue for as long as its task stays over its slice.
+        "tasks are not stranded behind workers whose tasks ignore preemption" in {
+            // Three workers, two of them held by spinning tasks, and a sampling stride of one so the placement search regularly
+            // misses the free worker and reaches the fallback.
+            val cfg = Scheduler.Config.default.copy(cores = 3, coreWorkers = 3, minWorkers = 3, maxWorkers = 3, scheduleStride = 1)
+            // The free worker is available only while its own task is within its slice and the blocking monitor sees its carrier
+            // progress, and on a loaded runner the OS can hold that carrier off the CPU long enough to lose both: placement then
+            // finds no worker available and rightly falls back onto a stalled one. So the scheduler's time is frozen, and moved
+            // once to stall the spinning tasks, and the monitor is stopped: this leaf is about preemption, not blocking.
+            val time = new java.util.concurrent.atomic.AtomicLong(InternalClock.monotonicMillis())
+            withScheduler(cfg, () => time.get()) { s =>
+                s.blockingMonitor.stop()
+                val release = new CountDownLatch(1)
+                val started = new CountDownLatch(2)
+                try {
+                    (0 until 2).foreach(_ =>
+                        s.schedule(TestTask(_run = () => {
+                            started.countDown()
+                            while (release.getCount() > 0) {}
+                            Task.Done
+                        }))
+                    )
+                    assert(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    time.addAndGet(cfg.timeSliceMs + 1L)
+                    // Wait (poll, not a fixed sleep) until the clock has carried the move and both carriers are Stalled. The
+                    // deadline is a hang-guard for a pool that never stalls, never the pass condition.
+                    val deadline = java.lang.System.nanoTime() + 15000000000L
+                    var stalled  = 0
+                    while (
+                        {
+                            stalled = s.status().workers.count(w => (w ne null) && w.isStalled); stalled < 2
+                        } && java.lang.System.nanoTime() < deadline
+                    )
+                        Thread.sleep(1)
+                    assert(stalled == 2, s"the spinning tasks never stalled their workers (stalled=$stalled)")
+
+                    // The free worker's carrier is held mid-task while the tasks are placed, as a carrier the OS has descheduled is,
+                    // for longer than a slice of real time. Under the real clock that stalls it and every task falls back.
+                    val holding = new CountDownLatch(1)
+                    val hold    = new CountDownLatch(1)
+                    s.schedule(TestTask(_run = () => {
+                        holding.countDown()
+                        hold.await()
+                        Task.Done
+                    }))
+                    assert(holding.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    val heldUntil = java.lang.System.nanoTime() + 3L * cfg.timeSliceMs * 1000000L
+                    while (java.lang.System.nanoTime() < heldUntil) Thread.sleep(1)
+
+                    val served = new CountDownLatch(100)
+                    var landed = 0
+                    try {
+                        (0 until 100).foreach { _ =>
+                            s.schedule(TestTask(_run = () => { served.countDown(); Task.Done }))
+                            // The free worker is available throughout, so no task may be placed on a stalled one: a stalled worker's
+                            // load is its spinning task alone.
+                            if (s.status().workers.exists(w => (w ne null) && w.isStalled && w.load > 1)) landed += 1
+                        }
+                    } finally hold.countDown()
+                    assert(landed == 0, s"$landed tasks were placed on a stalled worker while a worker was available")
+                    assert(
+                        served.await(10, java.util.concurrent.TimeUnit.SECONDS),
+                        s"${served.getCount()} tasks stranded behind the spinning tasks with a worker free"
+                    )
+                } finally release.countDown()
+            }
+        }
+    }
+
+    "placement" - {
+        "a task whose placement scan fails is still placed before the failure propagates" in {
+            // A drain hands each task to schedule after taking it off the queue, so a schedule that throws before placing the task
+            // leaves it nowhere. The scan is where it throws: it checks each worker's availability, which preempts an over-slice
+            // task and, for a stalled worker, drains its queue.
+            val cfg = Scheduler.Config.default.copy(cores = 1, coreWorkers = 1, minWorkers = 1, maxWorkers = 1)
+            withScheduler(cfg) { s =>
+                val testThread = Thread.currentThread()
+                val armed      = new java.util.concurrent.atomic.AtomicBoolean(false)
+                val thrown     = new java.util.concurrent.atomic.AtomicBoolean(false)
+                val started    = new CountDownLatch(1)
+                val release    = new CountDownLatch(1)
+                val spinning   = TestTask(
+                    // Only the scan run by this test's own schedule call fails: armed around that call, and on this thread. The
+                    // cycle's preemptions pass, and so do the ones `status()` makes, which reads availability too.
+                    _preempt = () =>
+                        if ((Thread.currentThread() eq testThread) && armed.get() && thrown.compareAndSet(false, true))
+                            throw new StackOverflowError("injected"),
+                    _run = () => {
+                        started.countDown()
+                        while (release.getCount() > 0) {}
+                        Task.Done
+                    }
+                )
+                val placed = new java.util.concurrent.ConcurrentLinkedQueue[TestTask]()
+                try {
+                    s.schedule(spinning)
+                    assert(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    // The scan preempts only a task over its slice; the cycle marks the worker Stalled once it is.
+                    eventually(assert(s.status().workers.exists(w => (w ne null) && w.isStalled)))
+                    // The scan skips the preemption of a worker the blocking monitor flags blocked, and the monitor flags a spinning
+                    // worker whose thread it sees make no CPU progress, which a starved runner produces. A scan that skipped it
+                    // places the task normally, so the attempt repeats with a fresh task until a scan reaches the preemption.
+                    eventually {
+                        val task = TestTask()
+                        placed.add(task)
+                        armed.set(true)
+                        val failure =
+                            try { s.schedule(task); None }
+                            catch { case e: StackOverflowError => Some(e) }
+                            finally armed.set(false)
+                        assert(thrown.get() && failure.isDefined, "the scan's failure must reach the caller")
+                    }
+                } finally release.countDown()
+                eventually(assert(
+                    placed.stream().allMatch(_.executions == 1),
+                    "every attempted task, the one whose placement failed included, runs exactly once"
+                ))
+                assert(s.placementFallbacks.sum() == 1, "the fallback placement must be counted")
+            }
+        }
+    }
+
+    "worker cycle" - {
+        "a fatal error in one cycle does not stop the cycles after it" in {
+            // The worker cycle runs as one long-lived loop on the timer pool, and it is what detects stalled workers, preempts their
+            // tasks and drains their queues. An error that escapes a cycle ends that loop, and nothing restarts it.
+            withScheduler { s =>
+                val thrown   = new java.util.concurrent.atomic.AtomicInteger(0)
+                val started  = new CountDownLatch(1)
+                val release  = new CountDownLatch(1)
+                val spinning = TestTask(
+                    // A task over its slice is preempted on every cycle. The first three preemptions on the cycle's own thread fail
+                    // the way the scheduler's drain recursion did on CI, one per cycle, so the third failure being counted is the
+                    // proof that the loop ran on after the first two.
+                    _preempt = () =>
+                        if ((Thread.currentThread() eq s.cycleThread) && thrown.getAndIncrement() < 3)
+                            throw new StackOverflowError("injected"),
+                    _run = () => {
+                        started.countDown()
+                        while (release.getCount() > 0) {}
+                        Task.Done
+                    }
+                )
+                try {
+                    s.schedule(spinning)
+                    assert(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    eventually(assert(
+                        s.cycleFailures.sum() >= 3,
+                        s"the cycle stopped after an error (${s.cycleFailures.sum()} failures counted)"
+                    ))
+                } finally release.countDown()
+            }
+        }
+    }
+
+    "window shrink" - {
+        // A worker the window shrinks away from keeps running the task it holds, and that task can be parked indefinitely, like an I/O
+        // driver's carrier. Placement and steal stop at currentWorkers, and the worker's own loop polls its queue only once that task
+        // returns, so the scheduler itself has to hand off what is queued behind it.
+
+        "a shrink hands off the queue of the worker it excludes" in withParkedCarriers { (s, carriers) =>
+            val excluded     = carriers.last
+            val windowBefore = windowLoad(s, excluded.workerId)
+            s.updateWorkers(-1)
+            assert(s.status().currentWorkers == excluded.workerId, s"the shrink did not exclude worker ${excluded.workerId}")
+            val load = s.status().workers(excluded.workerId).load
+            assert(
+                load == 1,
+                s"STRANDED: worker ${excluded.workerId} left the window (currentWorkers=${s.status().currentWorkers}) while its carrier " +
+                    s"was parked (parked=${excluded.finished.getCount() == 1}), and its queued canary was never handed off: load=$load " +
+                    s"instead of 1"
+            )
+            val windowAfter = windowLoad(s, excluded.workerId)
+            assert(
+                windowAfter == windowBefore + 1,
+                s"the canary drained off worker ${excluded.workerId} was not placed inside the window: in-window load went from " +
+                    s"$windowBefore to $windowAfter"
+            )
+        }
+
+        "the cycle drains a blocked worker outside the window" in withParkedCarriers { (s, carriers) =>
+            val excluded = carriers.last
+            s.updateWorkers(-1)
+            assert(s.status().currentWorkers == excluded.workerId, s"the shrink did not exclude worker ${excluded.workerId}")
+            val beforeEnqueue = s.status().workers(excluded.workerId).load
+            excluded.enqueueRequested = true
+            excluded.enqueue.countDown()
+            excluded.enqueued.await()
+            val queued = s.status().workers(excluded.workerId).load
+            assert(
+                queued == beforeEnqueue + 1,
+                s"the excluded carrier's own task did not queue behind it on worker ${excluded.workerId}: load went from $beforeEnqueue " +
+                    s"to $queued"
+            )
+            val windowBefore = windowLoad(s, excluded.workerId)
+            excluded.worker.blocked = true
+            s.cycleWorkers()
+            val load = s.status().workers(excluded.workerId).load
+            assert(
+                load == 1,
+                s"STRANDED: worker ${excluded.workerId} is blocked outside the window (currentWorkers=${s.status().currentWorkers}) " +
+                    s"with ${queued - 1} task(s) queued behind its parked carrier, and the cycle did not drain them: load=$load instead of 1"
+            )
+            val windowAfter = windowLoad(s, excluded.workerId)
+            assert(
+                windowAfter == windowBefore + (queued - 1),
+                s"the ${queued - 1} task(s) drained off worker ${excluded.workerId} were not placed inside the window: in-window load " +
+                    s"went from $windowBefore to $windowAfter"
+            )
+        }
+    }
+
+    "regulator harness liveness" - {
+        // Each Scheduler permanently pins TWO timer-pool threads with infinite loops: the blocking-monitor scan loop
+        // (BlockingMonitor's submitted task) and the worker-cycle loop (Scheduler.cycleTask). The concurrency and admission
+        // regulators run their probes as PERIODIC tasks on that same pool (collectInterval=10ms), so a pool with headroom
+        // beyond those 2 threads fires them freely. The shared Scheduler.defaultTimerExecutor is size 4, and Scheduler.get
+        // (the global singleton) already pins 2 of its threads for the whole JVM, so a regulator-dependent test sharing that
+        // pool is unreliable. withScheduler gives every test its own adequately sized, torn-down timer pool by default. This
+        // leaf guards that: a live regulator fires within a bounded deadline given a dedicated pool with headroom.
+        val liveCfg = Scheduler.Config.default.copy(cores = 2, coreWorkers = 2, minWorkers = 2, maxWorkers = 4)
+
+        "an adequately sized dedicated timer pool keeps the regulator firing" in withScheduler(liveCfg) { s =>
+            // probesSent increments every ~10ms; a live regulator fires many within a few seconds. Poll to a 30s hang-guard: the barrier is that
+            // the regulator eventually fires, so only a frozen pool runs the deadline out.
+            val deadline = java.lang.System.nanoTime() + 30000000000L
+            while (s.status().concurrency.regulator.probesSent <= 10 && java.lang.System.nanoTime() < deadline)
+                Thread.sleep(10)
+            val probes = s.status().concurrency.regulator.probesSent
+            assert(probes > 10, s"regulator never fired in the harness (probesSent=$probes) despite an 8-thread dedicated timer pool")
+        }
+    }
+
+    /** How many times the idle-snapshot leaf reruns against a fresh scheduler. The race it guards surfaced once
+      * on windows-x64 and never on this host, so a single pass says nothing; repeating it makes a reopened
+      * window fail wherever the suite runs rather than on one pole every few weeks.
+      */
+    private val idleSnapshotRepeats = 100
+
+    private def withScheduler[A](testCode: Scheduler => A): A =
+        withScheduler(Scheduler.Config.default)(testCode)
+
+    /** Runs `testCode` with a fresh Scheduler on its OWN adequately sized, torn-down timer pool. This is the default for every
+      * scheduler test, so none can accidentally hit the starving shared pool.
+      *
+      * Each Scheduler permanently pins 2 timer-pool threads with infinite loops (the blocking-monitor scan loop and the
+      * worker-cycle loop), so the regulator's periodic probes only fire when the pool has headroom beyond those 2. The process
+      * Scheduler.defaultTimerExecutor is size 4, of which Scheduler.get (the global singleton) already pins 2 for the whole
+      * JVM, so a test sharing it silently freezes the regulator (probesSent stays ~0). A dedicated pool sized well past the
+      * 2 pinned loops removes that trap, and shutting it down afterwards avoids thread accumulation on Native.
+      */
+    private def withScheduler[A](cfg: Scheduler.Config)(testCode: Scheduler => A): A =
+        withScheduler(cfg, () => InternalClock.monotonicMillis())(testCode)
+
+    private def withScheduler[A](cfg: Scheduler.Config, clockSource: () => Long)(testCode: Scheduler => A): A = {
+        val timer     = java.util.concurrent.Executors.newScheduledThreadPool(8, kyo.scheduler.util.Threads("test-timer"))
+        val scheduler = new Scheduler(TestExecutors.cached, TestExecutors.scheduled, timer, cfg, clockSource)
         try testCode(scheduler)
-        finally {
+        finally { scheduler.shutdown(); timer.shutdownNow(): Unit }
+    }
+
+    /** A carrier that, once started, can be asked to schedule one more task from its own worker thread before it parks on `release`:
+      * `enqueue` opens that step, `enqueueRequested` says whether to schedule, and `enqueued` opens once the task is queued.
+      */
+    final private class ParkedCarrier {
+        @volatile var workerId         = -1
+        @volatile var worker: Worker   = null
+        @volatile var enqueueRequested = false
+        val started                    = new CountDownLatch(1)
+        val enqueue                    = new CountDownLatch(1)
+        val enqueued                   = new CountDownLatch(1)
+        val release                    = new CountDownLatch(1)
+        val finished                   = new CountDownLatch(1)
+    }
+
+    private def windowLoad(s: Scheduler, currentWorkers: Int): Int =
+        s.status().workers.take(currentWorkers).map(_.load).sum
+
+    /** Parks one carrier on each of four workers, each with a canary it scheduled from its own thread queued behind it (the
+      * `Worker.current()` fast path), and hands them to `testCode` ordered by worker index.
+      *
+      * Nothing may move the window or drain a worker except the leaf's own `updateWorkers` and `cycleWorkers` calls, so every assertion
+      * holds synchronously after the call it follows. The regulators are made inert by a timer that runs no periodic task (both drive
+      * `updateWorkers` from `scheduleWithFixedDelay`), and the timer never runs a submitted task, which keeps the cycle loop and the
+      * blocking monitor's scan from starting: the monitor would flag the parked carriers, draining them early and raising the shrink
+      * floor above the window. The scheduler's clock is frozen: its clock executor discards the update loop, so every reading is the one
+      * taken at construction, no task's runtime ever exceeds the time slice, and the stall path is unreachable whatever the wall time.
+      * Carriers are placed one at a time, each after the previous one is running, with a full placement scan, so each lands on a
+      * distinct idle worker. The only waits are handoffs from the carriers, which complete on any version of the drain logic.
+      */
+    private def withParkedCarriers[A](testCode: (Scheduler, IndexedSeq[ParkedCarrier]) => A): A = {
+        val cfg = Scheduler.Config.default.copy(
+            cores = 4,
+            coreWorkers = 4,
+            minWorkers = 1,
+            maxWorkers = 8,
+            scheduleStride = 4
+        )
+        val timer = new ScheduledThreadPoolExecutor(8, kyo.scheduler.util.Threads("test-timer")) {
+            override def scheduleWithFixedDelay(command: Runnable, initialDelay: Long, delay: Long, unit: TimeUnit): ScheduledFuture[?] =
+                super.scheduleWithFixedDelay((() => ()): Runnable, initialDelay, delay, unit)
+            override def submit[T](task: Callable[T]): Future[T] =
+                new FutureTask[T](task)
+        }
+        val frozenClock: java.util.concurrent.Executor = _ => ()
+        val scheduler                                  = new Scheduler(TestExecutors.cached, frozenClock, timer, cfg)
+        val carriers                                   = IndexedSeq.fill(cfg.coreWorkers)(new ParkedCarrier)
+        try {
+            carriers.foreach { c =>
+                scheduler.schedule(TestTask(_run = () => {
+                    try {
+                        c.worker = Worker.current()
+                        c.workerId = c.worker.status().id
+                        scheduler.schedule(TestTask(_run = () => Task.Done))
+                        c.started.countDown()
+                        c.enqueue.await()
+                        if (c.enqueueRequested) {
+                            scheduler.schedule(TestTask(_run = () => Task.Done))
+                            c.enqueued.countDown()
+                        }
+                        c.release.await()
+                    } finally c.finished.countDown()
+                    Task.Done
+                }))
+                c.started.await()
+            }
+            val byWorker = carriers.sortBy(_.workerId)
+            assert(
+                byWorker.map(_.workerId) == (0 until cfg.coreWorkers),
+                s"carriers did not land one per worker: ${carriers.map(_.workerId)}"
+            )
+            val st = scheduler.status()
+            assert(st.currentWorkers == cfg.coreWorkers, s"the window moved before the shrink: currentWorkers=${st.currentWorkers}")
+            assert(
+                st.workers.forall(w => w.load == 2 && !w.isStalled),
+                s"every worker must hold its parked carrier plus its canary, unstalled: " +
+                    st.workers.map(w => s"worker ${w.id} load=${w.load} stalled=${w.isStalled}").mkString(", ")
+            )
+            testCode(scheduler, byWorker)
+        } finally {
+            carriers.foreach { c =>
+                c.enqueue.countDown()
+                c.release.countDown()
+            }
+            carriers.foreach { c =>
+                if (c.started.getCount() == 0)
+                    c.finished.await()
+            }
             scheduler.shutdown()
-            scheduledExecutor.shutdown()
+            timer.shutdownNow(): Unit
         }
     }
 }

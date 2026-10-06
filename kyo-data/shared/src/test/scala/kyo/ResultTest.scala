@@ -1,10 +1,9 @@
 package kyo
 
-import kyo.Result
 import kyo.Result.*
 import scala.util.Try
 
-class ResultTest extends Test:
+class ResultTest extends kyo.test.Test[Any]:
 
     val ex = new Exception
 
@@ -32,7 +31,7 @@ class ResultTest extends Test:
         }
 
         "union of exception types" in {
-            val ex = new IllegalStateException("test")
+            val ex     = new IllegalStateException("test")
             val result = Result.catching[IllegalArgumentException | IllegalStateException] {
                 throw ex
             }
@@ -50,7 +49,7 @@ class ResultTest extends Test:
         "union + intersection" in {
             trait SomeTrait
             class CustomException extends RuntimeException("inner") with SomeTrait
-            val ex = new CustomException
+            val ex     = new CustomException
             val result = Result.catching[IllegalArgumentException | (RuntimeException & SomeTrait)] {
                 throw ex
             }
@@ -297,7 +296,7 @@ class ResultTest extends Test:
             }
 
             "should throw for Panic" in {
-                assertThrows[Exception] {
+                interceptThrown[Exception] {
                     panic.foldOrThrow(_ => 42, _ => -1)
                 }
             }
@@ -381,11 +380,14 @@ class ResultTest extends Test:
             assert(!nestedResult.isFailure)
         }
 
-        "should handle exceptions in deeply nested transformations" in {
+        "should catch an exception where it is thrown and carry it outward as a value" in {
+            // The innermost map catches the throw as its own Panic; each enclosing map receives that Panic as a plain
+            // value and keeps it in its success lane, exactly as it would a Failure, so only a flatten reaches it.
             val nested = Success(Success(Success(1)))
             val ex     = new RuntimeException("nested error")
             val result = nested.map(_.map(_.map(_ => throw ex)))
-            assert(result == Panic(ex))
+            assert(result == Success(Success(Panic(ex))))
+            assert(result.flatten.flatten == Panic(ex))
         }
 
         "should maintain correct error type through nested flatMaps" in {
@@ -505,7 +507,7 @@ class ResultTest extends Test:
         "matching with guards" - {
             "should match Success with a guard" in {
                 val tryy: Result[Nothing, Int] = Success(2)
-                val result = tryy match
+                val result                     = tryy match
                     case Success(x) if x > 1 => "greater than 1"
                     case Success(_)          => "less than or equal to 1"
                     case Failure(_)          => "failure"
@@ -514,7 +516,7 @@ class ResultTest extends Test:
 
             "should match Failure with a guard" in {
                 val tryy: Result[String, Int] = Failure("error")
-                val result = tryy match
+                val result                    = tryy match
                     case Failure(e) if e.length > 5 => "long error"
                     case Failure(_)                 => "short error"
                     case Success(_)                 => "success"
@@ -525,20 +527,21 @@ class ResultTest extends Test:
             "should match Failure" in {
                 val result = Result.fail("FAIL!")
                 result match
-                    case Error(_) => succeed
+                    case Error(e) => assert(e.isInstanceOf[String] && e.asInstanceOf[String] == "FAIL!")
                     case _        => fail()
             }
             "should match Panic" in {
-                val result = Result.panic(new AssertionError)
+                val ae     = new AssertionError
+                val result = Result.panic(ae)
                 result match
-                    case Error(_) => succeed
+                    case Error(e) => assert(e.isInstanceOf[AssertionError] && (e.asInstanceOf[AssertionError] eq ae))
                     case _        => fail()
             }
             "should not match Success" in {
                 val result = Result.succeed(1)
                 result match
                     case Error(_) => fail()
-                    case _        => succeed
+                    case _        => succeed("Success does not match the Error extractor; reaching this arm is the verification")
             }
         }
 
@@ -578,7 +581,7 @@ class ResultTest extends Test:
         "should not handle exceptions in ifError" in {
             val tryy      = Success(1)
             val exception = new RuntimeException("exception")
-            val result =
+            val result    =
                 try
                     tryy.foldError(_ => throw exception, _ => throw exception)
                     "no exception"
@@ -590,7 +593,7 @@ class ResultTest extends Test:
         "should not handle exceptions in ifPanic" in {
             val tryy      = Result.panic(ex)
             val exception = new RuntimeException("exception")
-            val result =
+            val result    =
                 try
                     tryy.foldError(_ => throw exception, _ => throw exception)
                     "no exception"
@@ -602,7 +605,7 @@ class ResultTest extends Test:
         "should handle exceptions in ifSuccess" in {
             val tryy      = Success(1)
             val exception = new RuntimeException("exception")
-            val result =
+            val result    =
                 try
                     tryy.foldError(_ => throw exception, _ => 0)
                     "no exception"
@@ -614,7 +617,7 @@ class ResultTest extends Test:
         "should handle exceptions during map" in {
             val tryy      = Success(1)
             val exception = new RuntimeException("exception")
-            val result =
+            val result    =
                 try
                     tryy.map(_ => throw exception)
                     "no exception"
@@ -626,7 +629,7 @@ class ResultTest extends Test:
         "should handle exceptions during flatMap" in {
             val tryy      = Success(1)
             val exception = new RuntimeException("exception")
-            val result =
+            val result    =
                 try
                     tryy.flatMap(_ => throw exception)
                     "no exception"
@@ -951,7 +954,7 @@ class ResultTest extends Test:
             }
 
             "should not handle non-matching exception from union" in {
-                val ex = new TestException2("error")
+                val ex                                                                    = new TestException2("error")
                 val result: Result[TestException1 | TestException2 | TestException3, Int] =
                     Result.fail(ex)
 
@@ -991,7 +994,7 @@ class ResultTest extends Test:
             }
 
             "should not handle exception outside of specified union" in {
-                val ex = new TestException3("error")
+                val ex                                                                    = new TestException3("error")
                 val result: Result[TestException1 | TestException2 | TestException3, Int] =
                     Result.fail(ex)
 
@@ -1068,7 +1071,7 @@ class ResultTest extends Test:
             }
 
             "should not handle non-matching exception from union" in {
-                val ex = new TestException2("error")
+                val ex                                                                    = new TestException2("error")
                 val result: Result[TestException1 | TestException2 | TestException3, Int] =
                     Result.fail(ex)
 
@@ -1095,7 +1098,7 @@ class ResultTest extends Test:
             }
 
             "should not handle exception outside of specified union" in {
-                val ex = new TestException3("error")
+                val ex                                                                    = new TestException3("error")
                 val result: Result[TestException1 | TestException2 | TestException3, Int] =
                     Result.fail(ex)
 
@@ -1191,7 +1194,7 @@ class ResultTest extends Test:
         }
 
         "Panic encountered" in {
-            val ex = new Exception("panic")
+            val ex      = new Exception("panic")
             val results = Seq(
                 Result.succeed(1),
                 Result.panic(ex),
@@ -1235,8 +1238,8 @@ class ResultTest extends Test:
 
         "should handle exceptions during sequence traversal" in {
             val results = new Seq[Result[String, Int]]:
-                def length: Int                          = throw new RuntimeException("length error")
-                def apply(idx: Int): Result[String, Int] = Result.succeed(idx)
+                def length: Int                             = throw new RuntimeException("length error")
+                def apply(idx: Int): Result[String, Int]    = Result.succeed(idx)
                 def iterator: Iterator[Result[String, Int]] =
                     throw new RuntimeException("iterator error")
             val collected = Result.collect(results)
@@ -1413,19 +1416,19 @@ class ResultTest extends Test:
         "nested Success" in {
             val nested = Result.succeed(Result.succeed(Result.succeed(23)))
             assert(nested.show == "Success(Success(Success(23)))")
-            assert(t"$nested".show == "Success(Success(Success(23)))")
+            assert(render"$nested" == "Success(Success(Success(23)))")
             val widened: Result[Nothing, Result[Nothing, Result[Nothing, Int]]] = nested
             assert(widened.show == "Success(Success(Success(23)))")
-            assert(t"$widened".show == "Success(Success(Success(23)))")
+            assert(render"$widened" == "Success(Success(Success(23)))")
         }
 
         "nested Success with failure" in {
             val nested = Result.succeed(Result.succeed(Result.fail("error")))
             assert(nested.show == "Success(Success(Failure(error)))")
-            assert(t"$nested".show == "Success(Success(Failure(error)))")
+            assert(render"$nested" == "Success(Success(Failure(error)))")
             val widened: Result[Nothing, Result[Nothing, Result[String, Nothing]]] = nested
             assert(widened.show == "Success(Success(Failure(error)))")
-            assert(t"$widened".show == "Success(Success(Failure(error)))")
+            assert(render"$widened" == "Success(Success(Failure(error)))")
         }
     }
 
@@ -1453,7 +1456,7 @@ class ResultTest extends Test:
         "construct" in {
             val success: Partial[String, Int] = Success(23)
             val failure: Partial[String, Int] = Failure("failed")
-            succeed
+            assert(success.isSuccess && failure.isFailure) // both typed ascriptions succeed and have the expected shapes
         }
 
         "is Result" in {
@@ -1511,6 +1514,36 @@ class ResultTest extends Test:
             )
         }
 
+    }
+
+    "a success carrying a Panic" - {
+        // The unboxed representation makes a success that carries an error indistinguishable from the error itself, which is
+        // what SuccessError exists to box, for a Panic as for a Failure: a success whose value is a Panic (a fiber's result
+        // handed on as data, say) must not read as the panic of whoever holds it.
+        val ex = new Exception("carried")
+
+        "Success keeps a Panic as its value" in {
+            val r: Result[Nothing, Result[Nothing, Int]] = Success(Panic(ex))
+            assert(r.isSuccess, s"the carried panic was read as the outer result's own: $r")
+            assert(r.exists(_.isPanic))
+        }
+
+        "succeed keeps a Panic as its value" in {
+            val r: Result[Nothing, Result[Nothing, Int]] = Result.succeed(Result.panic(ex))
+            assert(r.isSuccess, s"the carried panic was read as the outer result's own: $r")
+            assert(r.exists(_.isPanic))
+        }
+
+        "flatten of a success carrying a Panic is that Panic, and only after the flatten" in {
+            val r: Result[Nothing, Result[Nothing, Int]] = Success(Panic(ex))
+            assert(r.isSuccess)
+            assert(r.flatten.isPanic)
+        }
+
+        "map keeps a Panic produced as a value inside the success lane" in {
+            val r: Result[Nothing, Result[Nothing, Int]] = Success(1).map(_ => Panic(ex))
+            assert(r.isSuccess, s"the panic the function produced as a value was read as the outer result's own: $r")
+        }
     }
 
 end ResultTest

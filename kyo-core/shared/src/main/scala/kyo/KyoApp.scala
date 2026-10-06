@@ -1,8 +1,5 @@
 package kyo
 
-import Result.Error
-import kyo.internal.OsSignal
-
 /** An abstract base class for Kyo applications.
   *
   * This class provides a foundation for building applications using the Kyo framework, with built-in support for logging, random number
@@ -10,30 +7,13 @@ import kyo.internal.OsSignal
   *
   * Note: This class and its methods are unsafe and should only be used as the entrypoint of an application.
   */
-abstract class KyoApp extends KyoAppPlatformSpecific:
-    private val awaitInterrupt =
-        given AllowUnsafe = AllowUnsafe.embrace.danger
-        val promise       = Promise.Unsafe.init[Nothing, Any]()
-
-        val interrupt = (signal: String) =>
-            () =>
-                promise
-                    .completeDiscard(Result.panic(Interrupted(Frame.internal, s"Interrupt Signal: $signal")))
-
-        if System.live.unsafe.operatingSystem() != System.OS.Windows then
-            OsSignal.handle("INT", interrupt("INT"))
-            OsSignal.handle("TERM", interrupt("TERM"))
-
-        promise.mask().safe
-    end awaitInterrupt
-
-    override protected def handle[A](v: A < (Async & Scope & Abort[Throwable]))(using Frame): A < (Async & Abort[Throwable]) =
-        Async.raceFirst(Scope.run(v), awaitInterrupt.get)
-    end handle
-end KyoApp
+abstract class KyoApp extends kyo.internal.KyoAppPlatformSpecific
 
 object KyoApp:
-    def apply[A](v: => A < (Async & Scope & Abort[Throwable]))(using Frame, Render[A]): KyoApp =
+    final case class FailureException private[kyo] (error: Any)(using Frame)
+        extends KyoException("Uncaught error", String.valueOf(error))
+
+    def apply[A](v: => A < (Async & Scope & Abort[Any]))(using Frame, Render[A]): KyoApp =
         new KyoApp:
             run(v)
 
@@ -51,7 +31,9 @@ object KyoApp:
     )(timeout: Duration)(v: => A < (Abort[E] & Async & S))(
         using frame: Frame
     ): A < (Abort[E | Timeout] & Sync & S) =
-        Fiber.initUnscoped(v).map { fiber =>
+        // The forked fiber is interrupted when the block returns, so a timeout, or an interrupt of the blocked
+        // thread, leaves nothing running with no owner; on completion the interrupt finds a settled fiber.
+        Fiber.use[E, A, S, Any](v) { fiber =>
             fiber.block(timeout).map(Abort.get(_))
         }
 
@@ -63,8 +45,9 @@ object KyoApp:
       *   The effect type used by the application.
       */
     abstract class Base[S]:
-        private var _args: Array[String]          = null
-        protected var initCode: Chunk[() => Unit] = Chunk.empty
+        self: kyo.internal.KyoAppRunner =>
+
+        private var _args: Array[String] = null
 
         final def main(args: Array[String]) =
             this._args = args
@@ -80,7 +63,7 @@ object KyoApp:
                               |""".stripMargin,
                     trailer = ""
                 )))
-            else for proc <- initCode do proc()
+            else runInitCode()
             end if
         end main
 
@@ -93,27 +76,8 @@ object KyoApp:
         protected def exit(code: Int)(using AllowUnsafe): Unit =
             internal.Platform.exit(code)
 
-        /** Unified handling logic for supporting arbitrary effects. */
-        protected def handle[A](v: A < S)(using Frame): A < (Async & Abort[Throwable])
-
-        /** The timeout for each [[run]] block. */
-        protected def runTimeout: Duration = Duration.Infinity
-
         /** The main entrypoint to this application. */
         protected def run[A](v: => A < S)(using Frame, Render[A]): Unit
-
-        /** Handles the result of the [[run]] block computation.
-          *
-          * Override this method to control how the result is handled.
-          */
-        protected def onResult[E, A](result: Result[E, A])(using Render[Result[E, A]], AllowUnsafe): Unit =
-            if !result.exists(().equals(_)) then println(result.show)
-            result match
-                case Error(e: Throwable) => throw e
-                case Error(_)            => exit(1)
-                case _                   =>
-            end match
-        end onResult
     end Base
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
@@ -133,9 +97,18 @@ object KyoApp:
           *   A Result containing either the computed value or a failure.
           */
         def runAndBlock[A](timeout: Duration)(
-            v: A < (Async & Scope & Abort[Throwable])
+            v: A < (Async & Scope & Abort[Any])
         )(using Frame, AllowUnsafe): Result[Throwable, A] =
-            Abort.run(Sync.Unsafe.run(KyoApp.runAndBlock(timeout)(Scope.run(v)))).eval
+            Abort.run(Sync.Unsafe.run(KyoApp.runAndBlock(timeout)(KyoApp.abortAnyToThrowable(Scope.run(v))))).eval
     end Unsafe
+
+    private[kyo] def abortAnyToThrowable[A, S](v: => A < (Abort[Any] & S))(using Frame): A < (Abort[Throwable] & S) =
+        Abort.run[Any](v).map {
+            case Result.Success(value)            => value
+            case Result.Failure(error: Throwable) => Abort.fail(error)
+            case Result.Failure(error)            => Abort.fail(FailureException(error))
+            case panic: Result.Panic              => Abort.get(panic)
+        }
+    end abortAnyToThrowable
 
 end KyoApp

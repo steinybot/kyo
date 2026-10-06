@@ -14,7 +14,7 @@ object TestServiceImpl extends TestService:
 
     private def requestToResponse(request: Request): Response < Grpc =
         request match
-            case Request.Empty => Abort.fail(Status.INVALID_ARGUMENT.asException)
+            case Request.Empty              => Abort.fail(Status.INVALID_ARGUMENT.asException)
             case nonEmpty: Request.NonEmpty =>
                 nonEmpty match
                     case Success(message, _, _)       => Kyo.lift(Echo(message))
@@ -30,7 +30,7 @@ object TestServiceImpl extends TestService:
 
     private def requestToResponses(request: Request): Stream[Response, Grpc] < Grpc =
         request match
-            case Request.Empty => Stream.empty[Response]
+            case Request.Empty              => Stream.empty[Response]
             case nonEmpty: Request.NonEmpty =>
                 nonEmpty match
                     case Success(message, count, _) =>
@@ -59,7 +59,7 @@ object TestServiceImpl extends TestService:
         requests.fold(Maybe.empty[String])((acc, request) =>
             for
                 response <- requestToResponse(request)
-                nextAcc <- response.asNonEmpty.get match
+                nextAcc  <- response.asNonEmpty.get match
                     case Echo(message, _) => acc.map(_ + " " + message).orElse(Maybe(message))
             yield nextAcc
         ).map(maybeMessage => Echo(maybeMessage.getOrElse("")))
