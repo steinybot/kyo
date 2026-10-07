@@ -1,5 +1,4 @@
 package example
 
-object Http {
+object Http:
     def name: String = "http"
-}

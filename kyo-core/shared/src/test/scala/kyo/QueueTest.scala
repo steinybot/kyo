@@ -116,6 +116,18 @@ class QueueTest extends kyo.test.Test[Any]:
         )
     }
 
+    "close states" in {
+        for
+            q       <- Queue.init[Int](2)
+            closed1 <- q.closed
+            open1   <- q.open
+            _       <- q.offer(1)
+            _       <- q.close
+            closed2 <- q.closed
+            open2   <- q.open
+        yield assert(!closed1 && open1 && closed2 && !open2)
+    }
+
     "drain" in {
         for
             q <- Queue.init[Int](2)
@@ -883,19 +895,22 @@ class QueueTest extends kyo.test.Test[Any]:
             for
                 queue  <- Queue.init[Int](10)
                 result <- queue.closeAwaitEmpty
-            yield assert(result)
+                closed <- queue.closed
+            yield assert(result && closed)
         }
 
         "returns true when queue becomes empty after closing" in {
             for
-                queue  <- Queue.init[Int](10)
-                _      <- queue.offer(1)
-                _      <- queue.offer(2)
-                fiber  <- Fiber.initUnscoped(queue.closeAwaitEmpty)
-                _      <- queue.poll
-                _      <- queue.poll
-                result <- fiber.get
-            yield assert(result)
+                queue   <- Queue.init[Int](10)
+                _       <- queue.offer(1)
+                _       <- queue.offer(2)
+                fiber   <- Fiber.initUnscoped(queue.closeAwaitEmpty)
+                closed1 <- queue.closed
+                _       <- queue.poll
+                _       <- queue.poll
+                result  <- fiber.get
+                closed2 <- queue.closed
+            yield assert(!closed1 && result && closed2)
         }
 
         "returns false if queue is already closed" in {
@@ -1071,6 +1086,218 @@ class QueueTest extends kyo.test.Test[Any]:
             )
                 .handle(Choice.run, _.unit, Loop.repeat(10))
                 .unit
+        }
+    }
+
+    "closeAwaitEmptyFiber" - {
+        def untilTrue[S](f: => Boolean < S)(using Frame): Boolean < S =
+            Loop(())(_ => f.map(b => if b then Loop.done(true) else Loop.continue(())))
+
+        "returns true when queue is already empty".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+                closed <- queue.closed
+                open   <- queue.open
+            yield assert(result && closed && !open)
+        }
+
+        "returns true when queue becomes empty after closing".notNative in {
+            for
+                queue   <- Queue.init[Int](10)
+                _       <- queue.offer(1)
+                _       <- queue.offer(2)
+                fiber   <- queue.closeAwaitEmptyFiber
+                closed1 <- queue.closed
+                open1   <- queue.open
+                _       <- queue.poll
+                _       <- queue.poll
+                result  <- fiber.get
+                closed2 <- queue.closed
+                open2   <- queue.open
+            yield assert(
+                !closed1 &&
+                    !open1 &&
+                    !open2 &&
+                    result &&
+                    closed2 &&
+                    !open2
+            )
+        }
+
+        "returns false if queue is already closed".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                _      <- queue.close
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+            yield assert(!result)
+        }
+
+        "unbounded queue" - {
+            "returns true when queue is already empty".notNative in {
+                for
+                    queue  <- Queue.Unbounded.init[Int]()
+                    result <- queue.closeAwaitEmptyFiber.map(_.get)
+                yield assert(result)
+            }
+
+            "returns true when queue becomes empty after closing".notNative in {
+                for
+                    queue  <- Queue.Unbounded.init[Int]()
+                    _      <- queue.add(1)
+                    _      <- queue.add(2)
+                    fiber  <- queue.closeAwaitEmptyFiber
+                    _      <- queue.poll
+                    _      <- queue.poll
+                    result <- fiber.get
+                yield assert(result)
+            }
+        }
+
+        "concurrent polling and waiting".notNative in {
+            for
+                queue  <- Queue.init[Int](10)
+                _      <- Kyo.foreach(1 to 5)(i => queue.offer(i))
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- Async.foreach(1 to 5)(_ => queue.poll)
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "sliding queue".notNative in {
+            for
+                queue  <- Queue.Unbounded.initSliding[Int](2)
+                _      <- queue.add(1)
+                _      <- queue.add(2)
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- queue.poll
+                _      <- queue.poll
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "dropping queue".notNative in {
+            for
+                queue  <- Queue.Unbounded.initDropping[Int](2)
+                _      <- queue.add(1)
+                _      <- queue.add(2)
+                fiber  <- queue.closeAwaitEmptyFiber
+                _      <- queue.poll
+                _      <- queue.poll
+                result <- fiber.get
+            yield assert(result)
+        }
+
+        "zero capacity queue".notNative in {
+            for
+                queue  <- Queue.init[Int](0)
+                result <- queue.closeAwaitEmptyFiber.map(_.get)
+            yield assert(result)
+        }
+
+        "race between closeAwaitEmpty and close".notNative in {
+            (for
+                size                 <- Choice.eval(0, 1, 2, 10, 100)
+                queue                <- Queue.init[Int](size)
+                _                    <- Kyo.foreach(1 to (size min 5))(i => queue.offer(i))
+                latch                <- Latch.init(1)
+                closeAwaitEmptyFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(queue.closeAwaitEmptyFiber.map(_.get))
+                )
+                closeFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(queue.close)
+                )
+                _        <- latch.release
+                _        <- Abort.run(queue.drain)
+                result1  <- closeAwaitEmptyFiber.get
+                result2  <- closeFiber.get
+                isClosed <- queue.closed
+            yield
+                assert(isClosed)
+                assert((result1 && result2.isEmpty) || (!result1 && result2.isDefined))
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .andThen(succeed)
+        }
+
+        "two producers calling closeAwaitEmpty".notNative in {
+            (for
+                size  <- Choice.eval(0, 1, 2, 10, 100)
+                queue <- Queue.init[Int](size)
+                latch <- Latch.init(1)
+
+                producerFiber1 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
+                    )
+                )
+                producerFiber2 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
+                    )
+                )
+
+                consumerFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.fill(100, 10)(untilTrue(queue.poll.map(_.isDefined)))
+                    )
+                )
+
+                _        <- latch.release
+                result1  <- producerFiber1.getResult
+                result2  <- producerFiber2.getResult
+                isClosed <- queue.closed
+                _        <- consumerFiber.getResult
+            yield
+                assert(isClosed)
+                assert(Seq(result1, result2).count(_.contains(true)) == 1)
+                assert(Seq(result1, result2).count(r => r.contains(false) || r.isFailure) == 1)
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .andThen(succeed)
+        }
+
+        "producer calling closeAwaitEmpty and another calling close".notNative in {
+            (for
+                size  <- Choice.eval(0, 1, 2, 10, 100)
+                queue <- Queue.init[Int](size)
+                latch <- Latch.init(1)
+
+                producerFiber1 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(1 to 25, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.closeAwaitEmptyFiber.map(_.get))
+                    )
+                )
+                producerFiber2 <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.foreach(26 to 50, 10)(i => Abort.run(queue.offer(i)))
+                            .andThen(queue.close)
+                    )
+                )
+
+                consumerFiber <- Fiber.initUnscoped(
+                    latch.await.andThen(
+                        Async.fill(100, 10)(untilTrue(queue.poll.map(_.isDefined)))
+                    )
+                )
+
+                _        <- latch.release
+                result1  <- producerFiber1.getResult
+                result2  <- producerFiber2.getResult
+                isClosed <- queue.closed
+                _        <- consumerFiber.getResult
+            yield
+                assert(isClosed)
+                assert(
+                    (result1.isFailure || result1.contains(false)) && !result2.contains(Absent) ||
+                        (result1.contains(true)) && result2.contains(Absent)
+                )
+            )
+                .handle(Choice.run, _.unit, Loop.repeat(10))
+                .andThen(succeed)
         }
     }
 

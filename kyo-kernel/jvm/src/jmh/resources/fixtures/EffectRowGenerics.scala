@@ -8,7 +8,7 @@ object EffectRowGenerics:
     sealed trait Ask extends ArrowEffect[[X] =>> Unit, [X] =>> Int]
     sealed trait Log extends ArrowEffect[[X] =>> String, [X] =>> Unit]
 
-    def ask: Int < Ask = ArrowEffect.suspend[Any](Tag[Ask], ())
+    def ask: Int < Ask             = ArrowEffect.suspend[Any](Tag[Ask], ())
     def log(s: String): Unit < Log = ArrowEffect.suspend[Any](Tag[Log], s)
 
     def zip[A, B, S, S2](a: A < S, b: B < S2): (A, B) < (S & S2) =

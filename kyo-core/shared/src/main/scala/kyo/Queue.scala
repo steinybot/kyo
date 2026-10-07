@@ -146,7 +146,7 @@ object Queue:
         /** Closes the queue and asynchronously waits until it's empty.
           *
           * This method closes the queue to new elements and returns a computation that completes when all elements have been consumed.
-          * Unlike the regular `close` method, this allows consumers to process all remaining elements before considering the queue fully
+          * Unlike the regular [[close]] method, this allows consumers to process all remaining elements before considering the queue fully
           * closed.
           *
           * @return
@@ -155,12 +155,41 @@ object Queue:
           */
         def closeAwaitEmpty(using Frame): Boolean < Async = Sync.Unsafe.defer(self.closeAwaitEmpty().safe.get)
 
-        /** Checks if the queue is closed.
+        /** Closes the queue and returns the [[Fiber]] waits until it's empty.
+          *
+          * This method closes the queue to new elements and returns a `Fiber` that completes when all elements have been consumed. Unlike
+          * the regular [[close]] method, this allows consumers to process all remaining elements before considering the queue fully closed.
+          *
+          * This differs from [[closeAwaitEmpty]] in that once the `Fiber` has been obtained it guarantees to have begun closing the queue
+          * and future offers to the queue will abort with [[Closed]] even if the queue is not yet completely closed. On the other hand,
+          * when handling the `Async` effect from `closeAwaitEmpty` the `Fiber` it returns may not have started closing the queue yet.
           *
           * @return
-          *   true if the queue is closed, false otherwise
+          *   A `Fiber` that completes with `true` if the queue was successfully closed and emptied, `false` if it was already closed or
+          *   another `closeAwaitEmpty` is already running.
+          */
+        def closeAwaitEmptyFiber(using Frame): Fiber[Boolean, Any] < Sync = Sync.Unsafe.defer(self.closeAwaitEmpty().safe)
+
+        /** Checks if the queue is closed.
+          *
+          * A queue is considered closed if it has fully closed, i.e. it is not open and it is empty.
+          *
+          * This will always be `true` after [[close]]. In the case of [[closeAwaitEmpty]] and [[closeAwaitEmptyFiber]], it will only be
+          * `true` once the queue has been emptied.
+          *
+          * @return
+          *   `true` if the queue is closed, `false` otherwise
           */
         def closed(using Frame): Boolean < Sync = Sync.Unsafe.defer(self.closed())
+
+        /** Checks if the queue is open.
+          *
+          * A queue is considered open if it has not begun closing, and it may still accept new elements (although it might be full).
+          *
+          * @return
+          *   `true` if the queue is open, `false` otherwise
+          */
+        def open(using Frame): Boolean < Sync = Sync.Unsafe.defer(self.open())
 
         /** Returns the unsafe version of the queue.
           *
@@ -506,6 +535,7 @@ object Queue:
                     def close()(using Frame, AllowUnsafe)           = underlying.close()
                     def closeAwaitEmpty()(using Frame, AllowUnsafe) = underlying.closeAwaitEmpty()
                     def closed()(using AllowUnsafe): Boolean        = underlying.closed()
+                    def open()(using AllowUnsafe): Boolean          = underlying.open()
                 end new
             end initDropping
 
@@ -552,6 +582,7 @@ object Queue:
                     def close()(using Frame, AllowUnsafe)           = underlying.close()
                     def closeAwaitEmpty()(using Frame, AllowUnsafe) = underlying.closeAwaitEmpty()
                     def closed()(using AllowUnsafe): Boolean        = underlying.closed()
+                    def open()(using AllowUnsafe): Boolean          = underlying.open()
                 end new
             end initSliding
         end Unsafe
@@ -571,6 +602,7 @@ object Queue:
         def close()(using Frame, AllowUnsafe): Fiber.Unsafe[Maybe[Seq[A]], Any]
         def closeAwaitEmpty()(using Frame, AllowUnsafe): Fiber.Unsafe[Boolean, Any]
         def closed()(using AllowUnsafe): Boolean
+        def open()(using AllowUnsafe): Boolean
 
         /** Best-effort human-readable snapshot of this queue's coordination state (open/half-open/closed status, ring emptiness and
           * size, in-flight offer count) for the [[kyo.internal.Diagnostics]] hang dumpers. Renders even when the queue is FullyClosed,
@@ -583,8 +615,7 @@ object Queue:
           * rather than wait for a delivery that can never happen. Default false; overridden by the closeable backend.
           */
         private[kyo] def offersRejected(): Boolean = false
-
-        final def safe: Queue[A] = this
+        final def safe: Queue[A]                   = this
     end Unsafe
 
     /** WARNING: Low-level API meant for integrations, libraries, and performance-sensitive code. See AllowUnsafe for more details. */
@@ -732,6 +763,9 @@ object Queue:
             end diagnosticState
 
             override private[kyo] def offersRejected(): Boolean = offerClosed.isDefined
+
+            final def open()(using AllowUnsafe) =
+                state.get() eq State.Open
 
             final def drainUpTo(max: Int)(using AllowUnsafe): Result[Closed, Chunk[A]] = pollOp(_drain(Maybe.Present(max)))
 

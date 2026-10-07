@@ -1,5 +1,4 @@
 package example
 
-object B {
+object B:
     def name: String = "b"
-}

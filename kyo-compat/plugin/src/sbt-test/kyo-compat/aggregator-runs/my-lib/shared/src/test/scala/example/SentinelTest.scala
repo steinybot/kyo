@@ -1,7 +1,8 @@
 package example
 
+import java.nio.file.Files
+import java.nio.file.Paths
 import org.scalatest.funsuite.AnyFunSuite
-import java.nio.file.{Files, Paths}
 
 // Each (backend × platform) cell of myLib runs this test in its own
 // forked JVM. The fork inherits two sysprops set in build.sbt:
@@ -19,3 +20,4 @@ class SentinelTest extends AnyFunSuite:
         val parent = Paths.get(dir)
         Files.createDirectories(parent)
         Files.writeString(parent.resolve(cellName), "ran")
+end SentinelTest

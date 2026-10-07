@@ -5,7 +5,7 @@ import kyo.kernel.*
 
 object SuspendSites:
 
-    sealed trait Ask extends ArrowEffect[[X] =>> Unit, [X] =>> Int]
+    sealed trait Ask  extends ArrowEffect[[X] =>> Unit, [X] =>> Int]
     sealed trait Tell extends ArrowEffect[[X] =>> Int, [X] =>> Unit]
 
     def get0: Int < Ask =

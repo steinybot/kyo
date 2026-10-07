@@ -1,5 +1,4 @@
 package example
 
-object Common {
+object Common:
     def name: String = "plain-common"
-}

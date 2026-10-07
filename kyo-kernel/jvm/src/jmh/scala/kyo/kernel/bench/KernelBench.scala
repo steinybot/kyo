@@ -8,9 +8,9 @@ import kyo.Kyo
 import kyo.Maybe
 import kyo.Tag
 import kyo.discard
+import kyo.kernel.*
 import kyo.kernel.Arrow
 import kyo.kernel.Loop
-import kyo.kernel.*
 import kyo.kernel.internal.Eval
 import kyo.kernel.internal.Nested
 import org.openjdk.jmh.annotations.*
@@ -536,7 +536,8 @@ class KernelBench:
 
     @Benchmark
     def effectfulIterationViaLoop: Int =
-        val v = Loop(seed - 1)(i => if i > Depth then Loop.done(i) else ArrowEffect.suspend[Any](Tag[Ask], ()).map(a => Loop.continue(i + a)))
+        val v =
+            Loop(seed - 1)(i => if i > Depth then Loop.done(i) else ArrowEffect.suspend[Any](Tag[Ask], ()).map(a => Loop.continue(i + a)))
         ArrowEffect.handleLoop(Tag[Ask], v)([C] => _ => Loop.continue(1), a => a).eval
     end effectfulIterationViaLoop
 
@@ -622,7 +623,10 @@ class KernelBench:
             if i > Depth then i
             else ArrowEffect.suspend[Any](Tag[Ask], ()).map(a => loop(i + a))
         ArrowEffect.handleLoop(Tag[Ask], loop(seed - 1))(
-            [C] => _ => { discard(cell.incrementAndGet()); Loop.continue(1) },
+            [C] =>
+                _ =>
+                    discard(cell.incrementAndGet()); Loop.continue(1)
+            ,
             a => a
         ).eval
     end statefulAnswersPaySuccessorAltRef

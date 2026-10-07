@@ -33,6 +33,16 @@ addSbtPlugin("com.github.sbt" % "sbt-unidoc" % "0.6.1")
 
 // addSbtPlugin("com.github.sbt" % "sbt-jacoco" % "3.4.0")
 
+addSbtPlugin("com.thesamet"  % "sbt-protoc"             % "1.0.8")
+addSbtPlugin("com.thesamet"  % "sbt-protoc-gen-project" % "0.1.8")
+addSbtPlugin("org.typelevel" % "sbt-fs2-grpc"           % "3.1.2")
+
+libraryDependencies ++= Seq(
+    "com.thesamet.scalapb"          %% "compilerplugin"   % "0.11.21",
+    "com.thesamet.scalapb.zio-grpc" %% "zio-grpc-codegen" % "0.6.3",
+    "org.typelevel"                 %% "scalac-options"   % "0.1.8"
+)
+
 // ---------------------------------------------------------------------------
 // Source-link `kyo-ffi-plugin` into the meta-build so the main build's
 // `kyo-ffi-it` sub-project can call `enablePlugins(KyoFfiPlugin)` without

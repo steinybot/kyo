@@ -1,5 +1,4 @@
 package example
 
-object Fetcher {
+object Fetcher:
     def name: String = "fetcher"
-}

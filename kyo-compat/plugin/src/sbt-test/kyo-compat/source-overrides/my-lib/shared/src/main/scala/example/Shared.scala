@@ -1,3 +1,4 @@
 package example
 
-object Shared { val tag = "shared" }
+object Shared:
+    val tag = "shared"

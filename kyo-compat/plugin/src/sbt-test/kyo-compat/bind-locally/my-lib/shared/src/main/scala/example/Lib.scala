@@ -1,5 +1,4 @@
 package example
 
-object Lib {
+object Lib:
     def name: String = "my-lib"
-}
