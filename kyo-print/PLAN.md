@@ -4,11 +4,17 @@
 
 `kyo-print` is a native, zero-dependency pretty-printing and document layout module for the Kyo ecosystem across all four supported platforms: JVM, JavaScript, Scala Native, and WebAssembly.
 
-It addresses the limitations observed with external libraries like Typelevel Paiges on `kyo-grpc` (which required vendoring workarounds for internal invariant violations and operator clutter) and replaces ad-hoc, error-prone string concatenation across `kyo-ffi/codegen`, `kyo-ui`, and `kyo-test`.
+It addresses the limitations observed with external libraries like [Typelevel Paiges](https://github.com/typelevel/paiges) on `kyo-grpc` (which required vendoring workarounds for internal invariant violations and operator clutter) and replaces ad-hoc, error-prone string concatenation across `kyo-ffi/codegen`, `kyo-ui`, and `kyo-test`.
 
-Following the insights of modern pretty-printing research (including Porncharoenwase et al., *Pretty-Expressive*, OOPSLA 2023), `kyo-print` separates layout into two independent concerns:
+Following the foundational work on pretty-printing layout algebras by [Philip Wadler (*A prettier printer*, 2003)](https://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf) and recent advances by Porncharoenwase et al. ([*A pretty expressive printer*, OOPSLA 2023](https://github.com/sorawee/pretty-expressive) / [OOPSLA 2023 Artifact](https://github.com/sorawee/pretty-expressive-oopsla23-artifact)), `kyo-print` separates layout into two independent concerns:
 1. **The Pretty Printing Language (PPL)**: An immutable, algebraic document AST (`Doc`) representing text, indentation, and branching layout choices (`Doc.choice`).
 2. **Pluggable Printers**: Algorithms that interpret the PPL against page-width constraints to select the optimal layout (`Printer.Greedy`, `Printer.Optimal`, `Printer.Compact`).
+
+### References & Prior Art
+
+- **Wadler's Prettier Printer**: [A prettier printer (Philip Wadler, 2003)](https://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf)
+- **Pretty-Expressive**: [Pretty-Expressive Repository](https://github.com/sorawee/pretty-expressive) and [OOPSLA 2023 Artifact](https://github.com/sorawee/pretty-expressive-oopsla23-artifact) (Sorawee Porncharoenwase, Justin Pombrio, Emina Torlak)
+- **Typelevel Paiges**: [Paiges Repository](https://github.com/typelevel/paiges)
 
 ```
                      ┌───────────────────────────────┐
