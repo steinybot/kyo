@@ -61,9 +61,9 @@ package kyo
 sealed trait Doc derives CanEqual:
     def append(that: Doc): Doc
     def indent(spaces: Int = 4): Doc
-    def or(that: Doc): Doc
-    def grouped: Doc
-    def aligned: Doc
+    def fallback(that: Doc): Doc
+    def group: Doc
+    def align: Doc
 
 object Doc:
     // Core Primitives
@@ -77,28 +77,28 @@ object Doc:
     def choice(alts: Doc*): Doc
 
     // Linear Sequences (Verbs)
-    def lines(docs: Doc*): Doc
-    def lines(docs: Seq[Doc]): Doc
-    def spaced(docs: Doc*): Doc
-    def spaced(docs: Seq[Doc]): Doc
+    def stack(docs: Doc*): Doc
+    def stack(docs: Chunk[Doc]): Doc
+    def space(docs: Doc*): Doc
+    def space(docs: Chunk[Doc]): Doc
 
     // Delimited Sequences (Verbs)
     def separate(sep: Doc)(docs: Doc*): Doc
-    def separate(sep: Doc)(docs: Seq[Doc]): Doc
+    def separate(sep: Doc)(docs: Chunk[Doc]): Doc
     def join(start: Doc, sep: Doc, end: Doc)(docs: Doc*): Doc
-    def join(start: Doc, sep: Doc, end: Doc)(docs: Seq[Doc]): Doc
+    def join(start: Doc, sep: Doc, end: Doc)(docs: Chunk[Doc]): Doc
 
     // Scalafmt Layout Strategies (Verbs)
     def chop(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Doc*): Doc
-    def chop(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Seq[Doc]): Doc
+    def chop(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Chunk[Doc]): Doc
     def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Doc*): Doc
-    def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Seq[Doc]): Doc
+    def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int = 4)(docs: Chunk[Doc]): Doc
 
     def hang(open: Doc, sep: Doc, close: Doc)(docs: Doc*): Doc
-    def hang(open: Doc, sep: Doc, close: Doc)(docs: Seq[Doc]): Doc
+    def hang(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc
 
     def wrap(open: Doc, sep: Doc, close: Doc)(docs: Doc*): Doc
-    def wrap(open: Doc, sep: Doc, close: Doc)(docs: Seq[Doc]): Doc
+    def wrap(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc
 
     // Enclosures
     def between(open: Doc, body: Doc, close: Doc): Doc
@@ -109,7 +109,7 @@ object Doc:
 
 In all breaking sequence combinators (`separate`, `join`, `chop`), separators are defined via `Doc.choice`:
 ```scala
-val commaSep = Doc.choice(broken = Doc.text(",") + Doc.newline, flat = Doc.text(", "))
+val commaSep = Doc.choice(broken = Doc.text(",").append(Doc.newline), flat = Doc.text(", "))
 ```
 When breaking across multiple lines, the separator emits `,` immediately followed by `\n` and indentation. Trailing spaces are strictly impossible.
 
@@ -132,8 +132,8 @@ val methodDoc =
 package kyo
 
 trait Printer:
-    def render(doc: Doc, width: Int): String
-    def renderStream(doc: Doc, width: Int): Stream[String, Any]
+    def print(doc: Doc, width: Int): String
+    def printStream(doc: Doc, width: Int): Stream[String, Any]
 
 object Printer:
     val greedy: Printer     // Wadler-Lindig linear-time lookahead
@@ -141,23 +141,19 @@ object Printer:
     val compact: Printer    // Single-line flat rendering
 ```
 
-### 2.6. Effect Integration (`Print`)
+### 2.6. Effect Integration
 
-Printers produce `Doc` directly or integrate with effects via [`kyo.Env`](file:///Users/jason/src/kyo2/kyo-prelude/shared/src/main/scala/kyo/Env.scala):
+`Doc` is a pure value and `Printer` is a layout strategy. To evaluate an effectful document (`Doc < S`), standard Kyo `.map` operations are used rather than a dedicated handler object, keeping the API minimal and avoiding lock-in. Printers are passed explicitly so users control the layout engine:
 
 ```scala
-object Print:
-    def run[S](doc: Doc < S, width: Int = 100, printer: Printer = Printer.greedy)(using Frame): String < S =
-        doc.map(printer.render(_, width))
+// Pure evaluation
+val output: String = Printer.greedy.print(doc, width = 100)
 
-    def runStream[S](doc: Doc < S, width: Int = 100, printer: Printer = Printer.greedy)(using Frame): Stream[String, S] =
-        Stream(doc.map(printer.renderStream(_, width)))
+// Effectful evaluation
+val stringEffect: String < S = docEffect.map(Printer.greedy.print(_, 100))
 
-    def format[C, S](doc: Doc < (Env[C] & S), extractWidth: C => Int, printer: Printer = Printer.greedy)(using Frame): String < (Env[C] & S) =
-        for
-            config <- Env.get[C]
-            d      <- doc
-        yield printer.render(d, extractWidth(config))
+// Streaming effectful evaluation (extracting the Emit effect from the pure stream)
+val streamEffect: Stream[String, S] = Stream(docEffect.map(Printer.greedy.printStream(_, 100).emit))
 ```
 
 ---
@@ -195,7 +191,7 @@ object Print:
                             │
 ┌───────────────────────────▼────────────────────────────┐
 │ Phase 5: Scalafmt Parity Test Suite                    │
-│ - Define ScalafmtConfig model                          │
+│ - Define ScalafmtConfig model in `kyo-print/shared/src/main/scala/kyo/ScalafmtConfig.scala` (ensuring no orphan test class)                          │
 │ - Reusable effectful fixtures Doc < Env[ScalafmtConfig]│
 │ - Test matrix validating documented Scalafmt styles    │
 └───────────────────────────┬────────────────────────────┘
@@ -240,7 +236,7 @@ object Print:
 - Test file: `kyo-print/shared/src/test/scala/kyo/PrinterTest.scala`.
 - Tests verify:
   - Width boundary conditions (exact fit vs 1-character overflow).
-  - Stream chunking and equivalence to buffered render.
+  - Stream chunking and equivalence to buffered print.
   - Equivalence between greedy and optimal on standard single-choice shapes.
 
 ### Phase 4: Template Interpolation
@@ -273,6 +269,7 @@ object Print:
 
 ## 4. Pre-Submission Quality Checklist
 
+- [ ] `using` clauses correctly ordered: `Tag` before `Frame` (inline), `Frame` before evidence (non-inline), `AllowUnsafe` last.
 - [ ] All cross-platform sources live in `shared/src/main/scala/kyo/`.
 - [ ] All tests live in `shared/src/test/scala/kyo/` and extend `kyo.test.Test[Any]`.
 - [ ] No symbolic operators in public APIs.
