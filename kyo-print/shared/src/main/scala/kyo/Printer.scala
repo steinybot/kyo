@@ -43,6 +43,18 @@ object Printer:
       */
     val greedy: Printer = GreedyPrinter
 
+    /** A compact printer that produces single-line minified output ignoring indentation.
+      *
+      * Evaluates documents in flat mode, collapsing soft line breaks to single spaces,
+      * selecting flat alternatives for layout choices, and omitting all indentation
+      * and column alignment. Hard line breaks remain preserved as newlines without
+      * indentation margins.
+      *
+      * This strategy is suited for minified text, machine-readable output, or single-line
+      * serialization where visual indentation is unnecessary.
+      */
+    val compact: Printer = CompactPrinter
+
     private case class Work(indent: Int, isFlat: Boolean, doc: Doc)
 
     private case class StreamState(work: List[Work], col: Int, pendingIndent: Int)
@@ -303,5 +315,121 @@ object Printer:
         end printStream
 
     end GreedyPrinter
+
+    private object CompactPrinter extends Printer:
+
+        def print(doc: Doc, width: Int): String =
+            if doc eq Doc.Empty then ""
+            else
+                val sb   = new java.lang.StringBuilder()
+                var work = doc :: Nil
+
+                while work.nonEmpty do
+                    val head = work.head
+                    work = work.tail
+
+                    head match
+                        case Doc.Empty => ()
+
+                        case Doc.Text(text) =>
+                            sb.append(text)
+                            ()
+
+                        case Doc.Newline =>
+                            sb.append(' ')
+                            ()
+
+                        case Doc.HardNewline =>
+                            sb.append('\n')
+                            ()
+
+                        case Doc.Indent(_, inner) =>
+                            work = inner :: work
+
+                        case Doc.Align(inner) =>
+                            work = inner :: work
+
+                        case Doc.Concat(first, second) =>
+                            work = first :: second :: work
+
+                        case Doc.Group(inner) =>
+                            work = inner :: work
+
+                        case Doc.Choice(_, flat) =>
+                            work = flat :: work
+                    end match
+                end while
+
+                sb.toString
+            end if
+        end print
+
+        private def formatNextLine(initialWork: List[Doc]): (String, List[Doc]) =
+            val sb           = new java.lang.StringBuilder()
+            var work         = initialWork
+            var finishedLine = false
+
+            while work.nonEmpty && !finishedLine do
+                val head = work.head
+                work = work.tail
+
+                head match
+                    case Doc.Empty => ()
+
+                    case Doc.Text(text) =>
+                        sb.append(text)
+                        ()
+
+                    case Doc.Newline =>
+                        sb.append(' ')
+                        ()
+
+                    case Doc.HardNewline =>
+                        sb.append('\n')
+                        finishedLine = true
+
+                    case Doc.Indent(_, inner) =>
+                        work = inner :: work
+
+                    case Doc.Align(inner) =>
+                        work = inner :: work
+
+                    case Doc.Concat(first, second) =>
+                        work = first :: second :: work
+
+                    case Doc.Group(inner) =>
+                        work = inner :: work
+
+                    case Doc.Choice(_, flat) =>
+                        work = flat :: work
+                end match
+            end while
+
+            (sb.toString, work)
+        end formatNextLine
+
+        def printStream(doc: Doc, width: Int)(using Frame): Stream[String, Any] =
+            if doc eq Doc.Empty then
+                Stream.empty
+            else
+                Stream:
+                    Loop(doc :: Nil) { work =>
+                        if work.isEmpty then
+                            Loop.done
+                        else
+                            val (line, nextWork) = formatNextLine(work)
+                            if nextWork.nonEmpty then
+                                Emit.valueWith(Chunk(line))(Loop.continue(nextWork))
+                            else if line.nonEmpty then
+                                Emit.valueWith(Chunk(line))(Loop.done)
+                            else
+                                Loop.done
+                            end if
+                        end if
+                    }
+            end if
+        end printStream
+
+    end CompactPrinter
 
 end Printer
