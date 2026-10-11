@@ -396,4 +396,171 @@ class PrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "Printer.optimal" - {
+        "primitives" - {
+            "empty document" in {
+                assert(Printer.optimal.print(Doc.empty, 80) == "")
+            }
+
+            "literal text" in {
+                assert(Printer.optimal.print(Doc.text("hello"), 80) == "hello")
+            }
+
+            "concatenation" in {
+                val doc = Doc.text("hello").append(Doc.space).append(Doc.text("world"))
+                assert(Printer.optimal.print(doc, 80) == "hello world")
+            }
+
+            "newline in break mode emits line break" in {
+                val doc = Doc.text("hello").append(Doc.newline).append(Doc.text("world"))
+                assert(Printer.optimal.print(doc, 80) == "hello\nworld")
+            }
+
+            "hardNewline always breaks even in flat group" in {
+                val doc = Doc.group(Doc.text("a").append(Doc.hardNewline).append(Doc.text("b")))
+                assert(Printer.optimal.print(doc, 80) == "a\nb")
+            }
+        }
+
+        "indentation" - {
+            "nested indentation increases margin" in {
+                val doc = Doc.text("parent:").append(
+                    Doc.newline.append(Doc.text("child")).indent(4)
+                )
+                assert(Printer.optimal.print(doc, 80) == "parent:\n    child")
+            }
+
+            "additive indentation stacks across levels" in {
+                val doc = Doc.text("level0:").append(
+                    Doc.newline.append(Doc.text("level1:")).append(
+                        Doc.newline.append(Doc.text("level2")).indent(2)
+                    ).indent(2)
+                )
+                assert(Printer.optimal.print(doc, 80) == "level0:\n  level1:\n    level2")
+            }
+
+            "zero-trailing-whitespace on empty lines" in {
+                val doc = Doc.text("a").append(Doc.newline).append(Doc.newline.indent(4)).append(
+                    Doc.text("b").indent(4)
+                )
+                assert(Printer.optimal.print(doc, 80) == "a\n\n    b")
+            }
+
+            "trailing newline produces no trailing spaces" in {
+                val doc = Doc.text("a").append(Doc.newline).indent(4)
+                assert(Printer.optimal.print(doc, 80) == "a\n")
+            }
+        }
+
+        "alignment" - {
+            "aligns line breaks to current column" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align(Doc.text("line1").append(Doc.newline).append(Doc.text("line2")))
+                )
+                assert(Printer.optimal.print(doc, 80) == "prefix: line1\n        line2")
+            }
+
+            "nested alignment with indentation" in {
+                val doc = Doc.text("fn(").append(
+                    Doc.align(
+                        Doc.text("a").append(Doc.newline).append(Doc.text("b").indent(2))
+                    )
+                )
+                assert(Printer.optimal.print(doc, 80) == "fn(a\n     b")
+            }
+        }
+
+        "choice and optimality" - {
+            "evaluates multi-alternative choice selecting best fit" in {
+                val doc = Doc.choice(
+                    Doc.text("long alternative that exceeds width"),
+                    Doc.text("medium alt"),
+                    Doc.text("short")
+                )
+                assert(Printer.optimal.print(doc, 15) == "medium alt")
+                assert(Printer.optimal.print(doc, 8) == "short")
+                assert(Printer.optimal.print(doc, 50) == "long alternative that exceeds width")
+            }
+
+            "multi-choice tree selects globally optimal layout" in {
+                // Testing multiple choices where optimal avoids greedy pitfall
+                val doc = Doc.choice(
+                    Doc.text("first-option-long").append(Doc.space).append(
+                        Doc.choice(Doc.text("second-long"), Doc.text("s2"))
+                    ),
+                    Doc.text("first-short").append(Doc.space).append(
+                        Doc.choice(Doc.text("second-long-choice"), Doc.text("s2"))
+                    )
+                )
+                // Width 25: "first-short second-long-choice" has length 11 + 1 + 18 = 30 (overflow)
+                // "first-short s2" length 11 + 1 + 2 = 14
+                // "first-option-long s2" length 17 + 1 + 2 = 20 <= 25 (fits!)
+                // "first-option-long second-long" length 17 + 1 + 11 = 29
+                assert(Printer.optimal.print(doc, 22) == "first-option-long s2")
+            }
+        }
+
+        "equivalence with greedy on standard single-choice shapes" - {
+            val docs = Seq(
+                ("empty", Doc.empty),
+                ("single line", Doc.text("simple single line")),
+                ("lines", Doc.text("a").append(Doc.newline).append(Doc.text("b"))),
+                ("group", Doc.group(Doc.text("hello").append(Doc.newline).append(Doc.text("world")))),
+                ("chop", Doc.chop(Doc.text("("), Doc.text(", "), Doc.text(")"))(Doc.text("x"), Doc.text("y"))),
+                ("chopClosed", Doc.chopClosed(Doc.text("("), Doc.text(", "), Doc.text(")"))(Doc.text("x"), Doc.text("y"))),
+                ("hang", Doc.hang(Doc.text("fn("), Doc.text(", "), Doc.text(")"))(Doc.text("x"), Doc.text("y"))),
+                ("stack", Doc.stack(Doc.text("line 1"), Doc.text("line 2"), Doc.text("line 3"))),
+                ("align", Doc.text("prefix: ").append(Doc.align(Doc.text("1").append(Doc.newline).append(Doc.text("2")))))
+            )
+
+            for
+                (name, d) <- docs
+                w         <- Seq(5, 10, 15, 80)
+            do
+                s"shape $name at width $w" in {
+                    val greedyResult  = Printer.greedy.print(d, w)
+                    val optimalResult = Printer.optimal.print(d, w)
+                    assert(optimalResult == greedyResult)
+                }
+            end for
+        }
+
+        "streaming" - {
+            "empty document produces empty stream" in {
+                val stream = Printer.optimal.printStream(Doc.empty, 80)
+                assert(stream.run.eval == Chunk.empty)
+            }
+
+            "single line document produces single element stream" in {
+                val stream = Printer.optimal.printStream(Doc.text("hello"), 80)
+                assert(stream.run.eval == Chunk("hello"))
+            }
+
+            "multi-line document chunks by line" in {
+                val doc    = Doc.text("a").append(Doc.newline).append(Doc.text("b"))
+                val stream = Printer.optimal.printStream(doc, 80)
+                assert(stream.run.eval == Chunk("a\n", "b"))
+            }
+
+            "stream output equals buffered print output across document shapes" in {
+                val docs = Seq(
+                    Doc.empty,
+                    Doc.text("simple single line"),
+                    Doc.text("a").append(Doc.newline).append(Doc.text("b")),
+                    Doc.chop(Doc.text("("), Doc.text(", "), Doc.text(")"))(Doc.text("x"), Doc.text("y")),
+                    Doc.text("prefix: ").append(Doc.align(Doc.text("1").append(Doc.newline).append(Doc.text("2"))))
+                )
+
+                for
+                    d <- docs
+                    w <- Seq(5, 10, 80)
+                do
+                    val expected = Printer.optimal.print(d, w)
+                    val streamed = Printer.optimal.printStream(d, w).run.eval.mkString
+                    assert(streamed == expected)
+                end for
+            }
+        }
+    }
+
 end PrinterTest
