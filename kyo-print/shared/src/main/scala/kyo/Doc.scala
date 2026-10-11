@@ -62,7 +62,9 @@ object Doc:
 
     val empty: Doc = Empty
 
-    val space: Doc = Text(" ")
+    private val singleSpace: Doc = Text(" ")
+
+    def space: Doc = singleSpace
 
     val newline: Doc = Newline
 
@@ -73,7 +75,7 @@ object Doc:
         else Text(str)
 
     def char(c: Char): Doc =
-        if c == ' ' then space
+        if c == ' ' then singleSpace
         else Text(c.toString)
 
     def append(a: Doc, b: Doc): Doc =
@@ -116,4 +118,164 @@ object Doc:
     def choice(alts: Doc*): Doc =
         choice(Chunk.from(alts))
 
+    def separate(sep: Doc)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then empty
+        else if docs.length == 1 then docs.head
+        else
+            var acc = docs.head
+            var i   = 1
+            while i < docs.length do
+                acc = acc.append(sep).append(docs(i))
+                i += 1
+            acc
+
+    def separate(sep: Doc)(docs: Doc*): Doc =
+        separate(sep)(Chunk.from(docs))
+
+    def join(start: Doc, sep: Doc, end: Doc)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then start.append(end)
+        else start.append(separate(sep)(docs)).append(end)
+
+    def join(start: Doc, sep: Doc, end: Doc)(docs: Doc*): Doc =
+        join(start, sep, end)(Chunk.from(docs))
+
+    def stack(docs: Chunk[Doc]): Doc =
+        separate(newline)(docs)
+
+    def stack(docs: Doc*): Doc =
+        stack(Chunk.from(docs))
+
+    def lines(docs: Chunk[Doc]): Doc =
+        stack(docs)
+
+    def lines(docs: Doc*): Doc =
+        stack(Chunk.from(docs))
+
+    def space(docs: Chunk[Doc]): Doc =
+        separate(singleSpace)(docs)
+
+    def space(first: Doc, rest: Doc*): Doc =
+        space(Chunk.from(first +: rest))
+
+    def spaced(docs: Chunk[Doc]): Doc =
+        space(docs)
+
+    def spaced(docs: Doc*): Doc =
+        space(Chunk.from(docs))
+
+    def between(open: Doc, body: Doc, close: Doc): Doc =
+        open.append(body).append(close)
+
+    def enclose(open: Doc, close: Doc)(body: Doc): Doc =
+        between(open, body, close)
+
+    private def stripTrailingSpace(doc: Doc): Doc =
+        doc match
+            case Text(s) if s.endsWith(" ") =>
+                val trimmed = s.stripTrailing()
+                if trimmed.isEmpty then Empty else Text(trimmed)
+            case Concat(first, second) =>
+                val s2 = stripTrailingSpace(second)
+                if s2 eq Empty then stripTrailingSpace(first)
+                else Concat(first, s2)
+            case _ => doc
+
+    private def resolveSeparators(sep: Doc): (Doc, Doc) =
+        sep match
+            case Choice(broken, flat) => (broken, flat)
+            case Newline              => (Newline, singleSpace)
+            case HardNewline          => (HardNewline, singleSpace)
+            case Empty                => (newline, Empty)
+            case _                    =>
+                val stripped = stripTrailingSpace(sep)
+                if stripped ne sep then
+                    (stripped.append(newline), sep)
+                else
+                    (sep.append(newline), sep.append(singleSpace))
+                end if
+
+    def chop(open: Doc, sep: Doc, close: Doc, indent: Int)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then open.append(close)
+        else
+            val (brokenSep, flatSep) = resolveSeparators(sep)
+            val brokenInner          =
+                if docs.length == 1 then docs.head.indent(indent)
+                else separate(brokenSep)(docs).indent(indent)
+            val broken = open.append(newline).append(brokenInner).append(newline).append(close)
+            val flat   = open.append(separate(flatSep)(docs)).append(close)
+            group(choice(broken, flat))
+
+    def chop(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
+        chop(open, sep, close, 4)(docs)
+
+    def chop(open: Doc, sep: Doc, close: Doc, indent: Int)(first: Doc, rest: Doc*): Doc =
+        chop(open, sep, close, indent)(Chunk.from(first +: rest))
+
+    def chop(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        chop(open, sep, close, 4)(Chunk.from(first +: rest))
+
+    def chop(open: Doc, sep: Doc, close: Doc)(): Doc =
+        open.append(close)
+
+    def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then open.append(close)
+        else
+            val (brokenSep, flatSep) = resolveSeparators(sep)
+            val brokenInner          =
+                if docs.length == 1 then docs.head.indent(indent)
+                else separate(brokenSep)(docs).indent(indent)
+            val broken = open.append(newline).append(brokenInner).append(close)
+            val flat   = open.append(separate(flatSep)(docs)).append(close)
+            group(choice(broken, flat))
+
+    def chopClosed(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
+        chopClosed(open, sep, close, 4)(docs)
+
+    def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int)(first: Doc, rest: Doc*): Doc =
+        chopClosed(open, sep, close, indent)(Chunk.from(first +: rest))
+
+    def chopClosed(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        chopClosed(open, sep, close, 4)(Chunk.from(first +: rest))
+
+    def chopClosed(open: Doc, sep: Doc, close: Doc)(): Doc =
+        open.append(close)
+
+    def hang(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then open.append(close)
+        else if docs.length == 1 then open.append(docs.head).append(close)
+        else
+            val (brokenSep, flatSep) = resolveSeparators(sep)
+            val broken               = open.append(align(separate(brokenSep)(docs).append(close)))
+            val flat                 = open.append(separate(flatSep)(docs)).append(close)
+            group(choice(broken, flat))
+
+    def hang(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        hang(open, sep, close)(Chunk.from(first +: rest))
+
+    def hang(open: Doc, sep: Doc, close: Doc)(): Doc =
+        open.append(close)
+
+    def wrap(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then open.append(close)
+        else if docs.length == 1 then open.append(docs.head).append(close)
+        else
+            val (brokenSep, flatSep) = resolveSeparators(sep)
+            val softSep              = group(choice(brokenSep, flatSep))
+            open.append(align(separate(softSep)(docs))).append(close)
+
+    def wrap(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        wrap(open, sep, close)(Chunk.from(first +: rest))
+
+    def wrap(open: Doc, sep: Doc, close: Doc)(): Doc =
+        open.append(close)
+
 end Doc
+
+extension (docs: Chunk[Doc])
+    def separate(sep: Doc): Doc                                           = Doc.separate(sep)(docs)
+    def join(start: Doc, sep: Doc, end: Doc): Doc                         = Doc.join(start, sep, end)(docs)
+    def chop(open: Doc, sep: Doc, close: Doc, indent: Int = 4): Doc       = Doc.chop(open, sep, close, indent)(docs)
+    def chopClosed(open: Doc, sep: Doc, close: Doc, indent: Int = 4): Doc = Doc.chopClosed(open, sep, close, indent)(docs)
+    def hang(open: Doc, sep: Doc, close: Doc): Doc                        = Doc.hang(open, sep, close)(docs)
+    def wrap(open: Doc, sep: Doc, close: Doc): Doc                        = Doc.wrap(open, sep, close)(docs)
+end extension
