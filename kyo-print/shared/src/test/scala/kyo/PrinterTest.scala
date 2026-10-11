@@ -254,4 +254,146 @@ class PrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "Printer.compact" - {
+        "primitives" - {
+            "empty document" in {
+                assert(Printer.compact.print(Doc.empty, 80) == "")
+            }
+
+            "literal text" in {
+                assert(Printer.compact.print(Doc.text("hello"), 80) == "hello")
+            }
+
+            "concatenation" in {
+                val doc = Doc.text("hello").append(Doc.space).append(Doc.text("world"))
+                assert(Printer.compact.print(doc, 80) == "hello world")
+            }
+
+            "newline collapses to single space" in {
+                val doc = Doc.text("hello").append(Doc.newline).append(Doc.text("world"))
+                assert(Printer.compact.print(doc, 80) == "hello world")
+            }
+
+            "hardNewline preserves line break without indentation" in {
+                val doc = Doc.text("hello").append(Doc.hardNewline).append(Doc.text("world"))
+                assert(Printer.compact.print(doc, 80) == "hello\nworld")
+            }
+        }
+
+        "indentation and alignment ignored" - {
+            "ignores indentation" in {
+                val doc = Doc.text("parent:").append(
+                    Doc.newline.append(Doc.text("child")).indent(4)
+                )
+                assert(Printer.compact.print(doc, 80) == "parent: child")
+            }
+
+            "ignores indentation with hardNewline" in {
+                val doc = Doc.text("line1").append(
+                    Doc.hardNewline.append(Doc.text("line2")).indent(4)
+                )
+                assert(Printer.compact.print(doc, 80) == "line1\nline2")
+            }
+
+            "ignores alignment" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align(Doc.text("line1").append(Doc.newline).append(Doc.text("line2")))
+                )
+                assert(Printer.compact.print(doc, 80) == "prefix: line1 line2")
+            }
+        }
+
+        "grouping and choice" - {
+            "group remains flat" in {
+                val doc = Doc.group(Doc.text("hello").append(Doc.newline).append(Doc.text("world")))
+                assert(Printer.compact.print(doc, 1) == "hello world")
+            }
+
+            "choice selects flat alternative" in {
+                val doc = Doc.choice(broken = Doc.text("broken"), flat = Doc.text("flat"))
+                assert(Printer.compact.print(doc, 80) == "flat")
+            }
+
+            "nested choice selects flat alternative" in {
+                val doc = Doc.choice(
+                    broken = Doc.text("outerBroken"),
+                    flat = Doc.choice(broken = Doc.text("innerBroken"), flat = Doc.text("innerFlat"))
+                )
+                assert(Printer.compact.print(doc, 80) == "innerFlat")
+            }
+        }
+
+        "combinators" - {
+            val items = Chunk(Doc.text("a"), Doc.text("b"), Doc.text("c"))
+
+            "chop formats flat with separators" in {
+                val doc = Doc.chop(Doc.text("("), Doc.text(", "), Doc.text(")"))(items)
+                assert(Printer.compact.print(doc, 5) == "(a, b, c)")
+            }
+
+            "chopClosed formats flat with delimiters" in {
+                val doc = Doc.chopClosed(Doc.text("("), Doc.text(", "), Doc.text(")"))(items)
+                assert(Printer.compact.print(doc, 5) == "(a, b, c)")
+            }
+
+            "hang formats flat" in {
+                val doc = Doc.hang(Doc.text("call("), Doc.text(", "), Doc.text(")"))(items)
+                assert(Printer.compact.print(doc, 5) == "call(a, b, c)")
+            }
+
+            "stack collapses lines to single spaces" in {
+                val doc = Doc.stack(items)
+                assert(Printer.compact.print(doc, 80) == "a b c")
+            }
+
+            "wrap formats flat" in {
+                val doc = Doc.wrap(Doc.text("["), Doc.text(", "), Doc.text("]"))(
+                    Doc.text("11"),
+                    Doc.text("22"),
+                    Doc.text("33")
+                )
+                assert(Printer.compact.print(doc, 5) == "[11, 22, 33]")
+            }
+        }
+
+        "streaming" - {
+            "empty document produces empty stream" in {
+                val stream = Printer.compact.printStream(Doc.empty, 80)
+                assert(stream.run.eval == Chunk.empty)
+            }
+
+            "single line document produces single element stream" in {
+                val doc    = Doc.text("hello").append(Doc.newline).append(Doc.text("world"))
+                val stream = Printer.compact.printStream(doc, 80)
+                assert(stream.run.eval == Chunk("hello world"))
+            }
+
+            "document with hardNewline chunks by line" in {
+                val doc    = Doc.text("a").append(Doc.hardNewline).append(Doc.text("b"))
+                val stream = Printer.compact.printStream(doc, 80)
+                assert(stream.run.eval == Chunk("a\n", "b"))
+            }
+
+            "stream output equals buffered print output across document shapes" in {
+                val docs = Seq(
+                    Doc.empty,
+                    Doc.text("simple single line"),
+                    Doc.text("a").append(Doc.newline).append(Doc.text("b")),
+                    Doc.text("a").append(Doc.hardNewline).append(Doc.text("b")),
+                    Doc.chop(Doc.text("("), Doc.text(", "), Doc.text(")"))(Doc.text("x"), Doc.text("y")),
+                    Doc.text("prefix: ").append(Doc.align(Doc.text("1").append(Doc.newline).append(Doc.text("2"))))
+                )
+
+                for
+                    d <- docs
+                    w <- Seq(5, 10, 80)
+                do
+                    val expected = Printer.compact.print(d, w)
+                    val streamed = Printer.compact.printStream(d, w).run.eval.mkString
+                    assert(streamed == expected)
+                end for
+            }
+        }
+    }
+
 end PrinterTest
