@@ -229,4 +229,270 @@ class DocTest extends kyo.test.Test[Any]:
         assert(describe(Doc.Choice(a, b)) == "choice(text(a), text(b))")
     }
 
+    "separate" - {
+        "empty collection" in {
+            assert(Doc.separate(Doc.text(","))() == Doc.empty)
+            assert(Doc.separate(Doc.text(","))(Chunk.empty[Doc]) == Doc.empty)
+        }
+
+        "single element" in {
+            assert(Doc.separate(Doc.text(","))(a) == a)
+            assert(Doc.separate(Doc.text(","))(Chunk(a)) == a)
+        }
+
+        "multiple elements" in {
+            val comma    = Doc.text(",")
+            val expected = a.append(comma).append(b).append(comma).append(c)
+            assert(Doc.separate(comma)(a, b, c) == expected)
+            assert(Doc.separate(comma)(Chunk(a, b, c)) == expected)
+        }
+    }
+
+    "join" - {
+        "empty collection" in {
+            val left  = Doc.text("[")
+            val right = Doc.text("]")
+            assert(Doc.join(left, Doc.text(","), right)() == left.append(right))
+            assert(Doc.join(left, Doc.text(","), right)(Chunk.empty[Doc]) == left.append(right))
+        }
+
+        "single element" in {
+            val left  = Doc.text("[")
+            val right = Doc.text("]")
+            assert(Doc.join(left, Doc.text(","), right)(a) == left.append(a).append(right))
+            assert(Doc.join(left, Doc.text(","), right)(Chunk(a)) == left.append(a).append(right))
+        }
+
+        "multiple elements" in {
+            val left     = Doc.text("[")
+            val comma    = Doc.text(",")
+            val right    = Doc.text("]")
+            val expected = left.append(a.append(comma).append(b).append(comma).append(c)).append(right)
+            assert(Doc.join(left, comma, right)(a, b, c) == expected)
+            assert(Doc.join(left, comma, right)(Chunk(a, b, c)) == expected)
+        }
+    }
+
+    "stack and lines" - {
+        "empty collection" in {
+            assert(Doc.stack() == Doc.empty)
+            assert(Doc.stack(Chunk.empty[Doc]) == Doc.empty)
+            assert(Doc.lines() == Doc.empty)
+            assert(Doc.lines(Chunk.empty[Doc]) == Doc.empty)
+        }
+
+        "single element" in {
+            assert(Doc.stack(a) == a)
+            assert(Doc.stack(Chunk(a)) == a)
+            assert(Doc.lines(a) == a)
+            assert(Doc.lines(Chunk(a)) == a)
+        }
+
+        "multiple elements" in {
+            val expected = a.append(Doc.newline).append(b).append(Doc.newline).append(c)
+            assert(Doc.stack(a, b, c) == expected)
+            assert(Doc.stack(Chunk(a, b, c)) == expected)
+            assert(Doc.lines(a, b, c) == expected)
+            assert(Doc.lines(Chunk(a, b, c)) == expected)
+        }
+    }
+
+    "space and spaced" - {
+        "empty collection" in {
+            assert(Doc.space(Chunk.empty[Doc]) == Doc.empty)
+            assert(Doc.spaced() == Doc.empty)
+            assert(Doc.spaced(Chunk.empty[Doc]) == Doc.empty)
+        }
+
+        "single element" in {
+            assert(Doc.space(a) == a)
+            assert(Doc.space(Chunk(a)) == a)
+            assert(Doc.spaced(a) == a)
+            assert(Doc.spaced(Chunk(a)) == a)
+        }
+
+        "multiple elements" in {
+            val expected = a.append(Doc.space).append(b).append(Doc.space).append(c)
+            assert(Doc.space(a, b, c) == expected)
+            assert(Doc.space(Chunk(a, b, c)) == expected)
+            assert(Doc.spaced(a, b, c) == expected)
+            assert(Doc.spaced(Chunk(a, b, c)) == expected)
+        }
+    }
+
+    "between and enclose" - {
+        val left  = Doc.text("<")
+        val right = Doc.text(">")
+
+        "between" in {
+            assert(Doc.between(left, a, right) == left.append(a).append(right))
+        }
+
+        "enclose" in {
+            assert(Doc.enclose(left, right)(a) == left.append(a).append(right))
+        }
+    }
+
+    "chop" - {
+        val open  = Doc.text("(")
+        val close = Doc.text(")")
+        val sep   = Doc.text(",")
+
+        "empty collection" in {
+            assert(Doc.chop(open, sep, close)() == open.append(close))
+            assert(Doc.chop(open, sep, close)(Chunk.empty[Doc]) == open.append(close))
+        }
+
+        "single element" in {
+            val broken   = open.append(Doc.newline).append(a.indent(4)).append(Doc.newline).append(close)
+            val flat     = open.append(a).append(close)
+            val expected = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chop(open, sep, close)(a) == expected)
+            assert(Doc.chop(open, sep, close)(Chunk(a)) == expected)
+        }
+
+        "multiple elements" in {
+            val brokenSep   = sep.append(Doc.newline)
+            val flatSep     = sep.append(Doc.space)
+            val brokenInner = a.append(brokenSep).append(b).indent(4)
+            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
+            val flatInner   = a.append(flatSep).append(b)
+            val flat        = open.append(flatInner).append(close)
+            val expected    = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chop(open, sep, close)(a, b) == expected)
+            assert(Doc.chop(open, sep, close)(Chunk(a, b)) == expected)
+        }
+
+        "custom indent" in {
+            val brokenSep   = sep.append(Doc.newline)
+            val brokenInner = a.append(brokenSep).append(b).indent(2)
+            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
+            val flat        = open.append(a.append(sep.append(Doc.space)).append(b)).append(close)
+            val expected    = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chop(open, sep, close, indent = 2)(a, b) == expected)
+        }
+
+        "choice separator preserves zero-trailing-whitespace invariant" in {
+            val commaSep    = Doc.choice(broken = Doc.text(",").append(Doc.newline), flat = Doc.text(", "))
+            val brokenInner = a.append(Doc.text(",").append(Doc.newline)).append(b).indent(4)
+            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
+            val flatInner   = a.append(Doc.text(", ")).append(b)
+            val flat        = open.append(flatInner).append(close)
+            val expected    = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chop(open, commaSep, close)(a, b) == expected)
+        }
+    }
+
+    "chopClosed" - {
+        val open  = Doc.text("(")
+        val close = Doc.text(")")
+        val sep   = Doc.text(",")
+
+        "empty collection" in {
+            assert(Doc.chopClosed(open, sep, close)() == open.append(close))
+            assert(Doc.chopClosed(open, sep, close)(Chunk.empty[Doc]) == open.append(close))
+        }
+
+        "single element" in {
+            val broken   = open.append(Doc.newline).append(a.indent(4)).append(close)
+            val flat     = open.append(a).append(close)
+            val expected = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chopClosed(open, sep, close)(a) == expected)
+            assert(Doc.chopClosed(open, sep, close)(Chunk(a)) == expected)
+        }
+
+        "multiple elements" in {
+            val brokenSep   = sep.append(Doc.newline)
+            val flatSep     = sep.append(Doc.space)
+            val brokenInner = a.append(brokenSep).append(b).indent(4)
+            val broken      = open.append(Doc.newline).append(brokenInner).append(close)
+            val flatInner   = a.append(flatSep).append(b)
+            val flat        = open.append(flatInner).append(close)
+            val expected    = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.chopClosed(open, sep, close)(a, b) == expected)
+            assert(Doc.chopClosed(open, sep, close)(Chunk(a, b)) == expected)
+        }
+    }
+
+    "hang" - {
+        val open  = Doc.text("(")
+        val close = Doc.text(")")
+        val sep   = Doc.text(",")
+
+        "empty collection" in {
+            assert(Doc.hang(open, sep, close)() == open.append(close))
+            assert(Doc.hang(open, sep, close)(Chunk.empty[Doc]) == open.append(close))
+        }
+
+        "single element" in {
+            assert(Doc.hang(open, sep, close)(a) == open.append(a).append(close))
+            assert(Doc.hang(open, sep, close)(Chunk(a)) == open.append(a).append(close))
+        }
+
+        "multiple elements" in {
+            val brokenSep = sep.append(Doc.newline)
+            val flatSep   = sep.append(Doc.space)
+            val broken    = open.append(Doc.align(a.append(brokenSep).append(b).append(close)))
+            val flat      = open.append(a.append(flatSep).append(b)).append(close)
+            val expected  = Doc.group(Doc.choice(broken, flat))
+            assert(Doc.hang(open, sep, close)(a, b) == expected)
+            assert(Doc.hang(open, sep, close)(Chunk(a, b)) == expected)
+        }
+    }
+
+    "wrap" - {
+        val open  = Doc.text("(")
+        val close = Doc.text(")")
+        val sep   = Doc.text(",")
+
+        "empty collection" in {
+            assert(Doc.wrap(open, sep, close)() == open.append(close))
+            assert(Doc.wrap(open, sep, close)(Chunk.empty[Doc]) == open.append(close))
+        }
+
+        "single element" in {
+            assert(Doc.wrap(open, sep, close)(a) == open.append(a).append(close))
+            assert(Doc.wrap(open, sep, close)(Chunk(a)) == open.append(a).append(close))
+        }
+
+        "multiple elements" in {
+            val softSep  = Doc.group(Doc.choice(sep.append(Doc.newline), sep.append(Doc.space)))
+            val body     = Doc.align(a.append(softSep).append(b))
+            val expected = open.append(body).append(close)
+            assert(Doc.wrap(open, sep, close)(a, b) == expected)
+            assert(Doc.wrap(open, sep, close)(Chunk(a, b)) == expected)
+        }
+    }
+
+    "Chunk[Doc] extensions" - {
+        val chunk = Chunk(a, b)
+        val sep   = Doc.text(",")
+        val open  = Doc.text("(")
+        val close = Doc.text(")")
+
+        "separate" in {
+            assert(chunk.separate(sep) == Doc.separate(sep)(chunk))
+        }
+
+        "join" in {
+            assert(chunk.join(open, sep, close) == Doc.join(open, sep, close)(chunk))
+        }
+
+        "chop" in {
+            assert(chunk.chop(open, sep, close) == Doc.chop(open, sep, close)(chunk))
+        }
+
+        "chopClosed" in {
+            assert(chunk.chopClosed(open, sep, close) == Doc.chopClosed(open, sep, close)(chunk))
+        }
+
+        "hang" in {
+            assert(chunk.hang(open, sep, close) == Doc.hang(open, sep, close)(chunk))
+        }
+
+        "wrap" in {
+            assert(chunk.wrap(open, sep, close) == Doc.wrap(open, sep, close)(chunk))
+        }
+    }
+
 end DocTest
