@@ -1,0 +1,14 @@
+{
+  "reflection": [
+    { "type": "kyo.example.MetaImpl", "methods": [ { "name": "<init>", "parameterTypes": [] } ] }
+  ],
+  "foreign": {
+    "downcalls": [
+      { "returnType": "void", "parameterTypes": ["void*", "jint"], "options": { "captureCallState": true } },
+      { "returnType": "jint", "parameterTypes": ["void*"], "options": { "captureCallState": true, "critical": { "allowHeapAccess": true } } }
+    ],
+    "upcalls": [
+      { "returnType": "void", "parameterTypes": ["jint"] }
+    ]
+  }
+}
