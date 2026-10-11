@@ -1,5 +1,7 @@
 package kyo.ffi.codegen.emitters
 
+import kyo.Doc
+import kyo.Printer
 import kyo.ffi.codegen.model.*
 
 /** Emits the JVM (Panama) implementation source for a single binding trait.
@@ -17,33 +19,50 @@ import kyo.ffi.codegen.model.*
   *
   * Callback emission handles both transient and retained callbacks. Transient callbacks allocate a per-call `Arena.ofConfined()` that is
   * closed in the finally block after scratch reset. Retained callbacks use the guard's shared arena so the stub lives until guard.close().
+  *
+  * Emission builds a `Doc` layout tree (only intentional, hard line breaks) rendered once by [[emit]]; nested regions are indented with
+  * `Doc.indent` instead of re-processing emitted strings.
   */
 object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
 
+    /** Structured FFM function descriptor: the raw C signature as Panama layout names.
+      *
+      * Rendered as a `FunctionDescriptor` expression by [[render]] for the generated impl, and consumed structurally by
+      * `ReachabilityMetadataEmitter` for the native-image manifest so the manifest never re-parses emitted source.
+      */
+    final private[codegen] case class FunctionDescriptorExpr(returnLayout: Option[String], paramLayouts: List[String]):
+        def render: String = returnLayout match
+            case Some(r) if paramLayouts.isEmpty => s"FunctionDescriptor.of($r)"
+            case Some(r)                         => s"FunctionDescriptor.of($r, ${paramLayouts.mkString(", ")})"
+            case None                            => s"FunctionDescriptor.ofVoid(${paramLayouts.mkString(", ")})"
+    end FunctionDescriptorExpr
+
     /** Emit the full contents of `{spec.simpleName}Impl.scala`. */
     def emit(spec: TraitSpec): String =
-        val sb = new StringBuilder
-        sb ++= emitHeader(spec)
-        sb ++= "\n"
-        sb ++= emitImplClass(spec)
-        sb ++= "\n"
-        sb ++= emitImplCompanion(spec)
-        sb.toString
+        val doc =
+            emitHeader(spec)
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(emitImplClass(spec))
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(emitImplCompanion(spec))
+                .append(Doc.hardNewline)
+        Printer.greedy.print(doc, EmitterBase.RenderWidth)
     end emit
 
     // -------------------------------------------------------------------------
     // Header
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitHeader(spec: TraitSpec): String =
+    private[codegen] def emitHeader(spec: TraitSpec): Doc =
         emitHeader(
             spec,
-            """import java.lang.foreign.*
-              |import java.lang.foreign.ValueLayout.*
-              |import java.lang.invoke.MethodHandle
-              |import kyo.ffi.*
-              |import kyo.ffi.internal.{AbiCheck, NativeLoader, Scratch, Layouts, StructAbiCheck, UpcallBridge}
-              |""".stripMargin
+            List(
+                "import java.lang.foreign.*",
+                "import java.lang.foreign.ValueLayout.*",
+                "import java.lang.invoke.MethodHandle",
+                "import kyo.ffi.*",
+                "import kyo.ffi.internal.{AbiCheck, NativeLoader, Scratch, Layouts, StructAbiCheck, UpcallBridge}"
+            )
         )
     end emitHeader
 
@@ -51,25 +70,23 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
     // Impl class
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplClass(spec: TraitSpec): String =
-        val sb = new StringBuilder
-        sb ++= s"final class ${spec.simpleName}Impl extends ${spec.simpleName}:\n"
-        sb ++= s"    import ${spec.simpleName}Impl.*\n"
-        sb ++= companionInitLine(spec.simpleName)
-        spec.methods.foreach { m =>
-            sb ++= "\n"
-            sb ++= emitMethod(m, spec)
-        }
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+    private[codegen] def emitImplClass(spec: TraitSpec): Doc =
+        val head = hardLines(List(
+            text(s"final class ${spec.simpleName}Impl extends ${spec.simpleName}:"),
+            text(s"    import ${spec.simpleName}Impl.*"),
+            text(companionInitLine(spec.simpleName))
+        ))
+        spec.methods.foldLeft(head) { (acc, m) =>
+            acc.append(Doc.hardNewline).append(Doc.hardNewline).append(emitMethod(m, spec))
+        }.append(Doc.hardNewline).append(text(s"end ${spec.simpleName}Impl"))
     end emitImplClass
 
-    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): Doc =
         // Variadic bindings append a trailing `args: Any*` to the Scala-level signature.
         val sig = methodSignature(method, includeVarargs = true)
-        // Indent body 8 spaces (method body sits two indentation levels deep inside the class).
-        val body = indentBody(emitMethodBody(method, spec))
-        sig + "\n" + body + "\n"
+        // Method body sits two indentation levels deep inside the class (8 spaces).
+        val body = Doc.indent(8, emitMethodBody(method, spec))
+        sig.append(Doc.hardNewline).append(body)
     end emitMethod
 
     /** Emit the body (including the `val __kyoScratch = Scratch.current` / try-finally wrapping when needed).
@@ -79,7 +96,7 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
       * `methodSignature`). The blocking downcall itself stays synchronous on the carrier thread; the `Linker.Option`
       * matrix and array marshalling are unchanged.
       */
-    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         val sync =
             if method.hasVarargs then emitVariadicMethodBody(method, spec)
             else emitPlainMethodBody(method, spec)
@@ -91,7 +108,7 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
       * Transient callbacks allocate a per-call `Arena.ofConfined()` closed in the finally block after scratch reset; retained callbacks
       * read the arena from the user-supplied `Ffi.Guard` via `JvmGuard.unsafeArena` so the stub lifetime is owned by the guard.
       */
-    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         val structsByName = EmitterBase.structsByName(spec)
         // Binding/method context threaded into every spill-capable alloc site so `FfiErrors.scratchSpilled` names the
         // call origin in the default-off `-Dkyo.ffi.scratch.logSpills=true` diagnostic.
@@ -297,7 +314,7 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
 
         // Compose invokeExact argument list: errnoSeg first, then struct-return out (if Struct), then marshalled args, then multi-value outs.
         val returnOutForStruct: Option[String] = method.returnShape match
-            case ReturnShape.Struct(sSpec) => Some(s"out")
+            case ReturnShape.Struct(sSpec) => Some("out")
             case _                         => None
 
         val invokeArgs = (List("errnoSeg") ++ returnOutForStruct.toList ++ marshalled.map(_.passExpr) ++ outSegs.map(_.name))
@@ -338,17 +355,12 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
                     // a Scala String (readCStringBounded, copies) or wrap as a borrowed Buffer.
                     s"val $retValName: MemorySegment = $mhName.invokeExact($invokeArgs)"
 
-        // Build the body.
-        val sb = new StringBuilder
-
         // All methods need scratch because at minimum we allocate the errnoSeg. Per-binding scratch size override via
         // `Ffi.Config.scratchSize`: when set, the emitted code acquires a binding-specific per-thread `Scratch` sized to the override,        // a binding that routinely needs more than the global default block does not spill every call, and a small binding does not
         // carry the cost of a large block it never fills. When unset, the emitted code uses `Scratch.configuredSize`.
         val scratchSizeExpr = spec.companion.flatMap(_.scratchSize) match
             case Some(n) => s"${n}L"
             case None    => "Scratch.configuredSize"
-        sb ++= s"val __kyoScratch = Scratch.currentFor($fqnLit, $scratchSizeExpr)\n"
-        sb ++= "val __kyoMark = __kyoScratch.mark()\n"
 
         // Callback arena. Transient callbacks allocate a per-call `Arena.ofConfined()` closed in finally after scratch reset.
         // Retained callbacks read the arena from the user-supplied Ffi.Guard via JvmGuard.unsafeArena; the guard, not
@@ -364,50 +376,49 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
                 case _ => false
         }
         val needsCbArena = method.callbackKind != CallbackKind.None || hasStructFnPtrField
-        method.callbackKind match
+
+        val cbArenaLines: List[String] = method.callbackKind match
             case CallbackKind.Transient =>
-                sb ++= "val cbArena = Arena.ofConfined().nn\n"
+                List("val cbArena = Arena.ofConfined().nn")
             case CallbackKind.Retained =>
                 val guardParam = method.params.find(_.tpe == TypeRef.GuardT).getOrElse(
                     throw new IllegalStateException(
                         s"Retained callback method '${method.scalaName}' is missing an Ffi.Guard parameter"
                     )
                 )
-                sb ++= s"val cbArena = ${safeName(guardParam.name)}.asInstanceOf[kyo.ffi.internal.JvmGuard].unsafeArena\n"
+                List(s"val cbArena = ${safeName(guardParam.name)}.asInstanceOf[kyo.ffi.internal.JvmGuard].unsafeArena")
             case CallbackKind.None if hasStructFnPtrField =>
-                sb ++= "val cbArena = Arena.ofConfined().nn\n"
-            case CallbackKind.None => ()
-        end match
+                List("val cbArena = Arena.ofConfined().nn")
+            case CallbackKind.None => Nil
+        end cbArenaLines
 
-        sb ++= "try\n"
-
-        val bodyInner = new StringBuilder
+        // The try-block interior: marshal setup lines, out allocations, the invocation, errno capture, and result.
+        val inner = List.newBuilder[Doc]
 
         // Marshal setup lines.
         marshalled.flatMap(_.setup).foreach { line =>
-            bodyInner ++= line
-            bodyInner ++= "\n"
+            inner += text(line)
         }
 
         // Struct out-segment (for ReturnShape.Struct).
         method.returnShape match
             case ReturnShape.Struct(sSpec) =>
-                bodyInner ++=
-                    s"val out = __kyoScratch.alloc(${layoutConst(sSpec)}.byteSize(), ${layoutConst(sSpec)}.byteAlignment(), $fqnLit, $methodLit)\n"
+                inner += text(
+                    s"val out = __kyoScratch.alloc(${layoutConst(sSpec)}.byteSize(), ${layoutConst(sSpec)}.byteAlignment(), $fqnLit, $methodLit)"
+                )
             case _ => ()
         end match
 
         // Multi-value out-segments, coalesced into a single scratch allocation.
         //
         // Allocate one block sized to the sum of per-field bytes with natural-alignment padding, and expose
-        // each out-param as a zero-copy `asSlice(offset, size)` view into that block. Panama's `asSlice` does
-        // not allocate native memory, it returns a wrapper bounded to the requested range, so the semantics
+        // each out-param as a zero-copy `asSlice(offset, size)` view into that block. Panama's `asSlice` does not
+        // allocate native memory, it returns a wrapper bounded to the requested range, so the semantics
         // of the downstream `seg.get(JAVA_*, 0L)` / `seg.get(ADDRESS, 0L)` reads are unchanged.
         if outSegs.nonEmpty then
-            bodyInner ++=
-                s"val __kyoMultiOut = __kyoScratch.alloc(${outBlockSize}L, ${outBlockAlign}L, $fqnLit, $methodLit)\n"
+            inner += text(s"val __kyoMultiOut = __kyoScratch.alloc(${outBlockSize}L, ${outBlockAlign}L, $fqnLit, $methodLit)")
             outSegs.foreach { o =>
-                bodyInner ++= s"val ${o.name} = __kyoMultiOut.asSlice(${o.offsetBytes}L, ${o.sizeBytes}L)\n"
+                inner += text(s"val ${o.name} = __kyoMultiOut.asSlice(${o.offsetBytes}L, ${o.sizeBytes}L)")
             }
         end if
 
@@ -416,16 +427,15 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         // running platform supports regardless of which fields were requested: 4 bytes on Linux/macOS ([errno]) but 12 bytes on
         // Windows ([GetLastError, WSAGetLastError, errno]). A hardcoded 4-byte segment overflows the 12-byte Windows capture write,
         // so the size and alignment come from the layout (companion `captureLayout`), correct on every platform.
-        bodyInner ++= s"val errnoSeg = __kyoScratch.alloc(captureLayout.byteSize(), captureLayout.byteAlignment(), $fqnLit, $methodLit)\n"
+        inner += text(s"val errnoSeg = __kyoScratch.alloc(captureLayout.byteSize(), captureLayout.byteAlignment(), $fqnLit, $methodLit)")
 
         // The invocation.
-        bodyInner ++= invokeLine
-        bodyInner ++= "\n"
+        inner += text(invokeLine)
         // Capture errno from the segment if this method returns an Outcome. errno is read at its real field offset
         // within the capture struct (companion `errnoOffset`): 0 on Linux/macOS, but 8 on Windows where errno is the
         // third field; reading offset 0 on Windows would read GetLastError instead.
         if method.withError then
-            bodyInner ++= "val __errno = errnoSeg.get(JAVA_INT, errnoOffset)\n"
+            inner += text("val __errno = errnoSeg.get(JAVA_INT, errnoOffset)")
 
         // When the method carries a retained callback parameter AND argument marshalling spilled to fresh confined arenas
         // (oversized Buffer[Byte], string, or struct-by-value param), the spill arenas must outlive the method, the C-side retained
@@ -444,13 +454,13 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
                         s"Retained callback method '${method.scalaName}' is missing an Ffi.Guard parameter"
                     )
                 )
-                bodyInner ++= "val __kyoSpills = __kyoScratch.takeSpills()\n"
-                bodyInner ++= "if __kyoSpills.nonEmpty then\n"
-                bodyInner ++= s"    val __kyoGuard = $guardName.asInstanceOf[kyo.ffi.internal.JvmGuard]\n"
-                bodyInner ++= "    var __kyoSpillsI = __kyoSpills\n"
-                bodyInner ++= "    while __kyoSpillsI.nonEmpty do\n"
-                bodyInner ++= "        __kyoGuard.adoptArena(__kyoSpillsI.head)\n"
-                bodyInner ++= "        __kyoSpillsI = __kyoSpillsI.tail\n"
+                inner += text("val __kyoSpills = __kyoScratch.takeSpills()")
+                inner += text("if __kyoSpills.nonEmpty then")
+                inner += text(s"    val __kyoGuard = $guardName.asInstanceOf[kyo.ffi.internal.JvmGuard]")
+                inner += text("    var __kyoSpillsI = __kyoSpills")
+                inner += text("    while __kyoSpillsI.nonEmpty do")
+                inner += text("        __kyoGuard.adoptArena(__kyoSpillsI.head)")
+                inner += text("        __kyoSpillsI = __kyoSpillsI.tail")
             case _ => ()
         end match
 
@@ -514,28 +524,29 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
 
         // Emit errno handling + result. Outcome packs value-or-(-errno) into one Long; plain returns just emit the result.
         if method.withError then
-            bodyInner ++= s"val __kyoResult = $resultExpr\n"
-            bodyInner ++= "Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)\n"
+            inner += text(s"val __kyoResult = $resultExpr")
+            inner += text("Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)")
         else
-            bodyInner ++= resultExpr + "\n"
+            inner += text(resultExpr)
         end if
 
-        bodyInner.toString.linesIterator.foreach { line =>
-            sb ++= "    "
-            sb ++= line
-            sb ++= "\n"
-        }
+        val body = List.newBuilder[Doc]
+        body += text(s"val __kyoScratch = Scratch.currentFor($fqnLit, $scratchSizeExpr)")
+        body += text("val __kyoMark = __kyoScratch.mark()")
+        cbArenaLines.foreach(l => body += text(l))
+        body += text("try")
+        body += Doc.indent(4, hardLines(inner.result()))
 
         // Transient callbacks (including struct-field FnPtrT) close the per-call cbArena in finally.
         // Retained callbacks leave the arena alone, the guard will close it. All paths reset scratch in finally.
         if needsCbArena && method.callbackKind != CallbackKind.Retained then
-            sb ++= "finally\n"
-            sb ++= "    __kyoScratch.reset(__kyoMark)\n"
-            sb ++= "    cbArena.close()\n"
+            body += text("finally")
+            body += text("    __kyoScratch.reset(__kyoMark)")
+            body += text("    cbArena.close()")
         else
-            sb ++= "finally __kyoScratch.reset(__kyoMark)\n"
+            body += text("finally __kyoScratch.reset(__kyoMark)")
         end if
-        sb.toString
+        hardLines(body.result())
     end emitPlainMethodBody
 
     /** Emit the body for a variadic method.
@@ -551,7 +562,7 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
       * `printf`-like binding typically needs. Reject at emit-time if the fixed-arg set contains anything other than primitives / String /
       * Buffer.
       */
-    private def emitVariadicMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private def emitVariadicMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         // Validate fixed-arg shape upfront, varargs methods are intended for `printf`-style bindings whose fixed arg list is primitive
         // + String. Anything else would require per-platform marshalling that is out of scope for the F8b v1 cut.
         method.params.foreach { p =>
@@ -620,20 +631,6 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
             case Some(n) => s"${n}L"
             case None    => "Scratch.configuredSize"
 
-        val sb = new StringBuilder
-        sb ++= s"val __kyoScratch = Scratch.currentFor($fqnLit, $scratchSizeExpr)\n"
-        sb ++= "val __kyoMark = __kyoScratch.mark()\n"
-        sb ++= "try\n"
-
-        val inner = new StringBuilder
-        fixed.flatMap(_.setup).foreach { l =>
-            inner ++= l
-            inner ++= "\n"
-        }
-        // Capture-state segment sized from the platform's captureStateLayout() (see emitPlainMethodBody): 4 bytes on
-        // Linux/macOS ([errno]), 12 on Windows ([GetLastError, WSAGetLastError, errno]).
-        inner ++= s"val errnoSeg = __kyoScratch.alloc(captureLayout.byteSize(), captureLayout.byteAlignment(), $fqnLit, $methodLit)\n"
-
         val fixedLayouts =
             if fixed.isEmpty then "Nil"
             else fixed.map(f => s"${f.layout}: java.lang.foreign.MemoryLayout").mkString("List(", ", ", ")")
@@ -642,38 +639,54 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
             if fixed.isEmpty then "Nil"
             else fixed.map(f => s"${f.pass}: Any").mkString("List(", ", ", ")")
 
-        val invokeCall =
-            s"""kyo.ffi.internal.VariadicMarshaller.invoke(
-               |    lib,
-               |    "${method.cSymbol}",
-               |    errnoSeg,
-               |    $retLayoutExpr,
-               |    $fixedLayouts,
-               |    $fixedArgsList,
-               |    Linker.Option.firstVariadicArg(${fixed.size}),
-               |    args,
-               |    __kyoScratch,
-               |    "${spec.fqcn}",
-               |    "${method.scalaName}"
-               |)""".stripMargin
+        val invokeDoc =
+            text("kyo.ffi.internal.VariadicMarshaller.invoke(")
+                .append(Doc.hardNewline)
+                .append(Doc.indent(
+                    4,
+                    hardTextLines(List(
+                        "lib,",
+                        s""""${method.cSymbol}",""",
+                        "errnoSeg,",
+                        s"$retLayoutExpr,",
+                        s"$fixedLayouts,",
+                        s"$fixedArgsList,",
+                        s"Linker.Option.firstVariadicArg(${fixed.size}),",
+                        "args,",
+                        "__kyoScratch,",
+                        s""""${spec.fqcn}",""",
+                        s""""${method.scalaName}""""
+                    ))
+                ))
+                .append(Doc.hardNewline)
+                .append(text(")"))
+
+        // The try-block interior: fixed-arg setup, the errno segment, the invoke, and the return-value unwrap.
+        val inner = List.newBuilder[Doc]
+        fixed.flatMap(_.setup).foreach(l => inner += text(l))
+        // Capture-state segment sized from the platform's captureStateLayout() (see emitPlainMethodBody): 4 bytes on
+        // Linux/macOS ([errno]), 12 on Windows ([GetLastError, WSAGetLastError, errno]).
+        inner += text(s"val errnoSeg = __kyoScratch.alloc(captureLayout.byteSize(), captureLayout.byteAlignment(), $fqnLit, $methodLit)")
 
         method.returnShape match
             case ReturnShape.Void =>
-                inner ++= s"val _ = $invokeCall\n"
+                inner += text("val _ = ").append(invokeDoc)
                 if method.withError then
-                    inner ++= "val __errno = errnoSeg.get(JAVA_INT, errnoOffset)\n"
-                    inner ++= "Ffi.Outcome.fromValueErrno(0L, __errno)\n"
+                    inner += text("val __errno = errnoSeg.get(JAVA_INT, errnoOffset)")
+                    inner += text("Ffi.Outcome.fromValueErrno(0L, __errno)")
                 else
-                    inner ++= "()\n"
+                    inner += text("()")
                 end if
             case ReturnShape.Primitive(TypeRef.BooleanT) =>
-                inner ++= s"val retVal = $invokeCall\n"
+                inner += text("val retVal = ").append(invokeDoc)
                 if method.withError then
-                    inner ++= "val __errno = errnoSeg.get(JAVA_INT, errnoOffset)\n"
-                    inner ++=
-                        "Ffi.Outcome.fromValueErrno(if retVal.asInstanceOf[java.lang.Integer].intValue() != 0 then 1L else 0L, __errno)\n"
+                    inner += text("val __errno = errnoSeg.get(JAVA_INT, errnoOffset)")
+                    inner +=
+                        text(
+                            "Ffi.Outcome.fromValueErrno(if retVal.asInstanceOf[java.lang.Integer].intValue() != 0 then 1L else 0L, __errno)"
+                        )
                 else
-                    inner ++= s"retVal.asInstanceOf[java.lang.Integer].intValue() != 0\n"
+                    inner += text("retVal.asInstanceOf[java.lang.Integer].intValue() != 0")
                 end if
             case ReturnShape.Primitive(t) =>
                 val boxed = boxedName(t)
@@ -684,25 +697,25 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
                     case "Long"   => "longValue()"
                     case "Float"  => "floatValue()"
                     case "Double" => "doubleValue()"
-                inner ++= s"val retVal = $invokeCall\n"
+                inner += text("val retVal = ").append(invokeDoc)
                 if method.withError then
-                    inner ++= "val __errno = errnoSeg.get(JAVA_INT, errnoOffset)\n"
-                    inner ++= s"Ffi.Outcome.fromValueErrno(retVal.asInstanceOf[$boxed].$prim.toLong, __errno)\n"
+                    inner += text("val __errno = errnoSeg.get(JAVA_INT, errnoOffset)")
+                    inner += text(s"Ffi.Outcome.fromValueErrno(retVal.asInstanceOf[$boxed].$prim.toLong, __errno)")
                 else
-                    inner ++= s"retVal.asInstanceOf[$boxed].$prim\n"
+                    inner += text(s"retVal.asInstanceOf[$boxed].$prim")
                 end if
             case _ =>
                 // Already rejected above, unreachable.
                 throw new IllegalStateException("unreachable variadic return shape")
         end match
 
-        inner.toString.linesIterator.foreach { l =>
-            sb ++= "    "
-            sb ++= l
-            sb ++= "\n"
-        }
-        sb ++= "finally __kyoScratch.reset(__kyoMark)\n"
-        sb.toString
+        val body = List.newBuilder[Doc]
+        body += text(s"val __kyoScratch = Scratch.currentFor($fqnLit, $scratchSizeExpr)")
+        body += text("val __kyoMark = __kyoScratch.mark()")
+        body += text("try")
+        body += Doc.indent(4, hardLines(inner.result()))
+        body += text("finally __kyoScratch.reset(__kyoMark)")
+        hardLines(body.result())
     end emitVariadicMethodBody
 
     private def boxedName(t: TypeRef): String = t match
@@ -823,7 +836,7 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
                     val stubN  = s"${localIdent(access)}_stub"
                     val descId = s"${localIdent(access)}_desc"
                     val arity  = params.size
-                    val desc   = callbackFunctionDescriptor(params, ret)
+                    val desc   = callbackDescriptor(params, ret).render
                     buf += s"val $descId = $desc"
                     buf += s"val $stubN = UpcallBridge.stub$arity($access, $descId, cbArena, " +
                         s""""$bindingFqn", "$methodName", "transient")"""
@@ -1055,39 +1068,42 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
     // Impl companion
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplCompanion(spec: TraitSpec): String =
-        val sb          = new StringBuilder
+    private[codegen] def emitImplCompanion(spec: TraitSpec): Doc =
         val needsCritOn = spec.methods.exists(m => !m.blocking && m.hasArrayParam)
-        sb ++= s"object ${spec.simpleName}Impl:\n"
-        sb ++= abiCheckLine(spec.fqcn)
-        sb ++= "\n"
-        sb ++= companionLoadedDef
-        sb ++= s"""    private val lib      = NativeLoader.load("${spec.library}")\n"""
-        sb ++= "    private val linker   = Linker.nativeLinker()\n"
-        sb ++= """    private val capture  = Linker.Option.captureCallState("errno")""" + "\n"
+
+        val head = List.newBuilder[Doc]
+        head += text(s"object ${spec.simpleName}Impl:")
+        head += text(abiCheckLine(spec.fqcn))
+        head += text(companionLoadedDef)
+        head += text(s"""    private val lib      = NativeLoader.load("${spec.library}")""")
+        head += text("    private val linker   = Linker.nativeLinker()")
+        head += text("""    private val capture  = Linker.Option.captureCallState("errno")""")
         // The captured downcall's leading state segment must be sized to `captureStateLayout()`, the full canonical
         // capture struct the running platform supports: 4 bytes on Linux/macOS ([errno]) but 12 on Windows
         // ([GetLastError, WSAGetLastError, errno]). Derived once at class-init so every errnoSeg alloc is sized right.
-        sb ++= "    private val captureLayout = Linker.Option.captureStateLayout()\n"
+        head += text("    private val captureLayout = Linker.Option.captureStateLayout()")
         // errnoOffset is errno's byte offset within that struct (0 on Linux/macOS, 8 on Windows). Emitted only when a
         // method reads errno (withError); a captured downcall with no Outcome return never reads it.
         if spec.methods.exists(_.withError) then
-            sb ++=
-                """    private val errnoOffset = captureLayout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("errno"))""" +
-                    "\n"
+            head +=
+                text(
+                    """    private val errnoOffset = captureLayout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("errno"))"""
+                )
         end if
         if needsCritOn then
             // `Linker.Option.critical(...)` was added in JDK 22. Detect it reflectively at class-init time
             // so the emitted impl still class-loads under JDK 21 (capture-only downcall path).
-            sb ++= "    private val hasCriticalApi: Boolean =\n"
-            sb ++= "        try\n"
-            sb ++= "            val _ = classOf[Linker.Option].getMethod(\"critical\", classOf[Boolean])\n"
-            sb ++= "            true\n"
-            sb ++= "        catch case _: Throwable => false\n"
-            sb ++= "    private val critOn: Linker.Option | Null =\n"
-            sb ++= "        if hasCriticalApi then Linker.Option.critical(true) else null\n"
-            sb ++= "    private def mkOpts(opts: Linker.Option | Null*): Array[Linker.Option] =\n"
-            sb ++= "        opts.iterator.collect { case o: Linker.Option => o }.toArray\n"
+            head ++= List(
+                "    private val hasCriticalApi: Boolean =",
+                "        try",
+                """            val _ = classOf[Linker.Option].getMethod("critical", classOf[Boolean])""",
+                "            true",
+                "        catch case _: Throwable => false",
+                "    private val critOn: Linker.Option | Null =",
+                "        if hasCriticalApi then Linker.Option.critical(true) else null",
+                "    private def mkOpts(opts: Linker.Option | Null*): Array[Linker.Option] =",
+                "        opts.iterator.collect { case o: Linker.Option => o }.toArray"
+            ).map(text(_))
         end if
 
         // Emit struct layouts, only for structs that actually need a MemoryLayout at runtime
@@ -1100,8 +1116,9 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         val layoutNeeded  = layoutRequiredStructs(spec, structsByName)
         spec.structs.foreach { s =>
             if layoutNeeded.contains(s.fqcn) then
-                sb ++= "\n"
-                sb ++= s"    ${emitStructLayoutVal(s, spec)}\n"
+                head += text("")
+                head += text(s"    ${emitStructLayoutVal(s, spec)}")
+            end if
         }
 
         // Struct ABI self-check. For each struct whose MemoryLayout was emitted above, compare the code-generator's
@@ -1111,9 +1128,9 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         spec.structs.foreach { s =>
             if layoutNeeded.contains(s.fqcn) then
                 val expected = structByteSize(s, structsByName)
-                sb ++= s"""    StructAbiCheck.verifyByteSize("${spec.fqcn}", "${s.simpleName}", ${expected}L, ${layoutConst(
-                        s
-                    )}.byteSize())\n"""
+                head += text(
+                    s"""    StructAbiCheck.verifyByteSize("${spec.fqcn}", "${s.simpleName}", ${expected}L, ${layoutConst(s)}.byteSize())"""
+                )
         }
 
         // Emit MethodHandle bindings. Variadic methods do not use a cached MH, their
@@ -1121,12 +1138,12 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         // level handle emission for those methods.
         spec.methods.foreach { m =>
             if !m.hasVarargs then
-                sb ++= "\n"
-                sb ++= emitMethodHandle(m, spec)
+                head += text("")
+                head += emitMethodHandle(m, spec)
         }
 
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        head += text(s"end ${spec.simpleName}Impl")
+        hardLines(head.result())
     end emitImplCompanion
 
     private def emitStructLayoutVal(s: StructSpec, trait0: TraitSpec): String =
@@ -1206,28 +1223,25 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         s"MemoryLayout.unionLayout(${parts.mkString(", ")})"
     end unionLayoutExpr
 
-    private def emitMethodHandle(method: MethodSpec, spec: TraitSpec): String =
+    private def emitMethodHandle(method: MethodSpec, spec: TraitSpec): Doc =
         val structsByName = EmitterBase.structsByName(spec)
-        val descr         = emitFunctionDescriptor(method, structsByName)
+        val descr         = functionDescriptor(method, structsByName).render
         val opts          = emitLinkerOptions(method)
-        val indent        = "        "
 
         // Callback-bearing methods additionally emit one `FunctionDescriptor` val per callback parameter so generated bodies can pass
         // it to `UpcallBridge.stubN(...)`. Emitted BEFORE the MethodHandle val to keep declaration order user-readable.
-        val cbDescVals = method.callbackKind match
+        val cbDescVals: List[String] = method.callbackKind match
             case CallbackKind.Transient =>
                 method.params.collect { case ParamSpec(pname, TypeRef.FnPtrT(params, ret)) =>
                     val descName = callbackDescName(method.scalaName, pname)
-                    val fd       = callbackFunctionDescriptor(params, ret)
-                    s"    private val $descName: FunctionDescriptor = $fd\n"
-                }.mkString
+                    s"    private val $descName: FunctionDescriptor = ${callbackDescriptor(params, ret).render}"
+                }
             case CallbackKind.Retained =>
                 method.params.collect { case ParamSpec(pname, TypeRef.FnPtrT(params, ret)) =>
                     val name = callbackDescName(method.scalaName, pname)
-                    val fd   = callbackFunctionDescriptor(params, ret)
-                    s"    private val $name: FunctionDescriptor = $fd\n"
-                }.mkString
-            case CallbackKind.None => ""
+                    s"    private val $name: FunctionDescriptor = ${callbackDescriptor(params, ret).render}"
+                }
+            case CallbackKind.None => Nil
         end cbDescVals
 
         // When critOn may be in play (non-blocking + array params), splat the options through `mkOpts(...)` so the
@@ -1236,24 +1250,25 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
             if !method.blocking && method.hasArrayParam then s"mkOpts($opts)*"
             else opts
 
-        val mhLines =
-            s"""    private val ${method.scalaName}MH: MethodHandle = linker.downcallHandle(
-               |${indent}lib.find("${method.cSymbol}").orElseThrow(),
-               |${indent}$descr,
-               |${indent}$optsLine
-               |    )
-               |""".stripMargin
+        val mhLines = List(
+            s"    private val ${method.scalaName}MH: MethodHandle = linker.downcallHandle(",
+            s"""        lib.find("${method.cSymbol}").orElseThrow(),""",
+            s"        $descr,",
+            s"        $optsLine",
+            "    )"
+        )
 
-        cbDescVals + mhLines
+        hardTextLines(cbDescVals ++ mhLines)
     end emitMethodHandle
 
-    /** FunctionDescriptor for one callback parameter's C-level signature. */
-    private[codegen] def callbackFunctionDescriptor(params: List[TypeRef], ret: TypeRef): String =
-        val paramLayouts = params.map(callbackValueLayout).mkString(", ")
-        ret match
-            case TypeRef.UnitT => s"FunctionDescriptor.ofVoid($paramLayouts)"
-            case other => s"FunctionDescriptor.of(${callbackValueLayout(other)}${if params.isEmpty then "" else s", $paramLayouts"})"
-    end callbackFunctionDescriptor
+    /** Structured `FunctionDescriptor` for a callback parameter's C-level signature. */
+    private[codegen] def callbackDescriptor(params: List[TypeRef], ret: TypeRef): FunctionDescriptorExpr =
+        FunctionDescriptorExpr(
+            returnLayout = ret match
+                case TypeRef.UnitT => None
+                case other         => Some(callbackValueLayout(other)),
+            paramLayouts = params.map(callbackValueLayout)
+        )
 
     /** ValueLayout expression for a callback's primitive/pointer position. */
     private def callbackValueLayout(t: TypeRef): String = t match
@@ -1275,14 +1290,14 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
         val p = if paramName.isEmpty then "Cb" else paramName.head.toUpper.toString + paramName.tail
         s"cb${methodName.head.toUpper}${methodName.tail}${p}Desc"
 
-    /** Build the FunctionDescriptor expression for a method, honoring errno-capture's leading state segment.
+    /** Structured `FunctionDescriptor` for a method, honoring errno-capture's leading state segment.
       *
       * Under `captureCallState`, the leading capture segment is injected by Panama at `invokeExact` time, it is NOT part of
-      * `FunctionDescriptor`. So we emit the descriptor representing the raw C signature.
+      * `FunctionDescriptor`. So the descriptor represents the raw C signature.
       */
-    private[codegen] def emitFunctionDescriptor(method: MethodSpec, structsByName: Map[String, StructSpec]): String =
+    private[codegen] def functionDescriptor(method: MethodSpec, structsByName: Map[String, StructSpec]): FunctionDescriptorExpr =
         // Scala-level return type → descriptor return (for Void/Primitive/MultiValue the C return is the first-field primitive).
-        val returnPart: Option[String] = method.returnShape match
+        val returnLayout: Option[String] = method.returnShape match
             case ReturnShape.Void                                                 => None
             case ReturnShape.Primitive(t)                                         => Some(valueLayoutOf(t))
             case ReturnShape.MultiValue(sSpec)                                    => Some(valueLayoutOf(sSpec.fields.head.tpe))
@@ -1310,16 +1325,8 @@ object JvmEmitter extends EmitterBase.Ops with PlatformTypes:
             case _ => ()
         end match
 
-        val ps = paramParts.result().mkString(", ")
-        returnPart match
-            // Zero-arg primitive-return methods (e.g. `getpid(): Int`) must not
-            // emit a trailing comma, `FunctionDescriptor.of(JAVA_INT, )` is a syntax
-            // error. Drop the comma when there are no parameters.
-            case Some(r) if ps.isEmpty => s"FunctionDescriptor.of($r)"
-            case Some(r)               => s"FunctionDescriptor.of($r, $ps)"
-            case None                  => s"FunctionDescriptor.ofVoid($ps)"
-        end match
-    end emitFunctionDescriptor
+        FunctionDescriptorExpr(returnLayout, paramParts.result())
+    end functionDescriptor
 
     private def paramLayout(t: TypeRef, structsByName: Map[String, StructSpec]): String =
         t match

@@ -1,5 +1,7 @@
 package kyo.ffi.codegen.emitters
 
+import kyo.Doc
+import kyo.Printer
 import kyo.ffi.codegen.model.*
 
 /** Emits the Scala Native (`@extern`) implementation source for a single binding trait.
@@ -13,6 +15,9 @@ import kyo.ffi.codegen.model.*
   *   - An empty companion that performs the `kyo.ffi.internal.AbiCheck` check at class-loading time.
   *
   * The [[JvmEmitter]] is the structural reference.
+  *
+  * Emission builds a `Doc` layout tree (only intentional, hard line breaks) rendered once by [[emit]]; nested regions are indented with
+  * `Doc.indent` instead of re-processing emitted strings.
   */
 object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
 
@@ -24,38 +29,34 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
       *   the required C headers.
       */
     def emit(spec: TraitSpec, headersAvailable: Boolean = true): String =
-        val sb = new StringBuilder
-        sb ++= emitHeader(spec)
-        sb ++= "\n"
-        if headersAvailable then
-            sb ++= emitImplClass(spec)
-        else
-            sb ++= emitStubImplClass(spec)
-        end if
-        sb ++= "\n"
-        sb ++= emitImplCompanion(spec)
-        sb ++= "\n"
-        if headersAvailable then
-            sb ++= emitExternObject(spec)
-        else
-            sb ++= emitEmptyExternObject(spec)
-        end if
-        sb.toString
+        val impl    = if headersAvailable then emitImplClass(spec) else emitStubImplClass(spec)
+        val externs = if headersAvailable then emitExternObject(spec) else emitEmptyExternObject(spec)
+        val doc     =
+            emitHeader(spec)
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(impl)
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(emitImplCompanion(spec))
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(externs)
+                .append(Doc.hardNewline)
+        Printer.greedy.print(doc, EmitterBase.RenderWidth)
     end emit
 
     // -------------------------------------------------------------------------
     // Header
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitHeader(spec: TraitSpec): String =
+    private[codegen] def emitHeader(spec: TraitSpec): Doc =
         emitHeader(
             spec,
-            """import scala.scalanative.unsafe.*
-              |import scala.scalanative.libc.errno.errno
-              |import scala.scalanative.reflect.annotation.EnableReflectiveInstantiation
-              |import kyo.ffi.*
-              |import kyo.ffi.internal.{AbiCheck, NativePtr, StructAbiCheck}
-              |""".stripMargin
+            List(
+                "import scala.scalanative.unsafe.*",
+                "import scala.scalanative.libc.errno.errno",
+                "import scala.scalanative.reflect.annotation.EnableReflectiveInstantiation",
+                "import kyo.ffi.*",
+                "import kyo.ffi.internal.{AbiCheck, NativePtr, StructAbiCheck}"
+            )
         )
     end emitHeader
 
@@ -63,44 +64,41 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
     // Impl class
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplClass(spec: TraitSpec): String =
-        val sb = new StringBuilder
+    private[codegen] def emitImplClass(spec: TraitSpec): Doc =
+        val head = List.newBuilder[Doc]
         // `@EnableReflectiveInstantiation` tells the Scala Native linker to retain the nullary constructor so
         // `scala.reflect.Reflect.lookupInstantiatableClass` (used by `Ffi.load`) can instantiate it at runtime.
-        sb ++= s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:\n"
-        sb ++= s"    import `${spec.simpleName}_externs` as ext\n"
+        head += text(s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:")
+        head += text(s"    import `${spec.simpleName}_externs` as ext")
         // Import packed-struct byte-size constants from the companion so method bodies can reference them.
         if spec.structs.exists(_.packed) then
-            sb ++= s"    import ${spec.simpleName}Impl.*\n"
-        sb ++= companionInitLine(spec.simpleName)
-        spec.methods.foreach { m =>
-            sb ++= "\n"
-            if m.hasVarargs then
-                sb ++= emitVarargsStubMethod(m, spec)
-            else
-                sb ++= emitMethod(m, spec)
-            end if
+            head += text(s"    import ${spec.simpleName}Impl.*")
+        head += text(companionInitLine(spec.simpleName))
+        val classDoc = spec.methods.foldLeft(hardLines(head.result())) { (acc, m) =>
+            val methodDoc =
+                if m.hasVarargs then emitVarargsStubMethod(m, spec)
+                else emitMethod(m, spec)
+            acc.append(Doc.hardNewline).append(Doc.hardNewline).append(methodDoc)
         }
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        classDoc.append(Doc.hardNewline).append(text(s"end ${spec.simpleName}Impl"))
     end emitImplClass
 
     /** Emit a runtime stub for a variadic method. Scala Native's `@extern` cannot express variadic function pointers, the language-level
       * `CFuncPtrN` carriers are fixed-arity. The stub matches the trait signature (including the trailing `args: Any*`) and throws
       * `UnsupportedOperationException` at runtime.
       */
-    private[codegen] def emitVarargsStubMethod(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitVarargsStubMethod(method: MethodSpec, spec: TraitSpec): Doc =
         val sig  = methodSignature(method, includeVarargs = true)
         val body =
             s"""        throw new UnsupportedOperationException("Variadic method '${method.scalaName}' is not supported on Scala Native.")"""
-        sig + "\n" + body + "\n"
+        sig.append(Doc.hardNewline).append(text(body))
     end emitVarargsStubMethod
 
-    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): Doc =
         val sig = methodSignature(method)
-        // Indent body 8 spaces for the plain case; Zone-wrapped methods get their own indentation.
-        val body = indentBody(emitMethodBody(method, spec))
-        sig + "\n" + body + "\n"
+        // Method body sits two indentation levels deep inside the class (8 spaces); Zone-wrapped methods get their own indentation.
+        val body = Doc.indent(8, emitMethodBody(method, spec))
+        sig.append(Doc.hardNewline).append(body)
     end emitMethod
 
     /** Emit the body, including any `Zone.acquire` wrapping.
@@ -110,7 +108,7 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
       * `kyo.Fiber.Unsafe[<ret>, Any]` (matching the signature emitted by `methodSignature`). The `@blocking @extern`
       * downcall itself stays synchronous on the carrier thread.
       */
-    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         val sync = emitPlainMethodBody(method, spec)
         if method.blocking then wrapBlockingRun(sync) else sync
     end emitMethodBody
@@ -121,9 +119,7 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
       * from `FunctionN`. Retained callbacks additionally pin each wrapper on the user-supplied guard via `NativeGuard.unsafeRetain` so the
       * closure survives `guard.close()`. `Ffi.Guard` is consumed locally and never crosses the FFI boundary.
       */
-    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): String =
-        val structsByName = EmitterBase.structsByName(spec)
-
+    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         // Inspect the signature to decide whether we need a Zone (for CString allocation, Array copy, struct-alloc, or multi-value out-cells).
         val hasString        = method.params.exists(_.tpe == TypeRef.StringT)
         val hasArrayBlocking = method.blocking && method.params.exists {
@@ -145,25 +141,23 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
         val needsZone = hasString || hasArrayBlocking || hasStructParam || hasMultiValue || hasStructReturn || hasArrayNonBlocking
 
         // Build the inner body (what lives inside Zone.acquire { implicit z => ... } when present).
-        val inner = emitBodyInner(method, spec, structsByName)
+        val inner = emitBodyInner(method, spec)
 
         if needsZone then
-            val sb = new StringBuilder
-            sb ++= "Zone.acquire { implicit z =>\n"
-            inner.linesIterator.foreach { line =>
-                sb ++= "    "
-                sb ++= line
-                sb ++= "\n"
-            }
-            sb ++= "}"
-            sb.toString
+            text("Zone.acquire { implicit z =>")
+                .append(Doc.hardNewline)
+                .append(Doc.indent(4, inner))
+                .append(Doc.hardNewline)
+                .append(text("}"))
         else
             inner
         end if
     end emitPlainMethodBody
 
     /** Core body (no Zone wrapper): marshal args, call ext.cSymbol, capture errno, construct result. */
-    private def emitBodyInner(method: MethodSpec, spec: TraitSpec, structsByName: Map[String, StructSpec]): String =
+    private def emitBodyInner(method: MethodSpec, spec: TraitSpec): Doc =
+        val structsByName = EmitterBase.structsByName(spec)
+
         case class Marshalled(
             paramName: String,
             passExpr: String,
@@ -321,26 +315,25 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
                 }
             case _ => Nil
 
-        val sb = new StringBuilder
+        val body = List.newBuilder[Doc]
 
         // Setup lines for each marshalled parameter.
         marshalled.flatMap(_.setup).foreach { line =>
-            sb ++= line
-            sb ++= "\n"
+            body += text(line)
         }
 
         // Out-cell allocations (multi-value).
         outCells.foreach { o =>
-            sb ++= s"val ${o.name} = alloc[${cPrimitiveOf(o.tpe)}](1)\n"
+            body += text(s"val ${o.name} = alloc[${cPrimitiveOf(o.tpe)}](1)")
         }
 
         // Struct-return out-cell (C returns the struct into an out-param via pointer).
         method.returnShape match
             case ReturnShape.Struct(sSpec) =>
                 if sSpec.packed then
-                    sb ++= s"val out = alloc[Byte](${packedSizeConst(sSpec)})\n"
+                    body += text(s"val out = alloc[Byte](${packedSizeConst(sSpec)})")
                 else
-                    sb ++= s"val out = alloc[${externStructTypeName(sSpec, structsByName)}](1)\n"
+                    body += text(s"val out = alloc[${externStructTypeName(sSpec, structsByName)}](1)")
             case _ => ()
         end match
 
@@ -413,44 +406,35 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
             case ReturnShape.Void | ReturnShape.Struct(_) => false
             case _                                        => true
 
-        val callBlockSb = new StringBuilder
+        val callBlockLines = List.newBuilder[String]
         if hasRetVal then
-            callBlockSb ++= s"val retVal = $callExpr\n"
+            callBlockLines += s"val retVal = $callExpr"
         else
-            callBlockSb ++= s"$callExpr\n"
+            callBlockLines += callExpr
         end if
         if method.withError then
-            callBlockSb ++= "val __errno = errno\n"
-            callBlockSb ++= s"val __kyoResult = $resultExpr\n"
-            callBlockSb ++= "Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)"
+            callBlockLines += "val __errno = errno"
+            callBlockLines += s"val __kyoResult = $resultExpr"
+            callBlockLines += "Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)"
         else
-            callBlockSb ++= resultExpr
+            callBlockLines += resultExpr
         end if
-        val callBlock = callBlockSb.toString
+        val callBlock = hardTextLines(callBlockLines.result())
 
         // Teardown lines for transient callbacks (reverse push order: LIFO). Emitted in a `finally` block so the pops run even if the
         // FFI call throws. Retained callbacks don't contribute here, their cleanup fires at guard close, not per-call.
         val teardownLines = marshalled.flatMap(_.teardown).reverse
 
         if teardownLines.isEmpty then
-            sb ++= callBlock
-            sb ++= "\n"
+            body += callBlock
         else
-            sb ++= "try\n"
-            callBlock.linesIterator.foreach { l =>
-                sb ++= "    "
-                sb ++= l
-                sb ++= "\n"
-            }
-            sb ++= "finally\n"
-            teardownLines.foreach { l =>
-                sb ++= "    "
-                sb ++= l
-                sb ++= "\n"
-            }
+            body += text("try")
+            body += Doc.indent(4, callBlock)
+            body += text("finally")
+            body += Doc.indent(4, hardTextLines(teardownLines))
         end if
 
-        sb.toString
+        hardLines(body.result())
     end emitBodyInner
 
     /** Emit `ptr.fieldName = value` lines for writing a case-class into a zone-allocated struct.
@@ -873,58 +857,55 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
     // -------------------------------------------------------------------------
 
     /** Emit an impl class where every method is a runtime stub. Used when the required C headers are not available on the build host. */
-    private[codegen] def emitStubImplClass(spec: TraitSpec): String =
-        val sb          = new StringBuilder
+    private[codegen] def emitStubImplClass(spec: TraitSpec): Doc =
         val headersList = spec.headers.mkString(", ")
-        sb ++= s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:\n"
-        sb ++= companionInitLine(spec.simpleName)
-        spec.methods.foreach { m =>
-            sb ++= "\n"
-            sb ++= methodSignature(m, includeVarargs = true)
-            sb ++= "\n"
-            sb ++=
-                s"""        throw new UnsupportedOperationException("Required header(s) [$headersList] not available on this platform.")\n"""
+        val head        = List.newBuilder[Doc]
+        head += text(s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:")
+        head += text(companionInitLine(spec.simpleName))
+        val classDoc = spec.methods.foldLeft(hardLines(head.result())) { (acc, m) =>
+            val methodDoc =
+                methodSignature(m, includeVarargs = true)
+                    .append(Doc.hardNewline)
+                    .append(text(
+                        s"""        throw new UnsupportedOperationException("Required header(s) [$headersList] not available on this platform.")"""
+                    ))
+            acc.append(Doc.hardNewline).append(Doc.hardNewline).append(methodDoc)
         }
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        classDoc.append(Doc.hardNewline).append(text(s"end ${spec.simpleName}Impl"))
     end emitStubImplClass
 
     /** Emit an empty `@extern` object (no method declarations). Used when headers are unavailable, the object must still exist so the
       * companion can reference it, but it has no extern methods.
       */
-    private[codegen] def emitEmptyExternObject(spec: TraitSpec): String =
-        val sb = new StringBuilder
-        sb ++= "@extern\n"
+    private[codegen] def emitEmptyExternObject(spec: TraitSpec): Doc =
+        val lines = List.newBuilder[String]
+        lines += "@extern"
         // A `nativeBundled` library's C is compiled into the Native binary, so there is no shared library to `-l`:
         // emitting `@link` would force a missing `-l<library>` at link time. The symbols resolve via nativeConfig
         // linkingOptions instead. JVM/JS still load the shared library at runtime, so this only affects Native.
-        if !spec.nativeBundled then sb ++= s"""@link("${spec.library}")\n"""
-        val visibility =
-            if spec.packageName.isEmpty then "private"
-            else s"private[${spec.packageName.split('.').last}]"
-        sb ++= s"$visibility object `${spec.simpleName}_externs`:\n"
-        sb ++= s"end `${spec.simpleName}_externs`\n"
-        sb.toString
+        if !spec.nativeBundled then lines += s"""@link("${spec.library}")"""
+        lines += s"${externVisibility(spec)} object `${spec.simpleName}_externs`:"
+        lines += s"end `${spec.simpleName}_externs`"
+        hardTextLines(lines.result())
     end emitEmptyExternObject
 
     // -------------------------------------------------------------------------
     // Impl companion
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplCompanion(spec: TraitSpec): String =
-        val sb            = new StringBuilder
+    private[codegen] def emitImplCompanion(spec: TraitSpec): Doc =
         val structsByName = EmitterBase.structsByName(spec)
-        sb ++= s"object ${spec.simpleName}Impl:\n"
-        sb ++= "    import scala.scalanative.unsafe.*\n"
-        sb ++= abiCheckLine(spec.fqcn)
-        sb ++= "\n"
-        sb ++= companionLoadedDef
+        val lines         = List.newBuilder[String]
+        lines += s"object ${spec.simpleName}Impl:"
+        lines += "    import scala.scalanative.unsafe.*"
+        lines += abiCheckLine(spec.fqcn)
+        lines += companionLoadedDef
         // Emit a byte-size constant per packed struct. Scala Native 0.5 has no `@packed` annotation; packed structs
         // are represented as raw `Ptr[Byte]` with manual offset-based field access. The constant is used by alloc sites.
         spec.structs.foreach { s =>
             if s.packed then
                 val byteSize = packedByteSize(s, structsByName)
-                sb ++= s"    inline val ${packedSizeConst(s)} = $byteSize\n"
+                lines += s"    inline val ${packedSizeConst(s)} = $byteSize"
         }
         // Struct ABI self-check. For each struct that participates in a binding (param, return, or transitively nested),
         // compare the code generator's expected byte size against Scala Native's `sizeof[<StructType>]`. Mismatch indicates that the
@@ -936,10 +917,10 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
             if checked.contains(s.fqcn) && !s.packed then
                 val expected = structByteSize(s, structsByName)
                 val typeRef  = structTypeRef(s, structsByName, qualify = false, spec.simpleName + "Impl")
-                sb ++= s"""    StructAbiCheck.verifyByteSize("${spec.fqcn}", "${s.simpleName}", ${expected}L, sizeof[$typeRef].toLong)\n"""
+                lines += s"""    StructAbiCheck.verifyByteSize("${spec.fqcn}", "${s.simpleName}", ${expected}L, sizeof[$typeRef].toLong)"""
         }
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        lines += s"end ${spec.simpleName}Impl"
+        hardTextLines(lines.result())
     end emitImplCompanion
 
     /** Name of the packed-struct byte-size constant emitted in the impl companion. */
@@ -962,15 +943,12 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
     // @extern object
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitExternObject(spec: TraitSpec): String =
-        val sb = new StringBuilder
-        sb ++= "@extern\n"
+    private[codegen] def emitExternObject(spec: TraitSpec): Doc =
+        val lines = List.newBuilder[String]
+        lines += "@extern"
         // See `emitEmptyExternObject`: a `nativeBundled` library's C is linked into the binary, so no `@link` is emitted.
-        if !spec.nativeBundled then sb ++= s"""@link("${spec.library}")\n"""
-        val visibility =
-            if spec.packageName.isEmpty then "private"
-            else s"private[${spec.packageName.split('.').last}]"
-        sb ++= s"$visibility object `${spec.simpleName}_externs`:\n"
+        if !spec.nativeBundled then lines += s"""@link("${spec.library}")"""
+        lines += s"${externVisibility(spec)} object `${spec.simpleName}_externs`:"
         // The extern object is the linker-facing C-symbol table, so it holds exactly one declaration per distinct C symbol. Two binding
         // methods may resolve to the same symbol (e.g. a `@Ffi.blocking` overload and a synchronous one bound via the `symbols` override),
         // which would otherwise emit two `def <symbol>` externs with the same erased signature and fail to compile. Keep the first method per
@@ -981,11 +959,16 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
             if !m.hasVarargs && !emitted.contains(m.cSymbol) then
                 val _           = emitted.add(m.cSymbol)
                 val anyBlocking = spec.methods.exists(o => !o.hasVarargs && o.cSymbol == m.cSymbol && o.blocking)
-                sb ++= emitExternDecl(m, spec, forceBlocking = anyBlocking)
+                lines += emitExternDecl(m, spec, forceBlocking = anyBlocking)
         }
-        sb ++= s"end `${spec.simpleName}_externs`\n"
-        sb.toString
+        lines += s"end `${spec.simpleName}_externs`"
+        hardTextLines(lines.result())
     end emitExternObject
+
+    /** The `private[...]` visibility prefix of the extern object, `private` inside the empty package. */
+    private def externVisibility(spec: TraitSpec): String =
+        if spec.packageName.isEmpty then "private"
+        else s"private[${spec.packageName.split('.').last}]"
 
     private[codegen] def emitExternDecl(method: MethodSpec, spec: TraitSpec, forceBlocking: Boolean = false): String =
         val structsByName = EmitterBase.structsByName(spec)
@@ -1026,7 +1009,7 @@ object NativeEmitter extends EmitterBase.Ops with PlatformTypes:
             case ReturnShape.BorrowedString(_)    => "CString"
             case ReturnShape.BorrowedBuffer(_, _) => "Ptr[Byte]"
 
-        s"    ${prefix}def ${method.cSymbol}(${allParams.mkString(", ")}): $ret = extern\n"
+        s"    ${prefix}def ${method.cSymbol}(${allParams.mkString(", ")}): $ret = extern"
     end emitExternDecl
 
     // -------------------------------------------------------------------------

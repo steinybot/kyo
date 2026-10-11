@@ -1977,6 +1977,7 @@ lazy val `kyo-ffi-it` =
 lazy val `kyo-ffi-codegen` =
     project
         .in(file("kyo-ffi/codegen"))
+        .dependsOn(`kyo-print`.jvm)
         .dependsOn(`kyo-ffi`.jvm % Test)
         .settings(
             `kyo-settings`,
