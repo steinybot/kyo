@@ -16,6 +16,8 @@ package kyo
   *   - align: aligns line breaks to the current column
   *   - group: prefers single-line layout when width allows
   *   - choice: alternative layouts explored by printers
+  *   - clause: a delimited element list whose break style is decided at layout
+  *     time from a site policy
   */
 sealed trait Doc derives CanEqual:
 
@@ -59,6 +61,48 @@ object Doc:
     case class Concat(first: Doc, second: Doc) extends Doc
     case class Group(doc: Doc)                 extends Doc
     case class Choice(broken: Doc, flat: Doc)  extends Doc
+    case class Clause(
+        policy: Doc.ClausePolicy,
+        open: Doc,
+        close: Doc,
+        elems: Chunk[Doc],
+        sep: Doc = Text(","),
+        trailingSep: Boolean = false,
+        forcedOpen: Boolean = false
+    ) extends Doc
+
+    /** The kind of source construct a [[Clause]] represents.
+      *
+      * The site selects the layout rules the scalafmt printer applies:
+      * `Call` formats method call argument lists, `Defn` formats definition
+      * parameter lists, and `Extend` formats template parent clauses
+      * (`extends` / `with`), which are space-joined keyword lists without
+      * delimiters.
+      */
+    enum ClauseSite derives CanEqual:
+        case Call, Defn, Extend
+    end ClauseSite
+
+    /** Layout policy for a [[Clause]], resolved from a ScalafmtConfig by the
+      * document builder.
+      *
+      * The policy records everything the layout engine needs to decide how the
+      * clause breaks, mirroring the per-site options scalafmt consults during
+      * layout: the site selects the decision rules (one element per line,
+      * bin-packing, or template breaking), `indent` is the continuation indent
+      * in spaces applied relative to the clause's base, `dangling` places the
+      * closing delimiter on its own line when the clause breaks, `align`
+      * aligns continuation lines under the opening delimiter and takes
+      * precedence over bin-packing, and `binPack` selects the element packing
+      * strategy.
+      */
+    final case class ClausePolicy(
+        site: Doc.ClauseSite,
+        indent: Int,
+        dangling: Boolean,
+        align: Boolean,
+        binPack: ScalafmtConfig.BinPack.Site
+    ) derives CanEqual
 
     val empty: Doc = Empty
 
@@ -117,6 +161,97 @@ object Doc:
 
     def choice(alts: Doc*): Doc =
         choice(Chunk.from(alts))
+
+    /** Builds a clause: a delimited element list whose break style is decided
+      * at layout time by the site policy.
+      *
+      * `open` and `close` are the delimiters (for a definition site the close
+      * may carry an attached suffix such as `): Boolean`), `elems` are the
+      * arguments or parameters, and `sep` is the bare separator emitted after
+      * each element; a single space is added between elements when flat. An
+      * empty separator models a space-joined keyword list such as a template
+      * parent clause. `forcedOpen` records that the source had a line break
+      * after the opening delimiter, which forces the broken form. A clause
+      * without elements degenerates to `open` followed by `close`.
+      */
+    def clause(
+        policy: ClausePolicy,
+        open: Doc,
+        close: Doc,
+        sep: Doc,
+        trailingSep: Boolean,
+        forcedOpen: Boolean
+    )(elems: Chunk[Doc]): Doc =
+        if elems.isEmpty then open.append(close)
+        else Clause(policy, open, close, elems, sep, trailingSep, forcedOpen)
+    end clause
+
+    def clause(
+        policy: ClausePolicy,
+        open: Doc,
+        close: Doc,
+        sep: Doc,
+        trailingSep: Boolean,
+        forcedOpen: Boolean
+    )(first: Doc, rest: Doc*): Doc =
+        clause(policy, open, close, sep, trailingSep, forcedOpen)(Chunk.from(first +: rest))
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc)(elems: Chunk[Doc]): Doc =
+        clause(policy, open, close, Text(","), trailingSep = false, forcedOpen = false)(elems)
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        clause(policy, open, close, Text(","), trailingSep = false, forcedOpen = false)(
+            Chunk.from(first +: rest)
+        )
+
+    /** Approximates a clause with the Wadler-style combinators so the generic
+      * printers can render it; the scalafmt printer interprets the policy
+      * natively. Bin-packed and aligned clauses are approximated with their
+      * closest combinator (`wrap` / `hang`), which does not reproduce scalafmt
+      * output exactly.
+      */
+    private[kyo] def lowerClause(c: Clause): Doc =
+        if c.elems.isEmpty then c.open.append(c.close)
+        else
+            val extend = c.policy.site == ClauseSite.Extend
+            val elems  =
+                if c.trailingSep && !extend && c.elems.nonEmpty then
+                    c.elems.take(c.elems.length - 1) :+ c.elems.last.append(c.sep)
+                else c.elems
+            end elems
+            if extend then
+                lowerExtend(c, elems)
+            else if c.forcedOpen then
+                lowerBroken(c, elems)
+            else if c.policy.align then
+                hang(c.open, c.sep, c.close)(elems)
+            else if c.policy.binPack != ScalafmtConfig.BinPack.Site.Never then
+                wrap(c.open, c.sep, c.close)(elems)
+            else
+                val broken = lowerBroken(c, elems)
+                val flat   = c.open.append(separate(c.sep.append(singleSpace))(elems)).append(c.close)
+                group(choice(broken, flat))
+            end if
+        end if
+    end lowerClause
+
+    private def lowerExtend(c: Clause, elems: Chunk[Doc]): Doc =
+        if c.forcedOpen then
+            c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
+        else
+            val broken = c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
+            val flat   = c.open.append(separate(singleSpace)(elems))
+            group(choice(broken, flat))
+        end if
+    end lowerExtend
+
+    private def lowerBroken(c: Clause, elems: Chunk[Doc]): Doc =
+        val brokenSep = c.sep.append(newline)
+        val inner     = separate(brokenSep)(elems).indent(c.policy.indent)
+        val body      = c.open.append(newline).append(inner)
+        if c.policy.dangling && (c.close ne Empty) then body.append(newline).append(c.close)
+        else body.append(c.close)
+    end lowerBroken
 
     def separate(sep: Doc)(docs: Chunk[Doc]): Doc =
         if docs.isEmpty then empty

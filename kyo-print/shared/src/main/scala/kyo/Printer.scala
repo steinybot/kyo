@@ -68,6 +68,19 @@ object Printer:
       */
     val optimal: Printer = OptimalPrinter
 
+    /** A printer encoding the layout decision semantics of the scalafmt
+      * formatter.
+      *
+      * Renders [[Doc.Clause]] nodes natively by resolving their site policy at
+      * layout time: a clause stays flat when it fits, otherwise it breaks per
+      * its dangling, align, and bin-pack policy, with continuation lines
+      * indented relative to the clause's base and nested clauses stacking
+      * their indents. Other documents are rendered greedily. Validation runs
+      * against fixtures committed by scalafmt's own test suite; the generic
+      * printers only approximate clauses through their Wadler lowering.
+      */
+    val scalafmt: Printer = ScalafmtPrinter
+
     private case class Work(indent: Int, isFlat: Boolean, doc: Doc)
 
     private case class StreamState(work: List[Work], col: Int, pendingIndent: Int)
@@ -109,6 +122,8 @@ object Printer:
                                     fits(budget, Work(head.indent, true, flat) :: rest)
                                 else
                                     fits(budget, Work(head.indent, false, broken) :: rest)
+                            case c: Doc.Clause =>
+                                fits(budget, Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: rest)
 
         def print(doc: Doc, width: Int): String =
             if doc eq Doc.Empty then ""
@@ -184,6 +199,9 @@ object Printer:
                             else
                                 work = Work(head.indent, false, broken) :: work
                             end if
+
+                        case c: Doc.Clause =>
+                            work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
 
                         case Doc.Group(inner) =>
                             if head.isFlat then
@@ -282,6 +300,9 @@ object Printer:
                             work = Work(head.indent, false, broken) :: work
                         end if
 
+                    case c: Doc.Clause =>
+                        work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
+
                     case Doc.Group(inner) =>
                         if head.isFlat then
                             work = Work(head.indent, true, inner) :: work
@@ -370,6 +391,9 @@ object Printer:
 
                         case Doc.Choice(_, flat) =>
                             work = flat :: work
+
+                        case c: Doc.Clause =>
+                            work = Doc.lowerClause(c) :: work
                     end match
                 end while
 
@@ -415,6 +439,9 @@ object Printer:
 
                     case Doc.Choice(_, flat) =>
                         work = flat :: work
+
+                    case c: Doc.Clause =>
+                        work = Doc.lowerClause(c) :: work
                 end match
             end while
 
@@ -643,6 +670,9 @@ object Printer:
                                         brokenMs
                                     end if
                                 end if
+
+                    case c: Doc.Clause =>
+                        resolve(Doc.lowerClause(c), col, indent, pendingIndent, mode, width, memo)
                 memo.put(key, res)
                 res
             end if

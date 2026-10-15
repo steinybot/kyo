@@ -51,6 +51,41 @@ class DocTest extends kyo.test.Test[Any]:
             assert(ch.broken == a)
             assert(ch.flat == b)
         }
+
+        "Clause" in {
+            val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, ScalafmtConfig.BinPack.Site.Never)
+            val cl     = Doc.Clause(policy, a, b, Chunk(a, b), Doc.text(","), trailingSep = true, forcedOpen = true)
+            assert(cl.policy == policy)
+            assert(cl.open == a && cl.close == b)
+            assert(cl.elems == Chunk(a, b))
+            assert(cl.trailingSep && cl.forcedOpen)
+        }
+    }
+
+    "clause" - {
+        val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, ScalafmtConfig.BinPack.Site.Never)
+
+        "empty elements degenerate to open and close" in {
+            assert(Doc.clause(policy, a, b)(Chunk.empty) == Doc.Concat(a, b))
+        }
+
+        "non-empty elements build a Clause node" in {
+            val cl = Doc.clause(policy, a, b)(Chunk(a, b))
+            assert(cl == Doc.Clause(policy, a, b, Chunk(a, b), Doc.text(",")))
+            assert(Doc.clause(policy, a, b)(a, b) == cl)
+        }
+
+        "generic printers render the lowering like the matching combinator" in {
+            val elems     = Chunk(a, b)
+            val viaClause = Printer.greedy.print(Doc.clause(policy, Doc.text("send("), Doc.text(")"))(elems), 9)
+            val viaChop   = Printer.greedy.print(elems.chop(Doc.text("send("), Doc.text(","), Doc.text(")"), 2), 9)
+            assert(viaClause == viaChop)
+            assert(viaClause ==
+                """send(
+                  |  a,
+                  |  b
+                  |)""".stripMargin)
+        }
     }
 
     "core primitives" - {
@@ -208,15 +243,17 @@ class DocTest extends kyo.test.Test[Any]:
     "pattern matching" in {
         def describe(doc: Doc): String =
             doc match
-                case Doc.Empty                => "empty"
-                case Doc.Text(t)              => s"text($t)"
-                case Doc.Newline              => "newline"
-                case Doc.HardNewline          => "hardNewline"
-                case Doc.Indent(n, d)         => s"indent($n, ${describe(d)})"
-                case Doc.Align(d)             => s"align(${describe(d)})"
-                case Doc.Concat(d1, d2)       => s"concat(${describe(d1)}, ${describe(d2)})"
-                case Doc.Group(d)             => s"group(${describe(d)})"
-                case Doc.Choice(broken, flat) => s"choice(${describe(broken)}, ${describe(flat)})"
+                case Doc.Empty                                    => "empty"
+                case Doc.Text(t)                                  => s"text($t)"
+                case Doc.Newline                                  => "newline"
+                case Doc.HardNewline                              => "hardNewline"
+                case Doc.Indent(n, d)                             => s"indent($n, ${describe(d)})"
+                case Doc.Align(d)                                 => s"align(${describe(d)})"
+                case Doc.Concat(d1, d2)                           => s"concat(${describe(d1)}, ${describe(d2)})"
+                case Doc.Group(d)                                 => s"group(${describe(d)})"
+                case Doc.Choice(broken, flat)                     => s"choice(${describe(broken)}, ${describe(flat)})"
+                case Doc.Clause(p, open, close, elems, sep, _, _) =>
+                    s"clause(${p.site}, ${describe(open)}, ${describe(close)}, ${elems.length}, ${describe(sep)})"
 
         assert(describe(Doc.Empty) == "empty")
         assert(describe(Doc.Text("hi")) == "text(hi)")
@@ -227,6 +264,21 @@ class DocTest extends kyo.test.Test[Any]:
         assert(describe(Doc.Concat(a, b)) == "concat(text(a), text(b))")
         assert(describe(Doc.Group(a)) == "group(text(a))")
         assert(describe(Doc.Choice(a, b)) == "choice(text(a), text(b))")
+        assert(
+            describe(Doc.Clause(
+                Doc.ClausePolicy(
+                    Doc.ClauseSite.Call,
+                    2,
+                    true,
+                    false,
+                    ScalafmtConfig.BinPack.Site.Never
+                ),
+                a,
+                b,
+                Chunk(a, b)
+            )) ==
+                "clause(Call, text(a), text(b), 2, text(,))"
+        )
     }
 
     "separate" - {
