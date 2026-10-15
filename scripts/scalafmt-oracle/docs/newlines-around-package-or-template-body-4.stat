@@ -1,0 +1,31 @@
+runner.dialect = sbt1
+maxColumn = 40
+newlines.topLevelBodyIfMinStatements = [before,after]
+<<< example
+import org.scalafmt
+package core {
+  class C1 {
+    def one = 1
+  }
+  object O1 {
+    val one = 1
+    def two = 2
+  }
+  class C2 {}
+}
+>>>
+import org.scalafmt
+package core {
+
+  class C1 {
+    def one = 1
+  }
+  object O1 {
+
+    val one = 1
+    def two = 2
+
+  }
+  class C2 {}
+
+}

@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.beforeApplyArgInParens = Always
+spaces.beforeInfixArgInParens = Always
+<<< example
++(baz)
+===(baz)
+bar(baz)
+
+foo +(baz)
+foo ===(baz)
+foo bar(baz)
+>>>
++(baz)
+=== (baz)
+bar (baz)
+
+foo + (baz)
+foo === (baz)
+foo bar (baz)

@@ -1,0 +1,15 @@
+runner.dialect = scala213
+maxColumn = 40
+align.arrowEnumeratorGenerator = false
+<<< example
+for {
+  x <- new Integer {
+     def value = 2
+     }
+} yield x
+>>>
+for {
+  x <- new Integer {
+    def value = 2
+  }
+} yield x

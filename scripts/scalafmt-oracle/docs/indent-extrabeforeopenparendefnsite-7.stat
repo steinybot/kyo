@@ -1,0 +1,31 @@
+runner.dialect = scala213
+maxColumn = 40
+runner.dialect = Scala3
+indent.significant = 3
+indent.fewerBraces = never
+<<< example
+bar:
+  2 + 2
+
+foo.bar:
+  2 + 2
+
+foo:
+  2 + 2
+.bar:
+  3 + 3
+.baz // c
+.qux
+>>>
+bar:
+   2 + 2
+
+foo.bar:
+   2 + 2
+
+foo:
+   2 + 2
+.bar:
+   3 + 3
+.baz // c
+  .qux

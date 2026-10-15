@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+<<< example
+List(1, 2, 3).map { x => x + 1 }
+>>>
+List(1, 2, 3).map(x => x + 1)

@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+newlines.afterCurlyLambdaParams=squash
+<<< example
+List(1, 2, 3).map { x =>
+  x + 1
+}
+
+List(1, 2, 3).map { x =>
+  println("you can't squash me!")
+  x + 1
+}
+>>>
+List(1, 2, 3).map(x => x + 1)
+
+List(1, 2, 3).map { x =>
+  println("you can't squash me!")
+  x + 1
+}

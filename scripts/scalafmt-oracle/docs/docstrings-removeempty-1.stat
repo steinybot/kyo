@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+docstrings.removeEmpty = true
+<<< example
+/** */
+/**
+  *
+  */
+/** */ /** */
+val a = 1
+>>>
+val a = 1

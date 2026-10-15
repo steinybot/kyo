@@ -1,0 +1,32 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 30
+align.inInterpolation = true
+newlines.inInterpolation = oneline
+<<< example
+object a {
+  s"""
+    |foo1 ${quxQux(bazBaz, barBar)} foo2 ${quxQux(bazBaz, barBar)} foo3 ${quxQux(bazBaz, barBar)} foo4
+    |""".stripMargin
+}
+>>>
+object a {
+  s"""
+    |foo1 ${
+             quxQux(
+               bazBaz,
+               barBar
+             )
+           } foo2 ${
+                     quxQux(
+                       bazBaz,
+                       barBar
+                     )
+                   } foo3 ${
+                             quxQux(
+                               bazBaz,
+                               barBar
+                             )
+                           } foo4
+    |""".stripMargin
+}

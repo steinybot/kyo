@@ -1,0 +1,27 @@
+runner.dialect = scala213
+maxColumn = 40
+optIn.breaksInsideChains = true
+maxColumn = 35
+<<< example
+foo.bar(_ + 1)
+  .baz(_ > 2).qux
+foo.bar(_ + 1).baz(_ > 2).qux
+foo.bar(_ + 1).baz(_ > 2).qux(_ * 12)
+foo.bar(_ + 1).baz(_ > 2).qux { _ * 12 }
+foo.bar(_ + 1)
+  .baz(_ > 2).qux(_ * 12)
+>>>
+foo
+  .bar(_ + 1)
+  .baz(_ > 2).qux
+foo.bar(_ + 1).baz(_ > 2).qux
+foo
+  .bar(_ + 1).baz(_ > 2).qux(
+    _ * 12
+  )
+foo.bar(_ + 1).baz(_ > 2).qux {
+  _ * 12
+}
+foo
+  .bar(_ + 1)
+  .baz(_ > 2).qux(_ * 12)

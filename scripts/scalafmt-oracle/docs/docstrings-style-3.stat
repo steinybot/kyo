@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+docstrings.style = SpaceAsterisk
+<<< example
+/** Format intermediate lines with a space and an asterisk,
+ * both below the two asterisks of the first line
+ */
+>>>
+/** Format intermediate lines with a
+  * space and an asterisk, both below
+  * the two asterisks of the first line
+  */

@@ -1,0 +1,10 @@
+runner.dialect = scala213
+maxColumn = 40
+optIn.encloseClassicChains = true
+maxColumn = 30
+<<< example
+(foo.map(_ + 1).map(_ + 1))
+  .filter(_ > 2)
+>>>
+(foo.map(_ + 1).map(_ + 1))
+  .filter(_ > 2)

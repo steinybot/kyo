@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 20
+indent.caseSite = 5
+<<< example
+x match {
+  case _: Aaaaaa |
+      _: Bbbbbb |
+      _: Cccccc =>
+}
+>>>
+x match {
+  case _: Aaaaaa |
+       _: Bbbbbb |
+       _: Cccccc =>
+}

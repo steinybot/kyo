@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+align.preset = none
+<<< example
+x match { // false for case arrows
+  case 2  => 22 // also comments!
+  case 22 => 222 // don't align me!
+}
+>>>
+x match { // false for case arrows
+  case 2 => 22 // also comments!
+  case 22 => 222 // don't align me!
+}

@@ -1,0 +1,31 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [SortModifiers]
+rewrite.sortModifiers.preset = styleGuide
+<<< example
+final lazy private implicit val x = 42
+lazy final implicit private val y = 42
+
+class Test(
+    implicit
+    final private val i1: Int,
+    private final val i2: String
+)
+
+sealed protected[X] trait ADT
+final private case object A1 extends ADT
+private final case class A2(a: Int)
+    extends ADT
+>>>
+private implicit final lazy val x = 42
+private implicit final lazy val y = 42
+
+class Test(implicit
+    private final val i1: Int,
+    private final val i2: String
+)
+
+protected[X] sealed trait ADT
+private final case object A1 extends ADT
+private final case class A2(a: Int)
+    extends ADT

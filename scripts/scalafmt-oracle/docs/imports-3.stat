@@ -1,0 +1,8 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [Imports]
+rewrite.imports.sort = ascii
+<<< example
+import foo.{~>, `symbol`, bar, Random}
+>>>
+import foo.{Random, `symbol`, bar, ~>}

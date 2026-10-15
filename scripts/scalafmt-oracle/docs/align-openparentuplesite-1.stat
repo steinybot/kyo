@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 10
+align.openParenCallSite = false
+align.openParenTupleSite = true
+<<< example
+object a {
+  foo(bar, baz)
+  (bar, baz)
+}
+>>>
+object a {
+  foo(
+    bar,
+    baz
+  )
+  (bar,
+   baz
+  )
+}

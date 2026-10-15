@@ -1,0 +1,39 @@
+runner.dialect = sbt1
+maxColumn = 40
+newlines.topLevelStatementBlankLines = [
+  {
+    minBreaks = 2
+    blanks = 1
+  }
+]
+<<< example
+import org.scalafmt
+package core {
+  object O {
+    val x1 = 1
+    val x2 = 2
+    def A =
+      "A"
+    def B = {
+      "B"
+    }
+  }
+}
+>>>
+import org.scalafmt
+
+package core {
+
+  object O {
+    val x1 = 1
+    val x2 = 2
+    def A =
+      "A"
+
+    def B = {
+      "B"
+    }
+
+  }
+
+}

@@ -1,0 +1,19 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 20
+indent.matchSite = 0
+runner.dialect = scala3
+<<< example
+object a:
+  x match
+    case _: Aaaaaa |
+      _: Bbbbbb |
+      _: Cccccc =>
+  end match
+>>>
+object a:
+  x match
+  case _: Aaaaaa |
+      _: Bbbbbb |
+      _: Cccccc =>
+  end match

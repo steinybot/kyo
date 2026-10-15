@@ -1,0 +1,33 @@
+runner.dialect = scala213
+maxColumn = 40
+runner.dialect = scala3
+indent.main = 2
+indent.significant = 3
+<<< example
+object a {
+  if (foo)
+    bar
+  else
+    baz
+
+  if foo then
+    bar
+    bar
+  else
+    baz
+    baz
+}
+>>>
+object a {
+  if (foo)
+    bar
+  else
+    baz
+
+  if foo then
+     bar
+     bar
+  else
+     baz
+     baz
+}

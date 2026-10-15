@@ -1,0 +1,27 @@
+runner.dialect = sbt1
+maxColumn = 40
+newlines.topLevelBodyIfMinStatements = [after]
+<<< example
+package core {
+  class C1 {
+    def one = 1
+  }
+  object O1 {
+    val one = 1
+    def two = 2
+  }
+  class C2 {}
+}
+>>>
+package core {
+  class C1 {
+    def one = 1
+  }
+  object O1 {
+    val one = 1
+    def two = 2
+
+  }
+  class C2 {}
+
+}

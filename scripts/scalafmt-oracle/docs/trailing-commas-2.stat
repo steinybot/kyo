@@ -1,0 +1,54 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.trailingCommas.style = keep
+<<< example
+import a.{
+  b,
+  c,
+}
+def method1(
+  a: Int,
+  b: Long,
+) = {}
+def method2(
+  a: Int,
+  b: Long*
+) = {}
+def method3(
+  a: Int,
+) = {}
+method1(
+  a,
+  b
+)
+method2(
+  a,
+  b: _*,
+)
+method3(
+  a,
+)
+>>>
+import a.{b, c}
+def method1(
+    a: Int,
+    b: Long,
+) = {}
+def method2(
+    a: Int,
+    b: Long*
+) = {}
+def method3(
+    a: Int,
+) = {}
+method1(
+  a,
+  b
+)
+method2(
+  a,
+  b: _*,
+)
+method3(
+  a,
+)

@@ -1,0 +1,23 @@
+runner.dialect = scala213
+maxColumn = 40
+<<< example
+// scalafmt: { align.preset = most, danglingParentheses.preset = false }
+libraryDependencies ++= Seq(
+  "org.scalameta" %% "scalameta" % scalametaV,
+  "org.scalacheck" %% "scalacheck" % scalacheckV)
+
+// scalafmt: { align.preset = some, danglingParentheses.preset = true } (back to defaults)
+libraryDependencies ++= Seq(
+  "org.scalameta" %% "scalameta" % scalametaV,
+  "org.scalacheck" %% "scalacheck" % scalacheckV)
+>>>
+// scalafmt: { align.preset = most, danglingParentheses.preset = false }
+libraryDependencies ++= Seq(
+  "org.scalameta"  %% "scalameta"  % scalametaV,
+  "org.scalacheck" %% "scalacheck" % scalacheckV)
+
+// scalafmt: { align.preset = some, danglingParentheses.preset = true } (back to defaults)
+libraryDependencies ++= Seq(
+  "org.scalameta" %% "scalameta" % scalametaV,
+  "org.scalacheck" %% "scalacheck" % scalacheckV
+)

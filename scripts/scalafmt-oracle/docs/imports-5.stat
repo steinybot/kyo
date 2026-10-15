@@ -1,0 +1,66 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [Imports]
+rewrite.imports.sort = ascii
+rewrite.imports.groups = [
+  ["foo\\..*"],
+  ["bar\\..*", "baz\\..*"]
+]
+<<< example
+import bar.bar.{Random, bar, ~>, `symbol`}
+import baz.Baz.{bar => xyz, _}
+import qux.`qux`.{Random, bar, ~>, `symbol`}
+import foo._
+import baz.bar.{Random, bar, ~>, `symbol`}
+import qux.Baz.{bar => xyz, _}
+import foo.`qux`.{Random, bar, ~>, `symbol`}
+import bar._
+import qux.bar.{Random, bar, ~>, `symbol`}
+import foo.Baz.{bar => xyz, _}
+import bar.`qux`.{Random, bar, ~>, `symbol`}
+import baz._
+>>>
+import foo.Baz.{bar => xyz, _}
+import foo._
+import foo.`qux`.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}
+
+import bar._
+import bar.`qux`.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}
+import bar.bar.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}
+import baz.Baz.{bar => xyz, _}
+import baz._
+import baz.bar.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}
+
+import qux.Baz.{bar => xyz, _}
+import qux.`qux`.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}
+import qux.bar.{
+  Random,
+  `symbol`,
+  bar,
+  ~>
+}

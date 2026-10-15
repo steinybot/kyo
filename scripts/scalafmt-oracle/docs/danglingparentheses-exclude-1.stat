@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+indent.defnSite = 2
+danglingParentheses.defnSite = true
+danglingParentheses.exclude = [def]
+<<< example
+def other(a: String, b: String)(c: String, d: String) = a + b + c
+other(a, b)(c, d)
+>>>
+def other(a: String, b: String)(
+  c: String,
+  d: String) = a + b + c
+other(a, b)(c, d)

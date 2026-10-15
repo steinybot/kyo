@@ -1,0 +1,26 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.parentConstructors = OnelineIfPrimaryOneline
+maxColumn = 30
+<<< example
+object A {
+  class Foo(a: Int, b: Int)
+  extends Bar
+  with Baz
+
+  class Foo(
+    a: Int,
+    b: Int
+  ) extends Bar with Baz
+}
+>>>
+object A {
+  class Foo(a: Int, b: Int)
+      extends Bar with Baz
+
+  class Foo(
+      a: Int,
+      b: Int
+  ) extends Bar
+      with Baz
+}

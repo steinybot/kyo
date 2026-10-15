@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantParens]
+rewrite.redundantParens.infixSide = null
+<<< example
+// null+
+foo & (0) // literal
+foo & (bar) // identifier
+// some+
+foo & (bar.baz) // non-infix
+foo & (bar + baz) // very high precedence infix
+foo or (bar < baz) // non-symbolic outer op, medium precedence infix
+>>>
+// null+
+foo & 0 // literal
+foo & bar // identifier
+// some+
+foo & (bar.baz) // non-infix
+foo & (bar + baz) // very high precedence infix
+foo or (bar < baz) // non-symbolic outer op, medium precedence infix

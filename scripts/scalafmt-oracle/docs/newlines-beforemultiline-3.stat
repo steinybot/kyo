@@ -1,0 +1,23 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.beforeMultiline = keep
+<<< example
+a match {
+  // had space after "=>"
+  case a => if (step != 0)
+      d.name should be("dir" + step)
+  // had newline after "=>"
+  case a =>
+    if (step != 0)
+      d.name should be("dir" + step)
+}
+>>>
+a match {
+  // had space after "=>"
+  case a => if (step != 0)
+      d.name should be("dir" + step)
+  // had newline after "=>"
+  case a =>
+    if (step != 0)
+      d.name should be("dir" + step)
+}

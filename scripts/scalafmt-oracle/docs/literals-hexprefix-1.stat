@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+literals.hexPrefix=Lower
+<<< example
+0X123
+>>>
+0x123

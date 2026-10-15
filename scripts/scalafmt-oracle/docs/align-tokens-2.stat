@@ -1,0 +1,25 @@
+runner.dialect = scala213
+maxColumn = 40
+align.tokens = [
+  {
+    code = "%"
+    owners = [{
+      regex = "Term.ApplyInfix"
+    }]
+  }, {
+    code = "%%"
+    owners = [{
+      regex = "Term.ApplyInfix"
+    }]
+  }
+]
+<<< example
+val x = List(
+"org.scala-lang" %% "scala-compiler" % scalaVersion.value,
+"com.lihaoyi" %% "sourcecode" % "0.1.1"
+)
+>>>
+val x = List(
+  "org.scala-lang" %% "scala-compiler" % scalaVersion.value,
+  "com.lihaoyi" %% "sourcecode" % "0.1.1"
+)

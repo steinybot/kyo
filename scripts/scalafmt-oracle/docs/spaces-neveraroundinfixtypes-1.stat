@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.neverAroundInfixTypes=["##"]
+<<< example
+def f: Foo##Repr
+def g: Foo\/Repr
+// usage same operator not as type
+def e = a##b
+>>>
+def f: Foo##Repr
+def g: Foo \/ Repr
+// usage same operator not as type
+def e = a ## b

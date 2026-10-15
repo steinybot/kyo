@@ -1,0 +1,33 @@
+runner.dialect = scala213
+maxColumn = 40
+align.tokens."+" = [{
+  code = ":"
+  owners = [{
+    regex = "Term\\.Param"
+    parents = [ "Ctor\\.Primary" ]
+  }]
+}]
+<<< example
+case class Foo(
+  firstParam: Int,
+  secondParam: String,
+  thirdParam: Boolean
+) {
+  def Foo(
+    firstParam: Int,
+    secondParam: String,
+    thirdParam: Boolean
+  ) = ???
+}
+>>>
+case class Foo(
+    firstParam:  Int,
+    secondParam: String,
+    thirdParam:  Boolean
+) {
+  def Foo(
+      firstParam: Int,
+      secondParam: String,
+      thirdParam: Boolean
+  ) = ???
+}

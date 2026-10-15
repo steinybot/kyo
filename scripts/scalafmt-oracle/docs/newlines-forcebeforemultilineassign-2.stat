@@ -1,0 +1,66 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 19
+newlines.forceBeforeMultilineAssign = topMember
+<<< example
+class A {
+  class B {
+    // break, a top member
+    def foo = func(foo, bar)
+    // break, a top member
+    val foo = func(foo, bar)
+  }
+  def foo = {
+    // no break, not a member
+    def a = func(foo, bar)
+    // no break, not a member
+    val a = func(foo, bar)
+    new A with B {
+      // no break, not a top member
+      def foo = func(foo, bar)
+      // no break, not a top member
+      val foo = func(foo, bar)
+    }
+  }
+}
+>>>
+class A {
+  class B {
+    // break, a top member
+    def foo = func(
+      foo,
+      bar
+    )
+    // break, a top member
+    val foo = func(
+      foo,
+      bar
+    )
+  }
+  def foo = {
+    // no break, not a member
+    def a = func(
+      foo,
+      bar
+    )
+    // no break, not a member
+    val a = func(
+      foo,
+      bar
+    )
+    new A with B {
+      // no break, not a top member
+      def foo =
+        func(
+          foo,
+          bar
+        )
+      // no break, not a top member
+      val foo =
+        func(
+          foo,
+          bar
+        )
+    }
+  }
+}

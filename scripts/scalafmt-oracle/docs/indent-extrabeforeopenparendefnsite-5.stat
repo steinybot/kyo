@@ -1,0 +1,21 @@
+runner.dialect = scala213
+maxColumn = 40
+indent.relativeToLhsLastLine = [match, infix]
+<<< example
+foo // c1
+  .bar match {
+  case baz => qux
+}
+foo // c1
+  .bar infix {
+  case baz => qux
+}
+>>>
+foo // c1
+  .bar match {
+    case baz => qux
+  }
+foo // c1
+  .bar infix { case baz =>
+    qux
+  }

@@ -1,0 +1,33 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.maxBreaks = 3
+<<< example
+def f() = {
+  collection
+    .map(x => x + 1)
+    .filter(_ < 10)
+    .map(_ * 2)
+}
+
+def f() = {
+  collection
+    .map(x => x + 1)
+    .filter(_ < 10)
+    .map(_ * 2)
+    .headOption
+}
+>>>
+def f() =
+  collection
+    .map(x => x + 1)
+    .filter(_ < 10)
+    .map(_ * 2)
+
+def f() = {
+  collection
+    .map(x => x + 1)
+    .filter(_ < 10)
+    .map(_ * 2)
+    .headOption
+}

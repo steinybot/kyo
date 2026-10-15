@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 40
+newlines.avoidForSimpleOverflow = []
+<<< example
+intercept[TestException] {
+  val ct = Thread.currentThread() // comment
+}
+>>>
+intercept[TestException] {
+  val ct =
+    Thread.currentThread() // comment
+}
