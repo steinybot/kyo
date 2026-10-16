@@ -9,19 +9,29 @@ package kyo
   * policy against the current column and layout width:
   *
   *   - a clause whose flat form fits stays flat;
-  *   - otherwise a `Never` bin-pack site breaks after the opening delimiter
-  *     with one element per line, and the closing delimiter dangles on its own
-  *     line when the policy says so;
-  *   - a bin-packing site keeps the opening delimiter attached and packs as
-  *     many elements per line as the width allows, unless the clause is
-  *     forced open, in which case the elements still pack but the closing
-  *     delimiter dangles;
-  *   - an aligning site keeps the opening delimiter attached and aligns
-  *     continuation lines under it, taking precedence over bin-packing.
+  *   - a `Never` bin-pack site breaks after the opening delimiter with one
+  *     element per line, and the closing delimiter dangles on its own line
+  *     when the policy says so;
+  *   - a bin-packing `Always` site keeps both delimiters attached and packs
+  *     as many elements per line as the width allows;
+  *   - an `Oneline` site packs like `Always` but isolates multiline elements
+  *     on their own lines, breaking after the opening delimiter when the
+  *     first element is multiline (the closing delimiter then dangles
+  *     according to the policy);
+  *   - an aligning site keeps the opening delimiter attached, packs elements,
+  *     and aligns continuation lines under it;
+  *   - a template (`Extend`) site packs or lists parents per the
+  *     `parentConstructors` mode, starting the parents inline when the
+  *     template's parameter clause itself broke.
   *
   * Continuation indentation is applied relative to the clause's base, so
   * nested clauses stack their indents the way scalafmt stacks continuation
   * indents of nested argument lists.
+  *
+  * Source line breaks are handled the way scalafmt's default classic newline
+  * source handles them: a break at only one clause delimiter is folded, and
+  * a `Never` clause whose source broke at both delimiters keeps its broken
+  * form (the preserved config-style shape).
   *
   * Documents that are not clauses are rendered greedily, so this printer can
   * be used on any document. Output is validated byte-for-byte against
@@ -57,9 +67,10 @@ private[kyo] object ScalafmtPrinter extends Printer:
 
     final private class Renderer(width: Int):
 
-        val sb      = new java.lang.StringBuilder()
-        var col     = 0
-        var pending = -1
+        val sb       = new java.lang.StringBuilder()
+        var col      = 0
+        var pending  = -1
+        var newlines = 0
 
         def result(): String = sb.toString
 
@@ -92,6 +103,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
             sb.append('\n')
             col = indent
             pending = indent
+            newlines += 1
         end emitNewline
 
         /** The flat width of a document, or `None` when it cannot render on a
@@ -113,21 +125,19 @@ private[kyo] object ScalafmtPrinter extends Printer:
                         b <- flatWidth(second)
                     yield a + b
                 case c: Doc.Clause => clauseFlatWidth(c)
+            end match
         end flatWidth
 
         private def clauseFlatWidth(c: Doc.Clause): Option[Int] =
-            if c.forcedOpen then None
-            else
-                for
-                    openW  <- flatWidth(c.open)
-                    closeW <- flatWidth(c.close)
-                    elemWs <- allElemWidths(c)
-                yield
-                    if isSpaceJoined(c) then openW + elemWs.map(1 + _).sum + closeW
-                    else
-                        openW + elemWs.sum + (c.elems.length - 1) * (flatWidth(c.sep).getOrElse(0) + 1) +
-                            closeW
-            end if
+            for
+                openW  <- flatWidth(c.open)
+                closeW <- flatWidth(c.close)
+                elemWs <- allElemWidths(c)
+            yield
+                if isSpaceJoined(c) then openW + elemWs.map(1 + _).sum + closeW
+                else
+                    openW + elemWs.sum + (c.elems.length - 1) * (flatWidth(c.sep).getOrElse(0) + 1) +
+                        closeW
         end clauseFlatWidth
 
         private def allElemWidths(c: Doc.Clause): Option[List[Int]] =
@@ -141,6 +151,30 @@ private[kyo] object ScalafmtPrinter extends Printer:
 
         private def isSpaceJoined(c: Doc.Clause): Boolean =
             c.policy.site == Doc.ClauseSite.Extend
+
+        /** Whether an element cannot render on a single line from a fresh
+          * line at `indent`: either it contains a forced break, or its
+          * interior breaks by fit when rendered there. An element with no
+          * possible interior break (plain text) stays oneline even when it
+          * overflows the width, matching scalafmt's single-line-block rule.
+          */
+        private def isMultiline(elem: Doc, indent: Int): Boolean =
+            flatWidth(elem) match
+                case None    => true
+                case Some(0) => false
+                case Some(w) => indent + w > width && breaksWhenRendered(elem, indent)
+            end match
+        end isMultiline
+
+        /** Renders `elem` into a throwaway renderer to see whether it emits a
+          * newline; used only by the `Oneline` packing rules.
+          */
+        private def breaksWhenRendered(elem: Doc, startCol: Int): Boolean =
+            val probe = new Renderer(width)
+            probe.col = startCol
+            probe.render(elem, startCol, flat = false)
+            probe.newlines > 0
+        end breaksWhenRendered
 
         def render(doc: Doc, base: Int, flat: Boolean): Unit =
             doc match
@@ -184,17 +218,17 @@ private[kyo] object ScalafmtPrinter extends Printer:
         end render
 
         private def renderClause(c: Doc.Clause, base: Int): Unit =
-            val elemIndent = base + c.policy.indent
-            val fitsFlat   = !c.forcedOpen && clauseFlatWidth(c).exists(col + _ <= width)
             if c.elems.isEmpty then
                 render(c.open, base, false)
                 render(c.close, base, false)
-            else if fitsFlat then
-                renderFlatClause(c, base)
-            else if c.policy.align || c.policy.binPack == ScalafmtConfig.BinPack.Site.Never then
-                renderOnePerLine(c, base, elemIndent)
             else
-                renderPacked(c, base, elemIndent)
+                val preserved = c.forcedOpen && c.forcedClose
+                val fitsFlat  = !preserved && clauseFlatWidth(c).exists(col + _ <= width)
+                if fitsFlat then renderFlatClause(c, base)
+                else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, base)
+                else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, base)
+                else renderPacked(c, base)
+                end if
             end if
         end renderClause
 
@@ -216,7 +250,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
             render(c.close, base, true)
         end renderFlatClause
 
-        private def renderOnePerLine(c: Doc.Clause, base: Int, elemIndent: Int): Unit =
+        private def renderOnePerLine(c: Doc.Clause, base: Int): Unit =
+            val elemIndent = base + c.policy.indent
             if c.policy.align then
                 render(c.open, base, false)
                 val alignCol = col
@@ -248,46 +283,176 @@ private[kyo] object ScalafmtPrinter extends Printer:
             end if
         end renderOnePerLine
 
-        private def renderPacked(c: Doc.Clause, base: Int, elemIndent: Int): Unit =
-            val spaceJoined = isSpaceJoined(c)
-            // An extend clause never flows its first parent on the header line:
-            // like scalafmt's template handling, the break goes after the type
-            // name and the parents pack below it.
-            val forceOpenBreak = c.forcedOpen || spaceJoined
+        /** Bin-packs call and definition sites (Always and Oneline). The open
+          * delimiter stays attached; the Oneline mode isolates multiline
+          * elements and breaks after the open when the first element is
+          * multiline, in which case the close dangles per policy.
+          */
+        private def renderPacked(c: Doc.Clause, base: Int): Unit =
+            val oneline = c.policy.binPack == Doc.BinPackMode.Oneline
             render(c.open, base, false)
-            if forceOpenBreak then emitNewline(elemIndent)
-            var firstOnLine = true
-            var isolateNext = false
-            var i           = 0
+            // An aligning packed clause keeps continuation lines under the
+            // opening delimiter instead of at a fixed indent.
+            val elemIndent =
+                if c.policy.align then col
+                else base + c.policy.indent
+            var openBroke = false
+            if oneline && isMultiline(c.elems(0), elemIndent) then
+                emitNewline(elemIndent)
+                openBroke = true
+            end if
+            var afterMultiline = false
+            var i              = 0
             while i < c.elems.length do
                 val elem        = c.elems(i)
-                val w           = flatWidth(elem)
                 val atLineStart = pending >= 0
-                w match
-                    case Some(elemW) =>
-                        // The first element flows directly after an attached
-                        // open (or at the line start); later elements are
-                        // separated by a space or a line break by fit.
-                        val needSpace = !atLineStart && (!firstOnLine || spaceJoined)
-                        if needSpace && (isolateNext || col + 1 + elemW > width) then
-                            emitNewline(elemIndent)
-                        else if needSpace then emitSpace()
-                        render(elem, elemIndent, false)
-                    case None =>
-                        // A multiline element is isolated on its own line.
-                        if !atLineStart then emitNewline(elemIndent)
-                        render(elem, elemIndent, false)
-                end match
-                firstOnLine = false
-                isolateNext = c.policy.binPack == ScalafmtConfig.BinPack.Site.Oneline && w.isEmpty
+                val multiline   = isMultiline(elem, elemIndent)
+                if oneline && multiline then
+                    // An Oneline site isolates a multiline element on its
+                    // own line(s), and the next element starts fresh.
+                    if !atLineStart then emitNewline(elemIndent)
+                    render(elem, elemIndent, false)
+                else
+                    // The first element flows directly after an attached
+                    // open (or at the line start); later elements are
+                    // separated by a space or a line break by fit. A
+                    // multiline element under Always renders inline and
+                    // breaks internally; only a forced break starts a new
+                    // line unconditionally. Under Oneline, an element
+                    // following a multiline one always starts fresh.
+                    val needSpace = !atLineStart && i > 0
+                    if afterMultiline && !atLineStart then emitNewline(elemIndent)
+                    else
+                        flatWidth(elem) match
+                            case Some(w) if !needSpace || col + 1 + w <= width =>
+                                if needSpace then emitSpace()
+                            case _ => if !atLineStart then emitNewline(elemIndent)
+                        end match
+                    end if
+                    render(elem, elemIndent, false)
+                end if
+                afterMultiline = oneline && multiline
                 if i < c.elems.length - 1 || c.trailingSep then render(c.sep, elemIndent, false)
                 i += 1
             end while
             if c.close ne Doc.Empty then
-                if c.forcedOpen && c.policy.dangling then emitNewline(base)
+                if openBroke && c.policy.dangling then emitNewline(base)
                 render(c.close, base, false)
             end if
         end renderPacked
+
+        /** Formats a broken template parent clause (`extends` / `with`).
+          *
+          * Mirrors scalafmt's splits at the first parent: `Always` first
+          * tries to keep the parents flowing from wherever the header ended,
+          * tolerating newlines only inside parent constructors, and falls
+          * back to breaking before the first parent and then packing by fit.
+          * `Never` lists one parent per line. `Oneline` renders the whole
+          * chain on one line when every parent is single-line and it fits,
+          * and otherwise lists one parent per line;
+          * `OnelineIfPrimaryOneline` picks between `Oneline` and `Never` by
+          * whether the clause's opening (the template's parameter clause)
+          * rendered on a single line. A listed clause whose opening broke
+          * starts its first parent inline after the opening.
+          */
+        private def renderTemplateClause(c: Doc.Clause, base: Int): Unit =
+            val elemIndent = base + c.policy.indent
+            val nlBefore   = newlines
+            render(c.open, base, false)
+            val primaryFlat = newlines == nlBefore
+            val mode        = c.policy.binPack match
+                case Doc.BinPackMode.OnelineIfPrimaryOneline =>
+                    if primaryFlat then Doc.BinPackMode.Oneline else Doc.BinPackMode.Never
+                case other => other
+            mode match
+                case Doc.BinPackMode.Always =>
+                    if !tryInlineChain(c, elemIndent) then
+                        if primaryFlat then emitNewline(elemIndent)
+                        var i = 0
+                        while i < c.elems.length do
+                            val atLineStart = pending >= 0
+                            if !atLineStart then
+                                val fitsHere =
+                                    flatWidth(c.elems(i)).exists(w => col + 1 + w <= width)
+                                if fitsHere then emitSpace()
+                                else emitNewline(elemIndent)
+                            end if
+                            render(c.elems(i), elemIndent, false)
+                            if i < c.elems.length - 1 then render(c.sep, elemIndent, false)
+                            i += 1
+                        end while
+                    end if
+                case Doc.BinPackMode.Oneline =>
+                    // The whole chain on one line when every parent is
+                    // single-line and it fits; the first parent follows a
+                    // broken opening inline and a flat opening on a fresh
+                    // line.
+                    val startCol = if primaryFlat then elemIndent else col
+                    val chainW   = c.elems.foldLeft(0)((acc, e) => acc + 1 + flatWidth(e).getOrElse(0))
+                    val lead     = if primaryFlat then 0 else 1
+                    val oneLine  = !c.elems.exists(isMultiline(_, elemIndent)) &&
+                        startCol + chainW - 1 + lead <= width
+                    if oneLine then
+                        if !primaryFlat then emitSpace()
+                        var i = 0
+                        while i < c.elems.length do
+                            if i > 0 then emitSpace()
+                            render(c.elems(i), elemIndent, false)
+                            i += 1
+                        end while
+                    else
+                        emitListedChain(c, elemIndent, primaryFlat)
+                    end if
+                case _ =>
+                    emitListedChain(c, elemIndent, primaryFlat)
+            end match
+            if c.close ne Doc.Empty then render(c.close, base, false)
+        end renderTemplateClause
+
+        /** Lists one parent per line; a flat opening breaks before the first
+          * parent, a broken opening has the first parent follow it inline.
+          */
+        private def emitListedChain(c: Doc.Clause, elemIndent: Int, primaryFlat: Boolean): Unit =
+            if primaryFlat then emitNewline(elemIndent)
+            else if pending < 0 then emitSpace()
+            var i = 0
+            while i < c.elems.length do
+                if i > 0 then emitNewline(elemIndent)
+                render(c.elems(i), elemIndent, false)
+                if i < c.elems.length - 1 || c.trailingSep then
+                    render(c.sep, elemIndent, false)
+                i += 1
+            end while
+        end emitListedChain
+
+        /** Renders the parents flowing from the current position with no
+          * newline between parents, returning false when that is impossible
+          * because a parent overflows the width. Interior breaks (a parent
+          * constructor's argument clause) are tolerated, matching the
+          * exclusions of scalafmt's single-line split. The attempt runs on a
+          * scratch renderer first; its output is discarded on success and
+          * the real render replays it.
+          */
+        private def tryInlineChain(c: Doc.Clause, elemIndent: Int): Boolean =
+            val probe = new Renderer(width)
+            probe.col = col
+            probe.pending = pending
+            val ok = probe.emitInlineChain(c, elemIndent)
+            if ok then emitInlineChain(c, elemIndent): Unit
+            ok
+        end tryInlineChain
+
+        private def emitInlineChain(c: Doc.Clause, elemIndent: Int): Boolean =
+            var i = 0
+            while i < c.elems.length do
+                if pending < 0 then emitSpace()
+                if col > width then return false
+                render(c.elems(i), elemIndent, false)
+                if col > width then return false
+                i += 1
+            end while
+            true
+        end emitInlineChain
 
     end Renderer
 

@@ -11,7 +11,11 @@ package kyo
   * Defaults mirror the scalafmt `default` preset: a maximum column of 80,
   * call sites indented by 2 spaces, definition and extension sites by 4,
   * dangling closing parentheses enabled, no open-parenthesis alignment, and
-  * bin-packing disabled.
+  * bin-packing disabled at every site.
+  *
+  * `clausePolicy` resolves a site into the policy the scalafmt parity engine
+  * applies; document builders call it so every layout decision stays at layout
+  * time.
   *
   * @see [[https://scalameta.github.io/scalafmt/docs/configuration.html scalafmt configuration reference]]
   */
@@ -21,7 +25,58 @@ final case class ScalafmtConfig(
     danglingParentheses: ScalafmtConfig.DanglingParentheses = ScalafmtConfig.DanglingParentheses(),
     align: ScalafmtConfig.Align = ScalafmtConfig.Align(),
     binPack: ScalafmtConfig.BinPack = ScalafmtConfig.BinPack()
-) derives CanEqual
+) derives CanEqual:
+
+    /** Resolves the clause policy the parity engine applies at a site.
+      *
+      * Each site reads its own scalafmt options: call and definition sites
+      * their indentation, dangling, alignment, and bin-packing entries, and
+      * template parent clauses the extend-site indentation and the
+      * `binPack.parentConstructors` mode (templates have no closing delimiter
+      * to dangle and no parenthesis to align by). Builders call this when
+      * constructing a [[Doc.Clause]] so every layout decision stays at layout
+      * time.
+      */
+    def clausePolicy(site: Doc.ClauseSite): Doc.ClausePolicy =
+        import ScalafmtConfig.BinPack
+        import ScalafmtConfig.BinPack.Site
+        def siteMode(mode: Site): Doc.BinPackMode = mode match
+            case Site.Never   => Doc.BinPackMode.Never
+            case Site.Always  => Doc.BinPackMode.Always
+            case Site.Oneline => Doc.BinPackMode.Oneline
+        def ctorMode(mode: BinPack.ParentCtors): Doc.BinPackMode = mode match
+            case BinPack.ParentCtors.Never                   => Doc.BinPackMode.Never
+            case BinPack.ParentCtors.Always                  => Doc.BinPackMode.Always
+            case BinPack.ParentCtors.Oneline                 => Doc.BinPackMode.Oneline
+            case BinPack.ParentCtors.OnelineIfPrimaryOneline => Doc.BinPackMode.OnelineIfPrimaryOneline
+        site match
+            case Doc.ClauseSite.Call =>
+                Doc.ClausePolicy(
+                    site = site,
+                    indent = indent.callSite,
+                    dangling = danglingParentheses.callSite,
+                    align = align.openParenCallSite,
+                    binPack = siteMode(binPack.callSite)
+                )
+            case Doc.ClauseSite.Defn =>
+                Doc.ClausePolicy(
+                    site = site,
+                    indent = indent.defnSite,
+                    dangling = danglingParentheses.defnSite,
+                    align = align.openParenDefnSite,
+                    binPack = siteMode(binPack.defnSite)
+                )
+            case Doc.ClauseSite.Extend =>
+                Doc.ClausePolicy(
+                    site = site,
+                    indent = indent.extendSite,
+                    dangling = false,
+                    align = false,
+                    binPack = ctorMode(binPack.parentConstructors)
+                )
+        end match
+    end clausePolicy
+end ScalafmtConfig
 
 object ScalafmtConfig:
 
@@ -66,28 +121,55 @@ object ScalafmtConfig:
         openParenDefnSite: Boolean = false
     ) derives CanEqual
 
-    /** Argument packing strategy at method call sites.
+    /** Argument packing strategies, one per clause site.
       *
-      * Mirrors the `binPack` section of scalafmt, restricted to `callSite`.
-      * Controls whether the arguments of a broken call are packed greedily
-      * onto each line or kept one per line.
+      * Mirrors the `binPack` section of scalafmt: `callSite` and `defnSite`
+      * pack method call arguments and definition parameters, and
+      * `parentConstructors` packs template parents (`extends` / `with`).
+      * All three default to no packing, matching the scalafmt default preset
+      * (`newlines.source = classic` resolves the upstream `parentConstructors
+      * = source` default to `Never`).
       */
     final case class BinPack(
-        callSite: ScalafmtConfig.BinPack.Site = BinPack.Site.Never
+        callSite: ScalafmtConfig.BinPack.Site = BinPack.Site.Never,
+        defnSite: ScalafmtConfig.BinPack.Site = BinPack.Site.Never,
+        parentConstructors: ScalafmtConfig.BinPack.ParentCtors = BinPack.ParentCtors.Never
     ) derives CanEqual
 
     object BinPack:
 
-        /** Selects how arguments of a broken clause are distributed across lines.
+        /** Selects how arguments of a broken call or definition clause are
+          * distributed across lines.
           *
           * `Never` disables packing: once the clause breaks, every argument
           * occupies its own line. `Always` fits as many arguments per line as
-          * the column budget allows. `Oneline` packs like `Always` but keeps
-          * multiline arguments isolated on their own lines.
+          * the column budget allows, letting a multiline argument share its
+          * last line with later arguments. `Oneline` packs like `Always` but
+          * keeps multiline arguments isolated on their own lines, breaking
+          * after the opening delimiter when the first argument is multiline.
           */
         enum Site derives CanEqual:
             case Never, Always, Oneline
         end Site
+
+        /** Selects how the parents of a broken template are distributed across
+          * lines.
+          *
+          * `Never` gives every parent its own line. `Always` packs parents,
+          * letting a multiline parent share its last line with later parents.
+          * `Oneline` packs parents only when every parent fits on a single
+          * line, and otherwise falls back to one parent per line.
+          * `OnelineIfPrimaryOneline` applies `Oneline` when the template's
+          * parameter clause renders on a single line and `Never` otherwise.
+          *
+          * The upstream `source` and `keep` values resolve through
+          * `newlines.source`, which this module does not yet model; under the
+          * default classic source they behave as `Never`, which is the
+          * default here.
+          */
+        enum ParentCtors derives CanEqual:
+            case Never, Always, Oneline, OnelineIfPrimaryOneline
+        end ParentCtors
 
     end BinPack
 

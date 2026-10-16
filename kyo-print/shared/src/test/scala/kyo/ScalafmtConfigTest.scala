@@ -46,7 +46,7 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
         }
 
     /** Definition site fixture: `def process(...)` broken according to indent,
-      * dangling, and align defn-site options.
+      * dangling, align, and binPack defn-site options.
       */
     private def defParams(params: (String, String)*): Doc < Env[ScalafmtConfig] =
         Env.use[ScalafmtConfig] { config =>
@@ -56,6 +56,8 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             val close = Doc.text(")")
             if config.align.openParenDefnSite then
                 docs.hang(open, sep, close)
+            else if config.binPack.defnSite != ScalafmtConfig.BinPack.Site.Never then
+                docs.wrap(open, sep, close)
             else if config.danglingParentheses.defnSite then
                 docs.chop(open, sep, close, config.indent.defnSite)
             else
@@ -85,10 +87,46 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(!config.align.openParenCallSite)
             assert(!config.align.openParenDefnSite)
             assert(config.binPack.callSite == ScalafmtConfig.BinPack.Site.Never)
+            assert(config.binPack.defnSite == ScalafmtConfig.BinPack.Site.Never)
+            assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Never)
         }
 
         "construction without arguments yields the default preset" in {
             assert(ScalafmtConfig() == ScalafmtConfig.default)
+        }
+    }
+
+    "clausePolicy" - {
+        "resolves every site from its own options" in {
+            val config = ScalafmtConfig(
+                indent = ScalafmtConfig.Indent(callSite = 3, defnSite = 5, extendSite = 6),
+                danglingParentheses = ScalafmtConfig.DanglingParentheses(callSite = false),
+                align = ScalafmtConfig.Align(openParenDefnSite = true),
+                binPack = ScalafmtConfig.BinPack(
+                    callSite = ScalafmtConfig.BinPack.Site.Oneline,
+                    defnSite = ScalafmtConfig.BinPack.Site.Always,
+                    parentConstructors = ScalafmtConfig.BinPack.ParentCtors.OnelineIfPrimaryOneline
+                )
+            )
+            val call = config.clausePolicy(Doc.ClauseSite.Call)
+            assert(call.site == Doc.ClauseSite.Call)
+            assert(call.indent == 3 && !call.dangling && !call.align)
+            assert(call.binPack == Doc.BinPackMode.Oneline)
+            val defn = config.clausePolicy(Doc.ClauseSite.Defn)
+            assert(defn.site == Doc.ClauseSite.Defn)
+            assert(defn.indent == 5 && defn.dangling && defn.align)
+            assert(defn.binPack == Doc.BinPackMode.Always)
+            val extend = config.clausePolicy(Doc.ClauseSite.Extend)
+            assert(extend.site == Doc.ClauseSite.Extend)
+            assert(extend.indent == 6 && !extend.dangling && !extend.align)
+            assert(extend.binPack == Doc.BinPackMode.OnelineIfPrimaryOneline)
+        }
+
+        "defaults resolve to no packing at every site" in {
+            val config = ScalafmtConfig.default
+            assert(config.clausePolicy(Doc.ClauseSite.Call).binPack == Doc.BinPackMode.Never)
+            assert(config.clausePolicy(Doc.ClauseSite.Defn).binPack == Doc.BinPackMode.Never)
+            assert(config.clausePolicy(Doc.ClauseSite.Extend).binPack == Doc.BinPackMode.Never)
         }
     }
 
@@ -245,19 +283,64 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(render(config)(callArgs(args*)) == expected)
         }
 
-        "Oneline packs single-line arguments like Always" in {
-            // Oneline only isolates multiline arguments, which this fixture does not model.
-            val always = ScalafmtConfig(
+        "Oneline differs from Always on a multiline argument" in {
+            // The wrap combinator approximates packing but cannot isolate a
+            // multiline argument, so the Oneline distinction is asserted with
+            // the parity engine over a clause fixture; ScalafmtPrinterTest
+            // validates that engine byte-for-byte against scalafmt fixtures
+            // for this exact shape (classic/callsite-{always,oneline}-middle-
+            // multiline).
+            def fixture(mode: ScalafmtConfig.BinPack.Site): String =
+                val config = ScalafmtConfig(
+                    maxColumn = 40,
+                    binPack = ScalafmtConfig.BinPack(callSite = mode)
+                )
+                val beta = Doc.clause(
+                    config.clausePolicy(Doc.ClauseSite.Call),
+                    Doc.text("beta("),
+                    Doc.text(")")
+                )(Doc.text("gammaLongIdentifier1"), Doc.text("gammaLongIdentifier2"))
+                val clause = Doc.clause(
+                    config.clausePolicy(Doc.ClauseSite.Call),
+                    Doc.text("program("),
+                    Doc.text(")")
+                )(Chunk(Doc.text("aaaa"), beta, Doc.text("cccc")))
+                Printer.scalafmt.print(clause, config.maxColumn)
+            end fixture
+            assert(fixture(ScalafmtConfig.BinPack.Site.Always) ==
+                """program(aaaa,
+                  |  beta(gammaLongIdentifier1,
+                  |    gammaLongIdentifier2), cccc)""".stripMargin)
+            assert(fixture(ScalafmtConfig.BinPack.Site.Oneline) ==
+                """program(aaaa,
+                  |  beta(gammaLongIdentifier1,
+                  |    gammaLongIdentifier2),
+                  |  cccc)""".stripMargin)
+            assert(
+                fixture(ScalafmtConfig.BinPack.Site.Oneline) !=
+                    fixture(ScalafmtConfig.BinPack.Site.Always)
+            )
+        }
+
+        "defnSite Always packs parameters onto lines as the budget allows" in {
+            val config = ScalafmtConfig(
                 maxColumn = 30,
                 binPack =
-                    ScalafmtConfig.BinPack(callSite = ScalafmtConfig.BinPack.Site.Always)
+                    ScalafmtConfig.BinPack(defnSite = ScalafmtConfig.BinPack.Site.Always)
             )
-            val oneline = ScalafmtConfig(
-                maxColumn = 30,
-                binPack =
-                    ScalafmtConfig.BinPack(callSite = ScalafmtConfig.BinPack.Site.Oneline)
-            )
-            assert(render(oneline)(callArgs(args*)) == render(always)(callArgs(args*)))
+            // The wrap approximation aligns continuation lines under the
+            // opening delimiter rather than at the defn-site indent; the
+            // parity engine renders the documented indent (see
+            // ScalafmtPrinterTest's defnSite oracle fixtures).
+            val expected =
+                """def process(alpha: Int,
+                  |            beta: String,
+                  |            gammaLongIdentifier: Boolean)""".stripMargin
+            assert(render(config)(defParams(
+                ("alpha", "Int"),
+                ("beta", "String"),
+                ("gammaLongIdentifier", "Boolean")
+            )) == expected)
         }
     }
 

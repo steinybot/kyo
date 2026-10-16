@@ -53,7 +53,7 @@ class DocTest extends kyo.test.Test[Any]:
         }
 
         "Clause" in {
-            val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, ScalafmtConfig.BinPack.Site.Never)
+            val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, Doc.BinPackMode.Never)
             val cl     = Doc.Clause(policy, a, b, Chunk(a, b), Doc.text(","), trailingSep = true, forcedOpen = true)
             assert(cl.policy == policy)
             assert(cl.open == a && cl.close == b)
@@ -63,7 +63,7 @@ class DocTest extends kyo.test.Test[Any]:
     }
 
     "clause" - {
-        val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, ScalafmtConfig.BinPack.Site.Never)
+        val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, Doc.BinPackMode.Never)
 
         "empty elements degenerate to open and close" in {
             assert(Doc.clause(policy, a, b)(Chunk.empty) == Doc.Concat(a, b))
@@ -243,16 +243,16 @@ class DocTest extends kyo.test.Test[Any]:
     "pattern matching" in {
         def describe(doc: Doc): String =
             doc match
-                case Doc.Empty                                    => "empty"
-                case Doc.Text(t)                                  => s"text($t)"
-                case Doc.Newline                                  => "newline"
-                case Doc.HardNewline                              => "hardNewline"
-                case Doc.Indent(n, d)                             => s"indent($n, ${describe(d)})"
-                case Doc.Align(d)                                 => s"align(${describe(d)})"
-                case Doc.Concat(d1, d2)                           => s"concat(${describe(d1)}, ${describe(d2)})"
-                case Doc.Group(d)                                 => s"group(${describe(d)})"
-                case Doc.Choice(broken, flat)                     => s"choice(${describe(broken)}, ${describe(flat)})"
-                case Doc.Clause(p, open, close, elems, sep, _, _) =>
+                case Doc.Empty                                       => "empty"
+                case Doc.Text(t)                                     => s"text($t)"
+                case Doc.Newline                                     => "newline"
+                case Doc.HardNewline                                 => "hardNewline"
+                case Doc.Indent(n, d)                                => s"indent($n, ${describe(d)})"
+                case Doc.Align(d)                                    => s"align(${describe(d)})"
+                case Doc.Concat(d1, d2)                              => s"concat(${describe(d1)}, ${describe(d2)})"
+                case Doc.Group(d)                                    => s"group(${describe(d)})"
+                case Doc.Choice(broken, flat)                        => s"choice(${describe(broken)}, ${describe(flat)})"
+                case Doc.Clause(p, open, close, elems, sep, _, _, _) =>
                     s"clause(${p.site}, ${describe(open)}, ${describe(close)}, ${elems.length}, ${describe(sep)})"
 
         assert(describe(Doc.Empty) == "empty")
@@ -271,7 +271,7 @@ class DocTest extends kyo.test.Test[Any]:
                     2,
                     true,
                     false,
-                    ScalafmtConfig.BinPack.Site.Never
+                    Doc.BinPackMode.Never
                 ),
                 a,
                 b,

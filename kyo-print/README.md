@@ -14,7 +14,7 @@ val args = Chunk(Doc.text("alpha"), Doc.text("beta"), Doc.text("gamma"))
 
 A `Doc` is a description of a layout, not a string. You build an immutable tree of text, indentation, line breaks, and grouped alternatives; nothing decides where lines break until a `Printer` renders the tree against a column budget. The same `Doc` renders wide, narrow, or fully minified without being rebuilt. The vocabulary is small: soft line breaks (`Doc.newline`) collapse to a single space when their enclosing group fits; hard line breaks (`Doc.hardNewline`) always emit a newline; `Doc.group` marks a region the printer may flatten as a unit; `Doc.choice` offers explicit alternative layouts that the printer selects between; `Doc.indent` and `Doc.align` control where broken lines continue.
 
-Documents are usually authored with the `doc` string interpolator, whose source indentation is normalized away so templates read like their output, and rendered with one of three engines: `Printer.greedy` (linear-time Wadler-Lindig lookahead), `Printer.optimal` (dynamic-programming search minimizing overflow, then line count), or `Printer.compact` (minified single-line output). For code-generation work that must reproduce scalafmt's documented break styles, `ScalafmtConfig` models the relevant option subset (max column, per-site indents, dangling parens, open-paren alignment, bin-packing) as an inert configuration value that user code reads to select among the bracketing combinators.
+Documents are usually authored with the `doc` string interpolator, whose source indentation is normalized away so templates read like their output, and rendered with one of three engines: `Printer.greedy` (linear-time Wadler-Lindig lookahead), `Printer.optimal` (dynamic-programming search minimizing overflow, then line count), or `Printer.compact` (minified single-line output). For code-generation work that must reproduce scalafmt's documented break styles, `ScalafmtConfig` models the relevant option subset (max column, per-site indents, dangling parens, open-paren alignment, bin-packing) as an inert configuration value; user code either maps it to the bracketing combinators or hands it to `Printer.scalafmt`, the parity engine that resolves the same options at layout time over policy-carrying clauses.
 
 The module compiles for JVM, JavaScript, Scala Native, and Wasm from one shared source set and depends only on `kyo-prelude`.
 
@@ -440,7 +440,7 @@ All three engines implement `printStream`, and a stream's concatenation always e
 
 ## Configuring scalafmt-compatible styles
 
-When generated code must be formatted the way scalafmt formats it, the decisions map to this module's combinators, and `ScalafmtConfig` carries the option values that drive the mapping. It models the scalafmt subset that governs clause breaking: maximum column, per-site indents, dangling parentheses, open-parenthesis alignment, and call-site bin-packing. Defaults match the scalafmt `default` preset.
+When generated code must be formatted the way scalafmt formats it, the decisions map to this module's combinators, and `ScalafmtConfig` carries the option values that drive the mapping. It models the scalafmt subset that governs clause breaking: maximum column, per-site indents, dangling parentheses, open-parenthesis alignment, and bin-packing at call sites, definition sites, and template parent constructors. Defaults match the scalafmt `default` preset.
 
 ```scala
 val config = ScalafmtConfig.default
@@ -454,15 +454,17 @@ assert(config.danglingParentheses.defnSite)
 assert(!config.align.openParenCallSite)
 assert(!config.align.openParenDefnSite)
 assert(config.binPack.callSite == ScalafmtConfig.BinPack.Site.Never)
+assert(config.binPack.defnSite == ScalafmtConfig.BinPack.Site.Never)
+assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Never)
 ```
 
-The nested types each mirror one scalafmt section: `Indent` (`callSite`, `defnSite`, `extendSite`), `DanglingParentheses` (`callSite`, `defnSite`), `Align` (`openParenCallSite`, `openParenDefnSite`, both off by default as in scalafmt since v1.6), and `BinPack.Site` (`Never`, `Always`, `Oneline`).
+The nested types each mirror one scalafmt section: `Indent` (`callSite`, `defnSite`, `extendSite`), `DanglingParentheses` (`callSite`, `defnSite`), `Align` (`openParenCallSite`, `openParenDefnSite`, both off by default as in scalafmt since v1.6), and `BinPack`: `callSite` and `defnSite` take a `Site` (`Never`, `Always`, `Oneline`) while `parentConstructors` takes a `ParentCtors` (`Never`, `Always`, `Oneline`, `OnelineIfPrimaryOneline`). The constructor default of `Never` mirrors scalafmt's `parentConstructors = source` under its default classic newline source, which resolves to `Never`.
 
 > **Note:** `ScalafmtConfig` is an inert option model. Nothing in the module reads it automatically; user code maps options to combinators itself, as below. Unlike the bracketing combinators' default indent of 4, `indent.callSite` defaults to 2, so passing configuration through means threading the explicit indent parameter rather than relying on defaults.
 
 ### Reading options, selecting combinators
 
-Because the config is data, the idiomatic pattern is a function from config to `Doc` that reads the options from the environment and selects the matching combinator: alignment turns on `hang`, dangling parentheses choose between `chop` and `chopClosed`, and bin-packing selects `wrap`. Alignment takes precedence over bin-packing, mirroring how scalafmt disables packing when arguments align to the opening parenthesis.
+Because the config is data, the idiomatic pattern is a function from config to `Doc` that reads the options from the environment and selects the matching combinator: alignment turns on `hang`, dangling parentheses choose between `chop` and `chopClosed`, and bin-packing selects `wrap`. This mapping decides the bracketing at construction time, which approximates scalafmt for these shapes; the parity engine below covers the cases a construction-time decision cannot express.
 
 ```scala
 def renderCall(call: Call): Doc < Env[ScalafmtConfig] =
@@ -532,6 +534,42 @@ assert(
 ```
 
 The same pattern extends to definition sites (reading `indent.defnSite`, `danglingParentheses.defnSite`, and `align.openParenDefnSite` for `def` parameter lists) and to template bodies (indenting `extends` and `with` clauses by `indent.extendSite` once the template breaks).
+
+### The parity engine
+
+Scalafmt decides how a clause breaks during layout, conditioned on what else broke: `Oneline` bin-packing treats an argument that itself spans lines differently from `Always`, a template's parent packing depends on whether the parameter clause stayed on one line, and source line breaks fold or persist per scalafmt's classic rules. Construction-time combinator choice cannot express those, so `Printer.scalafmt` renders a `Doc.clause`: the clause carries a site policy, resolved from the config by `clausePolicy`, and the engine makes every decision against the width alone. Its output is validated byte-for-byte against fixtures committed from scalafmt's own test suite.
+
+```scala
+val oneline = ScalafmtConfig(
+    maxColumn = 40,
+    binPack =
+        ScalafmtConfig.BinPack(callSite = ScalafmtConfig.BinPack.Site.Oneline)
+)
+val always = oneline.copy(binPack =
+    ScalafmtConfig.BinPack(callSite = ScalafmtConfig.BinPack.Site.Always)
+)
+
+def call(config: ScalafmtConfig, fn: String, args: Doc*): Doc =
+    Doc.clause(config.clausePolicy(Doc.ClauseSite.Call), Doc.text(s"$fn("), Doc.text(")"))(
+        Chunk.from(args)
+    )
+
+// The nested call cannot fit on one line, so it is a multiline argument.
+val beta = call(oneline, "beta", Doc.text("gammaLongIdentifier1"), Doc.text("gammaLongIdentifier2"))
+
+// Oneline isolates a multiline argument on its own lines.
+assert(Printer.scalafmt.print(call(oneline, "program", Doc.text("aaaa"), beta, Doc.text("cccc")), 40) ==
+    """program(aaaa,
+      |  beta(gammaLongIdentifier1,
+      |    gammaLongIdentifier2),
+      |  cccc)""".stripMargin)
+
+// Always lets later arguments share the multiline argument's last line.
+assert(Printer.scalafmt.print(call(always, "program", Doc.text("aaaa"), beta, Doc.text("cccc")), 40) ==
+    """program(aaaa,
+      |  beta(gammaLongIdentifier1,
+      |    gammaLongIdentifier2), cccc)""".stripMargin)
+```
 
 ## Putting it together
 

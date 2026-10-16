@@ -68,7 +68,8 @@ object Doc:
         elems: Chunk[Doc],
         sep: Doc = Text(","),
         trailingSep: Boolean = false,
-        forcedOpen: Boolean = false
+        forcedOpen: Boolean = false,
+        forcedClose: Boolean = false
     ) extends Doc
 
     /** The kind of source construct a [[Clause]] represents.
@@ -83,6 +84,21 @@ object Doc:
         case Call, Defn, Extend
     end ClauseSite
 
+    /** How the elements of a broken clause are distributed across lines, as
+      * resolved from a `ScalafmtConfig` by the document builder.
+      *
+      * `Never` places one element per line. `Always` packs greedily by column
+      * budget, letting a multiline element share its last line with later
+      * elements. `Oneline` packs like `Always` but keeps multiline elements
+      * isolated on their own lines. `OnelineIfPrimaryOneline` is a template
+      * rule only: it applies `Oneline` when the clause's opening (the
+      * template's parameter clause) rendered on a single line and `Never`
+      * otherwise.
+      */
+    enum BinPackMode derives CanEqual:
+        case Never, Always, Oneline, OnelineIfPrimaryOneline
+    end BinPackMode
+
     /** Layout policy for a [[Clause]], resolved from a ScalafmtConfig by the
       * document builder.
       *
@@ -92,16 +108,15 @@ object Doc:
       * bin-packing, or template breaking), `indent` is the continuation indent
       * in spaces applied relative to the clause's base, `dangling` places the
       * closing delimiter on its own line when the clause breaks, `align`
-      * aligns continuation lines under the opening delimiter and takes
-      * precedence over bin-packing, and `binPack` selects the element packing
-      * strategy.
+      * aligns continuation lines under the opening delimiter, and `binPack`
+      * selects the element packing strategy.
       */
     final case class ClausePolicy(
         site: Doc.ClauseSite,
         indent: Int,
         dangling: Boolean,
         align: Boolean,
-        binPack: ScalafmtConfig.BinPack.Site
+        binPack: Doc.BinPackMode
     ) derives CanEqual
 
     val empty: Doc = Empty
@@ -170,9 +185,12 @@ object Doc:
       * arguments or parameters, and `sep` is the bare separator emitted after
       * each element; a single space is added between elements when flat. An
       * empty separator models a space-joined keyword list such as a template
-      * parent clause. `forcedOpen` records that the source had a line break
-      * after the opening delimiter, which forces the broken form. A clause
-      * without elements degenerates to `open` followed by `close`.
+      * parent clause. `forcedOpen` and `forcedClose` record that the source
+      * had a line break after the opening delimiter and before the closing
+      * delimiter; under the classic newline source the engine folds a break
+      * at only one delimiter and preserves the broken form when the source
+      * broke at both. A clause without elements degenerates to `open`
+      * followed by `close`.
       */
     def clause(
         policy: ClausePolicy,
@@ -180,10 +198,11 @@ object Doc:
         close: Doc,
         sep: Doc,
         trailingSep: Boolean,
-        forcedOpen: Boolean
+        forcedOpen: Boolean,
+        forcedClose: Boolean
     )(elems: Chunk[Doc]): Doc =
         if elems.isEmpty then open.append(close)
-        else Clause(policy, open, close, elems, sep, trailingSep, forcedOpen)
+        else Clause(policy, open, close, elems, sep, trailingSep, forcedOpen, forcedClose)
     end clause
 
     def clause(
@@ -192,17 +211,60 @@ object Doc:
         close: Doc,
         sep: Doc,
         trailingSep: Boolean,
-        forcedOpen: Boolean
+        forcedOpen: Boolean,
+        forcedClose: Boolean
     )(first: Doc, rest: Doc*): Doc =
-        clause(policy, open, close, sep, trailingSep, forcedOpen)(Chunk.from(first +: rest))
-
-    def clause(policy: ClausePolicy, open: Doc, close: Doc)(elems: Chunk[Doc]): Doc =
-        clause(policy, open, close, Text(","), trailingSep = false, forcedOpen = false)(elems)
-
-    def clause(policy: ClausePolicy, open: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
-        clause(policy, open, close, Text(","), trailingSep = false, forcedOpen = false)(
+        clause(policy, open, close, sep, trailingSep, forcedOpen, forcedClose)(
             Chunk.from(first +: rest)
         )
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc, sep: Doc)(elems: Chunk[Doc]): Doc =
+        clause(
+            policy,
+            open,
+            close,
+            sep,
+            trailingSep = false,
+            forcedOpen = false,
+            forcedClose =
+                false
+        )(elems)
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc, sep: Doc)(first: Doc, rest: Doc*): Doc =
+        clause(
+            policy,
+            open,
+            close,
+            sep,
+            trailingSep = false,
+            forcedOpen = false,
+            forcedClose =
+                false
+        )(Chunk.from(first +: rest))
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc)(elems: Chunk[Doc]): Doc =
+        clause(
+            policy,
+            open,
+            close,
+            Text(","),
+            trailingSep = false,
+            forcedOpen = false,
+            forcedClose =
+                false
+        )(elems)
+
+    def clause(policy: ClausePolicy, open: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
+        clause(
+            policy,
+            open,
+            close,
+            Text(","),
+            trailingSep = false,
+            forcedOpen = false,
+            forcedClose =
+                false
+        )(Chunk.from(first +: rest))
 
     /** Approximates a clause with the Wadler-style combinators so the generic
       * printers can render it; the scalafmt printer interprets the policy
@@ -219,13 +281,14 @@ object Doc:
                     c.elems.take(c.elems.length - 1) :+ c.elems.last.append(c.sep)
                 else c.elems
             end elems
+            val preservedBroken = c.forcedOpen && c.forcedClose
             if extend then
                 lowerExtend(c, elems)
-            else if c.forcedOpen then
+            else if preservedBroken then
                 lowerBroken(c, elems)
             else if c.policy.align then
                 hang(c.open, c.sep, c.close)(elems)
-            else if c.policy.binPack != ScalafmtConfig.BinPack.Site.Never then
+            else if c.policy.binPack != BinPackMode.Never then
                 wrap(c.open, c.sep, c.close)(elems)
             else
                 val broken = lowerBroken(c, elems)
@@ -236,13 +299,9 @@ object Doc:
     end lowerClause
 
     private def lowerExtend(c: Clause, elems: Chunk[Doc]): Doc =
-        if c.forcedOpen then
-            c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
-        else
-            val broken = c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
-            val flat   = c.open.append(separate(singleSpace)(elems))
-            group(choice(broken, flat))
-        end if
+        val broken = c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
+        val flat   = c.open.append(separate(singleSpace)(elems))
+        group(choice(broken, flat))
     end lowerExtend
 
     private def lowerBroken(c: Clause, elems: Chunk[Doc]): Doc =
