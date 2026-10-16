@@ -1,0 +1,223 @@
+<<< callsite-always-middle-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-oneline-middle-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-always-first-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-oneline-first-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-always-last-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, bbbb, beta(gammaLongIdentifier1, gammaLongIdentifier2))
+}
+<<< callsite-oneline-last-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, bbbb, beta(gammaLongIdentifier1, gammaLongIdentifier2))
+}
+<<< callsite-always-flat
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-oneline-flat
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-oneline-first-multiline-closed
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+danglingParentheses.callSite = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-always-two-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), delta(epsilonLongIdentifier1, epsilonLongIdentifier2), aaaa)
+}
+<<< callsite-oneline-two-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), delta(epsilonLongIdentifier1, epsilonLongIdentifier2), aaaa)
+}
+<<< callsite-always-align-openparen
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+align.openParenCallSite = true
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-always-align-flat
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+align.openParenCallSite = true
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-always-source-open-break-joined
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-never-single-source-break-folded
+---
+object a {
+  send(
+    alpha, beta, gammaLongIdentifier)
+}
+<<< callsite-never-both-source-breaks-preserved
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< defnsite-always
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< defnsite-oneline
+binPack.defnSite = oneline
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< defnsite-always-multiline-param
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def f(a: Int, b: LongTypeBB = defaultExpression(argumentA, argumentB), c: Int): Unit = ()
+}
+<<< defnsite-oneline-multiline-param
+binPack.defnSite = oneline
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def f(a: Int, b: LongTypeBB = defaultExpression(argumentA, argumentB), c: Int): Unit = ()
+}
+<<< defnsite-always-source-open-break-joined
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(
+    alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< parentconstructors-always-multiline-parent
+binPack.parentConstructors = always
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-never-multiline-parent
+binPack.parentConstructors = never
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-oneline-multiline-parent
+binPack.parentConstructors = oneline
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-onelineifprimaryoneline-multiline-parent
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-always-primary-flat
+binPack.parentConstructors = always
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-oneline-primary-flat
+binPack.parentConstructors = oneline
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-onelineifprimaryoneline-primary-flat
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-always-primary-broken
+binPack.parentConstructors = always
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-oneline-primary-broken
+binPack.parentConstructors = oneline
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-onelineifprimaryoneline-primary-broken
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-always-midlist-multiline
+binPack.parentConstructors = always
+---
+object a {
+  trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
+}
+<<< parentconstructors-oneline-midlist-multiline
+binPack.parentConstructors = oneline
+---
+object a {
+  trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
+}

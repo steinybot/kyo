@@ -14,8 +14,8 @@ class ScalafmtOracleTest extends kyo.test.Test[Any]:
 
         "contains fixtures from every harvested family" in {
             val families = ScalafmtOracle.cases.map(_.family).toSet
-            assert(families == Set("binPack", "optIn", "docs"))
-            assert(ScalafmtOracle.cases.length >= 250)
+            assert(families == Set("binPack", "optIn", "docs", "classic"))
+            assert(ScalafmtOracle.cases.length >= 300)
         }
 
         "ids are unique and traceable to a corpus file and case name" in {
