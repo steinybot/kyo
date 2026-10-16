@@ -624,6 +624,222 @@ class ScalafmtPrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "oracle parity: configStyleArguments" - {
+
+        def callClause(
+            config: ScalafmtConfig,
+            open: String,
+            elems: Seq[String],
+            forcedOpen: Boolean = false,
+            forcedClose: Boolean = false
+        ): Doc =
+            Doc.clause(
+                callPolicy(config),
+                Doc.text(open),
+                Doc.text(")"),
+                sep = Doc.text(","),
+                trailingSep = false,
+                forcedOpen = forcedOpen,
+                forcedClose = forcedClose
+            )(texts(elems*))
+
+        def defnClause(
+            config: ScalafmtConfig,
+            elems: Seq[String],
+            forcedOpen: Boolean = false,
+            forcedClose: Boolean = false
+        ): Doc =
+            Doc.clause(
+                defnPolicy(config),
+                Doc.text("def f("),
+                Doc.text("): Unit"),
+                sep = Doc.text(","),
+                trailingSep = false,
+                forcedOpen = forcedOpen,
+                forcedClose = forcedClose
+            )(texts(elems*)).append(Doc.text(" = ()"))
+
+        val default  = ScalafmtConfig(maxColumn = 40)
+        val noDangle = ScalafmtConfig(
+            maxColumn = 40,
+            danglingParentheses = ScalafmtConfig.DanglingParentheses(callSite = false)
+        )
+        val noDangleDefn = ScalafmtConfig(
+            maxColumn = 40,
+            danglingParentheses = ScalafmtConfig.DanglingParentheses(defnSite = false)
+        )
+        val noPrefer = ScalafmtConfig(
+            maxColumn = 40,
+            configStyle = ScalafmtConfig.ConfigStyle(callSite = false)
+        )
+        val aligned = ScalafmtConfig(
+            maxColumn = 40,
+            align = ScalafmtConfig.Align(openParenCallSite = true)
+        )
+        val always = ScalafmtConfig(
+            maxColumn = 40,
+            binPack = ScalafmtConfig.BinPack(callSite = ScalafmtConfig.BinPack.Site.Always)
+        )
+        val alwaysNoPrefer = always.copy(
+            configStyle = ScalafmtConfig.ConfigStyle(callSite = false)
+        )
+        val alwaysNoDangle = always.copy(
+            danglingParentheses = ScalafmtConfig.DanglingParentheses(callSite = false)
+        )
+        val literals = Seq("aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee")
+
+        "a close break alone folds when it fits" in {
+            val c      = caseById("classic/cfgstyle-close-break-alone-folded.stat:example")
+            val clause = callClause(
+                default,
+                "send(",
+                Seq("alpha", "beta", "gammaLongIdentifier"),
+                forcedClose = true
+            )
+            assert(render(obj("object a {")(clause), default) == c.expected)
+        }
+
+        "a close break alone folds at a definition site" in {
+            val c      = caseById("classic/cfgstyle-defnsite-close-break-alone-folded.stat:example")
+            val clause = defnClause(default, Seq("a: Int", "b: String"), forcedClose = true)
+            assert(render(obj("object a {")(clause), default) == c.expected)
+        }
+
+        "breaks at both delimiters preserve the config-style form" in {
+            val c      = caseById("classic/cfgstyle-defnsite-both-breaks-preserved.stat:example")
+            val clause =
+                defnClause(
+                    default,
+                    Seq("a: Int", "b: String"),
+                    forcedOpen = true,
+                    forcedClose = true
+                )
+            assert(render(obj("object a {")(clause), default) == c.expected)
+        }
+
+        "turning the preference off folds breaks at both delimiters" in {
+            val c      = caseById("classic/cfgstyle-prefer-false-both-breaks-folded.stat:example")
+            val clause =
+                callClause(
+                    noPrefer,
+                    "send(",
+                    Seq("alpha", "beta", "gamma"),
+                    forcedOpen = true,
+                    forcedClose = true
+                )
+            assert(render(obj("object a {")(clause), noPrefer) == c.expected)
+        }
+
+        "without dangling, a close break preserves the config-style form (scala.js rule)" in {
+            val c      = caseById("classic/cfgstyle-scalajs-close-break-preserved.stat:example")
+            val clause = callClause(
+                noDangle,
+                "send(",
+                Seq("alpha", "beta", "gammaLongIdentifier"),
+                forcedClose = true
+            )
+            assert(render(obj("object a {")(clause), noDangle) == c.expected)
+        }
+
+        "without dangling at a definition site, a close break preserves config style" in {
+            val c      = caseById("classic/cfgstyle-defnsite-scalajs-close-break-preserved.stat:example")
+            val clause = defnClause(noDangleDefn, Seq("a: Int", "b: String"), forcedClose = true)
+            assert(render(obj("object a {")(clause), noDangleDefn) == c.expected)
+        }
+
+        "alignment does not block config-style preservation and is not applied to it" in {
+            val c      = caseById("classic/cfgstyle-align-both-breaks-preserved.stat:example")
+            val clause =
+                callClause(
+                    aligned,
+                    "send(",
+                    Seq("alpha", "beta", "gamma"),
+                    forcedOpen = true,
+                    forcedClose = true
+                )
+            assert(render(obj("object a {")(clause), aligned) == c.expected)
+        }
+
+        "config-style preservation overrides bin-packing" in {
+            val c      = caseById("classic/binpack-always-configstyle-both-breaks.stat:example")
+            val clause = callClause(
+                always,
+                "program(",
+                literals,
+                forcedOpen = true,
+                forcedClose = true
+            )
+            assert(render(obj("object a {")(clause), always) == c.expected)
+        }
+
+        "without the preference, bin-packing keeps both delimiter breaks and packs between" in {
+            val c      = caseById("classic/binpack-always-prefer-false-both-breaks-kept.stat:example")
+            val clause = callClause(
+                alwaysNoPrefer,
+                "program(",
+                literals,
+                forcedOpen = true,
+                forcedClose = true
+            )
+            assert(render(obj("object a {")(clause), alwaysNoPrefer) == c.expected)
+        }
+
+        "without dangling, bin-packing yields to a close break (scala.js rule)" in {
+            val c      = caseById("classic/binpack-always-scalajs-close-break-preserved.stat:example")
+            val clause =
+                callClause(
+                    alwaysNoDangle,
+                    "program(",
+                    Seq("alpha", "beta", "gamma"),
+                    forcedClose = true
+                )
+            assert(render(obj("object a {")(clause), alwaysNoDangle) == c.expected)
+        }
+
+        "without the preference, a lone close break folds under bin-packing" in {
+            val c      = caseById("classic/binpack-prefer-false-close-break-folded.stat:example")
+            val clause =
+                callClause(
+                    alwaysNoPrefer,
+                    "program(",
+                    Seq("alpha", "beta", "gamma"),
+                    forcedClose = true
+                )
+            assert(render(obj("object a {")(clause), alwaysNoPrefer) == c.expected)
+        }
+
+        "newlines.configStyleDefnSite.prefer (docs/newlines-configstylexxxsite-prefer-1)" in {
+            val c      = caseById("docs/newlines-configstylexxxsite-prefer-1.stat:example")
+            val config = ScalafmtConfig(maxColumn = 45)
+            val defn1  = Doc.clause(
+                defnPolicy(config),
+                Doc.text("def method1("),
+                Doc.text("): Boolean")
+            )(texts("a: Int", "b: String"))
+            val defn2 = Doc.clause(
+                defnPolicy(config),
+                Doc.text("def method2("),
+                Doc.text("): Boolean")
+            )(texts("a: Int", "b: String", "c: String"))
+            val defn3 = Doc.clause(
+                defnPolicy(config),
+                Doc.text("def method3("),
+                Doc.text("): Boolean"),
+                sep = Doc.text(","),
+                trailingSep = false,
+                forcedOpen = true,
+                forcedClose = true
+            )(texts("a: Int", "b: String", "c: String"))
+            val body = Doc.text("// keeps single line").append(Doc.hardNewline).append(defn1)
+                .append(Doc.hardNewline).append(Doc.hardNewline).append(Doc.text("// forces config style"))
+                .append(Doc.hardNewline).append(defn2)
+                .append(Doc.hardNewline).append(Doc.hardNewline).append(Doc.text("// preserves config style"))
+                .append(Doc.hardNewline).append(defn3)
+            val doc = obj("object a {")(body)
+            assert(render(doc, config) == c.expected)
+        }
+    }
+
     "clause layout rules" - {
 
         "flat at exact fit, broken one column below" in {

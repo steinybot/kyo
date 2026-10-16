@@ -24,7 +24,8 @@ final case class ScalafmtConfig(
     indent: ScalafmtConfig.Indent = ScalafmtConfig.Indent(),
     danglingParentheses: ScalafmtConfig.DanglingParentheses = ScalafmtConfig.DanglingParentheses(),
     align: ScalafmtConfig.Align = ScalafmtConfig.Align(),
-    binPack: ScalafmtConfig.BinPack = ScalafmtConfig.BinPack()
+    binPack: ScalafmtConfig.BinPack = ScalafmtConfig.BinPack(),
+    configStyle: ScalafmtConfig.ConfigStyle = ScalafmtConfig.ConfigStyle()
 ) derives CanEqual:
 
     /** Resolves the clause policy the parity engine applies at a site.
@@ -56,7 +57,8 @@ final case class ScalafmtConfig(
                     indent = indent.callSite,
                     dangling = danglingParentheses.callSite,
                     align = align.openParenCallSite,
-                    binPack = siteMode(binPack.callSite)
+                    binPack = siteMode(binPack.callSite),
+                    configStyle = configStyle.callSite
                 )
             case Doc.ClauseSite.Defn =>
                 Doc.ClausePolicy(
@@ -64,7 +66,8 @@ final case class ScalafmtConfig(
                     indent = indent.defnSite,
                     dangling = danglingParentheses.defnSite,
                     align = align.openParenDefnSite,
-                    binPack = siteMode(binPack.defnSite)
+                    binPack = siteMode(binPack.defnSite),
+                    configStyle = configStyle.defnSite
                 )
             case Doc.ClauseSite.Extend =>
                 Doc.ClausePolicy(
@@ -72,7 +75,8 @@ final case class ScalafmtConfig(
                     indent = indent.extendSite,
                     dangling = false,
                     align = false,
-                    binPack = ctorMode(binPack.parentConstructors)
+                    binPack = ctorMode(binPack.parentConstructors),
+                    configStyle = false
                 )
         end match
     end clausePolicy
@@ -82,6 +86,23 @@ object ScalafmtConfig:
 
     /** The configuration matching the scalafmt `default` preset. */
     val default: ScalafmtConfig = ScalafmtConfig()
+
+    /** The configuration matching the scalafmt `IntelliJ` preset. */
+    val intellij: ScalafmtConfig = ScalafmtConfig(
+        indent = Indent(callSite = 2, defnSite = 2),
+        configStyle = ConfigStyle(false)
+    )
+
+    /** The configuration matching the scalafmt `Scala.js` preset. */
+    val scalaJs: ScalafmtConfig = ScalafmtConfig(
+        indent = Indent(callSite = 4, defnSite = 4),
+        danglingParentheses = DanglingParentheses(false),
+        binPack = BinPack(
+            callSite = BinPack.Site.Always,
+            defnSite = BinPack.Site.Always,
+            parentConstructors = BinPack.ParentCtors.Always
+        )
+    )
 
     /** Indentation widths applied when a construct breaks across lines.
       *
@@ -108,6 +129,11 @@ object ScalafmtConfig:
         callSite: Boolean = true,
         defnSite: Boolean = true
     ) derives CanEqual
+
+    object DanglingParentheses:
+        def apply(preset: Boolean): DanglingParentheses =
+            DanglingParentheses(callSite = preset, defnSite = preset)
+    end DanglingParentheses
 
     /** Whether line breaks align to the column of the opening parenthesis.
       *
@@ -172,5 +198,26 @@ object ScalafmtConfig:
         end ParentCtors
 
     end BinPack
+
+    /** Whether config-style formatting is preferred at a site.
+      *
+      * Mirrors `newlines.configStyleCallSite.prefer` and
+      * `newlines.configStyleDefnSite.prefer`, the v3.8.2 replacements for the
+      * single legacy `optIn.configStyleArguments` flag whose value they fall
+      * back to (and which defaulted to true). When preferred and the engine
+      * detects config style in the source, a clause renders with a break
+      * after the opening delimiter, one element per line, and a break before
+      * the closing delimiter, regardless of the dangling or bin-packing
+      * options.
+      */
+    final case class ConfigStyle(
+        callSite: Boolean = true,
+        defnSite: Boolean = true
+    ) derives CanEqual
+
+    object ConfigStyle:
+        def apply(prefer: Boolean): ConfigStyle =
+            ConfigStyle(callSite = prefer, defnSite = prefer)
+    end ConfigStyle
 
 end ScalafmtConfig

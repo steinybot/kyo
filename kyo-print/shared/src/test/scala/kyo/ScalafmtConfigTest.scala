@@ -89,10 +89,45 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.binPack.callSite == ScalafmtConfig.BinPack.Site.Never)
             assert(config.binPack.defnSite == ScalafmtConfig.BinPack.Site.Never)
             assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Never)
+            assert(config.configStyle.callSite)
+            assert(config.configStyle.defnSite)
         }
 
         "construction without arguments yields the default preset" in {
             assert(ScalafmtConfig() == ScalafmtConfig.default)
+        }
+
+        "intellij preset disables config style and sets defnSite indent to 2" in {
+            val config = ScalafmtConfig.intellij
+            assert(config.indent.callSite == 2)
+            assert(config.indent.defnSite == 2)
+            assert(!config.configStyle.callSite)
+            assert(!config.configStyle.defnSite)
+            assert(config.danglingParentheses.callSite)
+            assert(config.danglingParentheses.defnSite)
+        }
+
+        "scalaJs preset disables dangling and bin-packs always" in {
+            val config = ScalafmtConfig.scalaJs
+            assert(config.indent.callSite == 4)
+            assert(config.indent.defnSite == 4)
+            assert(!config.danglingParentheses.callSite)
+            assert(!config.danglingParentheses.defnSite)
+            assert(config.binPack.callSite == ScalafmtConfig.BinPack.Site.Always)
+            assert(config.binPack.defnSite == ScalafmtConfig.BinPack.Site.Always)
+            assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Always)
+        }
+
+        "constructors with preset/prefer flags set both call and defn sites" in {
+            val dFalse = ScalafmtConfig.DanglingParentheses(false)
+            assert(!dFalse.callSite && !dFalse.defnSite)
+            val dTrue = ScalafmtConfig.DanglingParentheses(true)
+            assert(dTrue.callSite && dTrue.defnSite)
+
+            val cFalse = ScalafmtConfig.ConfigStyle(false)
+            assert(!cFalse.callSite && !cFalse.defnSite)
+            val cTrue = ScalafmtConfig.ConfigStyle(true)
+            assert(cTrue.callSite && cTrue.defnSite)
         }
     }
 
@@ -106,16 +141,19 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
                     callSite = ScalafmtConfig.BinPack.Site.Oneline,
                     defnSite = ScalafmtConfig.BinPack.Site.Always,
                     parentConstructors = ScalafmtConfig.BinPack.ParentCtors.OnelineIfPrimaryOneline
-                )
+                ),
+                configStyle = ScalafmtConfig.ConfigStyle(callSite = false)
             )
             val call = config.clausePolicy(Doc.ClauseSite.Call)
             assert(call.site == Doc.ClauseSite.Call)
             assert(call.indent == 3 && !call.dangling && !call.align)
             assert(call.binPack == Doc.BinPackMode.Oneline)
+            assert(!call.configStyle)
             val defn = config.clausePolicy(Doc.ClauseSite.Defn)
             assert(defn.site == Doc.ClauseSite.Defn)
             assert(defn.indent == 5 && defn.dangling && defn.align)
             assert(defn.binPack == Doc.BinPackMode.Always)
+            assert(defn.configStyle)
             val extend = config.clausePolicy(Doc.ClauseSite.Extend)
             assert(extend.site == Doc.ClauseSite.Extend)
             assert(extend.indent == 6 && !extend.dangling && !extend.align)
@@ -127,6 +165,13 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.clausePolicy(Doc.ClauseSite.Call).binPack == Doc.BinPackMode.Never)
             assert(config.clausePolicy(Doc.ClauseSite.Defn).binPack == Doc.BinPackMode.Never)
             assert(config.clausePolicy(Doc.ClauseSite.Extend).binPack == Doc.BinPackMode.Never)
+        }
+
+        "defaults prefer config style at both paren sites and never at templates" in {
+            val config = ScalafmtConfig.default
+            assert(config.clausePolicy(Doc.ClauseSite.Call).configStyle)
+            assert(config.clausePolicy(Doc.ClauseSite.Defn).configStyle)
+            assert(!config.clausePolicy(Doc.ClauseSite.Extend).configStyle)
         }
     }
 

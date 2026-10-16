@@ -222,12 +222,25 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 render(c.open, base, false)
                 render(c.close, base, false)
             else
-                val preserved = c.forcedOpen && c.forcedClose
-                val fitsFlat  = !preserved && clauseFlatWidth(c).exists(col + _ <= width)
-                if fitsFlat then renderFlatClause(c, base)
+                // Config style detected in the source: a break before the
+                // closing delimiter plus either a break after the opening
+                // delimiter or the scala.js rule (no dangling and no
+                // alignment) preserves the broken form, with the close on its
+                // own line regardless of the dangling flag.
+                val preserved = c.policy.configStyle && c.forcedClose &&
+                    (c.forcedOpen || (!c.policy.dangling && !c.policy.align))
+                // Without the config-style preference, a bin-packing clause
+                // keeps source breaks at both delimiters and packs between
+                // them.
+                val keptDelims = !c.policy.configStyle && c.forcedOpen && c.forcedClose &&
+                    c.policy.binPack != Doc.BinPackMode.Never
+                val fitsFlat = !preserved && !keptDelims &&
+                    clauseFlatWidth(c).exists(col + _ <= width)
+                if preserved then renderOnePerLine(c, base, forceDangling = true, allowAlign = false)
+                else if fitsFlat then renderFlatClause(c, base)
                 else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, base)
                 else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, base)
-                else renderPacked(c, base)
+                else renderPacked(c, base, keptDelims)
                 end if
             end if
         end renderClause
@@ -250,9 +263,14 @@ private[kyo] object ScalafmtPrinter extends Printer:
             render(c.close, base, true)
         end renderFlatClause
 
-        private def renderOnePerLine(c: Doc.Clause, base: Int): Unit =
+        private def renderOnePerLine(
+            c: Doc.Clause,
+            base: Int,
+            forceDangling: Boolean = false,
+            allowAlign: Boolean = true
+        ): Unit =
             val elemIndent = base + c.policy.indent
-            if c.policy.align then
+            if allowAlign && c.policy.align then
                 render(c.open, base, false)
                 val alignCol = col
                 var i        = 0
@@ -263,7 +281,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                     i += 1
                 end while
                 if c.close ne Doc.Empty then
-                    if c.policy.dangling then emitNewline(base)
+                    if c.policy.dangling || forceDangling then emitNewline(base)
                     render(c.close, base, false)
                 end if
             else
@@ -277,7 +295,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                     i += 1
                 end while
                 if c.close ne Doc.Empty then
-                    if c.policy.dangling then emitNewline(base)
+                    if c.policy.dangling || forceDangling then emitNewline(base)
                     render(c.close, base, false)
                 end if
             end if
@@ -288,7 +306,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
           * elements and breaks after the open when the first element is
           * multiline, in which case the close dangles per policy.
           */
-        private def renderPacked(c: Doc.Clause, base: Int): Unit =
+        private def renderPacked(c: Doc.Clause, base: Int, keptDelims: Boolean = false): Unit =
             val oneline = c.policy.binPack == Doc.BinPackMode.Oneline
             render(c.open, base, false)
             // An aligning packed clause keeps continuation lines under the
@@ -297,7 +315,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 if c.policy.align then col
                 else base + c.policy.indent
             var openBroke = false
-            if oneline && isMultiline(c.elems(0), elemIndent) then
+            if keptDelims || (oneline && isMultiline(c.elems(0), elemIndent)) then
                 emitNewline(elemIndent)
                 openBroke = true
             end if
@@ -336,7 +354,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 i += 1
             end while
             if c.close ne Doc.Empty then
-                if openBroke && c.policy.dangling then emitNewline(base)
+                if openBroke && (c.policy.dangling || keptDelims) then emitNewline(base)
                 render(c.close, base, false)
             end if
         end renderPacked

@@ -108,15 +108,18 @@ object Doc:
       * bin-packing, or template breaking), `indent` is the continuation indent
       * in spaces applied relative to the clause's base, `dangling` places the
       * closing delimiter on its own line when the clause breaks, `align`
-      * aligns continuation lines under the opening delimiter, and `binPack`
-      * selects the element packing strategy.
+      * aligns continuation lines under the opening delimiter, `binPack`
+      * selects the element packing strategy, and `configStyle` lets a source
+      * layout with breaks around both delimiters render in the preserved
+      * config-style form.
       */
     final case class ClausePolicy(
         site: Doc.ClauseSite,
         indent: Int,
         dangling: Boolean,
         align: Boolean,
-        binPack: Doc.BinPackMode
+        binPack: Doc.BinPackMode,
+        configStyle: Boolean = false
     ) derives CanEqual
 
     val empty: Doc = Empty
@@ -281,7 +284,8 @@ object Doc:
                     c.elems.take(c.elems.length - 1) :+ c.elems.last.append(c.sep)
                 else c.elems
             end elems
-            val preservedBroken = c.forcedOpen && c.forcedClose
+            val preservedBroken = c.policy.configStyle && c.forcedClose &&
+                (c.forcedOpen || (!c.policy.dangling && !c.policy.align))
             if extend then
                 lowerExtend(c, elems)
             else if preservedBroken then
