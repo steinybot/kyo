@@ -1,0 +1,17 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.callSite = always
+danglingParentheses.callSite = false
+<<< example
+object a {
+  program(alpha, beta, gamma
+  )
+}
+>>>
+object a {
+  program(
+    alpha,
+    beta,
+    gamma
+  )
+}

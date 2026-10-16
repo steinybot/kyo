@@ -221,3 +221,85 @@ binPack.parentConstructors = oneline
 object a {
   trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
 }
+<<< cfgstyle-close-break-alone-folded
+---
+object a {
+  send(alpha, beta, gammaLongIdentifier
+  )
+}
+<<< cfgstyle-defnsite-close-break-alone-folded
+---
+object a {
+  def f(a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-prefer-false-both-breaks-folded
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< cfgstyle-defnsite-both-breaks-preserved
+---
+object a {
+  def f(
+    a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-scalajs-close-break-preserved
+danglingParentheses.callSite = false
+---
+object a {
+  send(alpha, beta, gammaLongIdentifier
+  )
+}
+<<< cfgstyle-defnsite-scalajs-close-break-preserved
+danglingParentheses.defnSite = false
+---
+object a {
+  def f(a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-align-both-breaks-preserved
+align.openParenCallSite = true
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< binpack-always-configstyle-both-breaks
+binPack.callSite = always
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee
+  )
+}
+<<< binpack-always-prefer-false-both-breaks-kept
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee
+  )
+}
+<<< binpack-always-scalajs-close-break-preserved
+binPack.callSite = always
+danglingParentheses.callSite = false
+---
+object a {
+  program(alpha, beta, gamma
+  )
+}
+<<< binpack-prefer-false-close-break-folded
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(alpha, beta, gamma
+  )
+}

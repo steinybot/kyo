@@ -1,0 +1,17 @@
+runner.dialect = scala213
+maxColumn = 40
+align.openParenCallSite = true
+<<< example
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+>>>
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
