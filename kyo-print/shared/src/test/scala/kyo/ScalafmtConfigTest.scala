@@ -91,6 +91,19 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Never)
             assert(config.configStyle.callSite)
             assert(config.configStyle.defnSite)
+            assert(config.newlines.source == ScalafmtConfig.Newlines.Source.Classic)
+            assert(config.newlines.beforeOpenParenCallSite.isEmpty)
+            assert(config.newlines.beforeOpenParenDefnSite.isEmpty)
+            assert(config.newlines.sometimesBeforeColonInMethodReturnType)
+            assert(config.newlines.beforeCurlyLambdaParams == ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Never)
+            assert(config.newlines.afterCurlyLambdaParams == ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Never)
+            assert(!config.newlines.beforeTemplateBodyIfBreakInParentCtors)
+            assert(!config.newlines.alwaysBeforeElseAfterCurlyIf)
+            assert(config.newlines.beforeMultiline.isEmpty)
+            assert(config.newlines.forceBeforeMultilineAssign == ScalafmtConfig.Newlines.ForceBeforeMultilineAssign.Never)
+            assert(!config.newlines.avoidInResultType)
+            assert(config.newlines.avoidAfterYield)
+            assert(!config.newlines.neverBeforeJsNative)
         }
 
         "construction without arguments yields the default preset" in {
@@ -107,7 +120,7 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.danglingParentheses.defnSite)
         }
 
-        "scalaJs preset disables dangling and bin-packs always" in {
+        "scalaJs preset disables dangling and bin-packs always with js native newlines" in {
             val config = ScalafmtConfig.scalaJs
             assert(config.indent.callSite == 4)
             assert(config.indent.defnSite == 4)
@@ -116,6 +129,9 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.binPack.callSite == ScalafmtConfig.BinPack.Site.Always)
             assert(config.binPack.defnSite == ScalafmtConfig.BinPack.Site.Always)
             assert(config.binPack.parentConstructors == ScalafmtConfig.BinPack.ParentCtors.Always)
+            assert(config.newlines.avoidInResultType)
+            assert(config.newlines.neverBeforeJsNative)
+            assert(!config.newlines.sometimesBeforeColonInMethodReturnType)
         }
 
         "constructors with preset/prefer flags set both call and defn sites" in {
@@ -142,22 +158,43 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
                     defnSite = ScalafmtConfig.BinPack.Site.Always,
                     parentConstructors = ScalafmtConfig.BinPack.ParentCtors.OnelineIfPrimaryOneline
                 ),
-                configStyle = ScalafmtConfig.ConfigStyle(callSite = false)
+                configStyle = ScalafmtConfig.ConfigStyle(callSite = false),
+                newlines = ScalafmtConfig.Newlines(
+                    source = ScalafmtConfig.Newlines.Source.Fold,
+                    beforeOpenParenCallSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Unfold),
+                    beforeOpenParenDefnSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Fold),
+                    beforeCurlyLambdaParams = ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Multiline,
+                    afterCurlyLambdaParams = ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Always
+                )
             )
             val call = config.clausePolicy(Doc.ClauseSite.Call)
             assert(call.site == Doc.ClauseSite.Call)
             assert(call.indent == 3 && !call.dangling && !call.align)
             assert(call.binPack == Doc.BinPackMode.Oneline)
             assert(!call.configStyle)
+            assert(call.source == Doc.SourcePolicy.Fold)
+            assert(call.beforeOpenParen.contains(Doc.BeforeOpenParen.Unfold))
+
             val defn = config.clausePolicy(Doc.ClauseSite.Defn)
             assert(defn.site == Doc.ClauseSite.Defn)
             assert(defn.indent == 5 && defn.dangling && defn.align)
             assert(defn.binPack == Doc.BinPackMode.Always)
             assert(defn.configStyle)
+            assert(defn.source == Doc.SourcePolicy.Fold)
+            assert(defn.beforeOpenParen.contains(Doc.BeforeOpenParen.Fold))
+
             val extend = config.clausePolicy(Doc.ClauseSite.Extend)
             assert(extend.site == Doc.ClauseSite.Extend)
             assert(extend.indent == 6 && !extend.dangling && !extend.align)
             assert(extend.binPack == Doc.BinPackMode.OnelineIfPrimaryOneline)
+            assert(extend.source == Doc.SourcePolicy.Fold)
+            assert(extend.beforeOpenParen.isEmpty)
+
+            val lambda = config.clausePolicy(Doc.ClauseSite.Lambda)
+            assert(lambda.site == Doc.ClauseSite.Lambda)
+            assert(lambda.source == Doc.SourcePolicy.Fold)
+            assert(lambda.beforeCurlyLambdaParams == Doc.BeforeCurlyLambdaParams.Multiline)
+            assert(lambda.afterCurlyLambdaParams == Doc.AfterCurlyLambdaParams.Always)
         }
 
         "defaults resolve to no packing at every site" in {
@@ -165,6 +202,11 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.clausePolicy(Doc.ClauseSite.Call).binPack == Doc.BinPackMode.Never)
             assert(config.clausePolicy(Doc.ClauseSite.Defn).binPack == Doc.BinPackMode.Never)
             assert(config.clausePolicy(Doc.ClauseSite.Extend).binPack == Doc.BinPackMode.Never)
+            assert(config.clausePolicy(Doc.ClauseSite.Call).source == Doc.SourcePolicy.Classic)
+            assert(config.clausePolicy(Doc.ClauseSite.Defn).source == Doc.SourcePolicy.Classic)
+            assert(config.clausePolicy(Doc.ClauseSite.Lambda).source == Doc.SourcePolicy.Classic)
+            assert(config.clausePolicy(Doc.ClauseSite.Lambda).beforeCurlyLambdaParams == Doc.BeforeCurlyLambdaParams.Never)
+            assert(config.clausePolicy(Doc.ClauseSite.Lambda).afterCurlyLambdaParams == Doc.AfterCurlyLambdaParams.Never)
         }
 
         "defaults prefer config style at both paren sites and never at templates" in {

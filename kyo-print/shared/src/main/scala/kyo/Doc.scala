@@ -81,8 +81,28 @@ object Doc:
       * delimiters.
       */
     enum ClauseSite derives CanEqual:
-        case Call, Defn, Extend
+        case Call, Defn, Extend, Lambda
     end ClauseSite
+
+    /** How source newlines interact with layout decisions. */
+    enum SourcePolicy derives CanEqual:
+        case Classic, Keep, Fold, Unfold
+    end SourcePolicy
+
+    /** Break policy before the opening parenthesis of a parameter group. */
+    enum BeforeOpenParen derives CanEqual:
+        case Fold, Unfold, Keep
+    end BeforeOpenParen
+
+    /** Break policy between the opening curly brace and lambda parameters. */
+    enum BeforeCurlyLambdaParams derives CanEqual:
+        case Never, Always, Multiline, MultilineWithCaseOnly
+    end BeforeCurlyLambdaParams
+
+    /** Break and blank-line policy following the arrow of a curly lambda. */
+    enum AfterCurlyLambdaParams derives CanEqual:
+        case Never, Always, Keep, Squash
+    end AfterCurlyLambdaParams
 
     /** How the elements of a broken clause are distributed across lines, as
       * resolved from a `ScalafmtConfig` by the document builder.
@@ -119,7 +139,11 @@ object Doc:
         dangling: Boolean,
         align: Boolean,
         binPack: Doc.BinPackMode,
-        configStyle: Boolean = false
+        configStyle: Boolean = false,
+        source: Doc.SourcePolicy = Doc.SourcePolicy.Classic,
+        beforeOpenParen: Option[Doc.BeforeOpenParen] = None,
+        beforeCurlyLambdaParams: Doc.BeforeCurlyLambdaParams = Doc.BeforeCurlyLambdaParams.Never,
+        afterCurlyLambdaParams: Doc.AfterCurlyLambdaParams = Doc.AfterCurlyLambdaParams.Never
     ) derives CanEqual
 
     val empty: Doc = Empty
@@ -268,6 +292,33 @@ object Doc:
             forcedClose =
                 false
         )(Chunk.from(first +: rest))
+
+    /** Builds a curly lambda clause: `{ params => body }`.
+      *
+      * `open` and `close` are the enclosing braces (defaulting to `{` and `}`),
+      * `params` is the parameter declaration or case header (e.g. `x =>`),
+      * and `body` is the lambda body. The site policy decides breaking before
+      * and after the parameters at layout time.
+      */
+    def lambda(
+        policy: ClausePolicy,
+        params: Doc,
+        body: Doc,
+        open: Doc = Text("{"),
+        close: Doc = Text("}"),
+        forcedOpen: Boolean = false,
+        forcedClose: Boolean = false
+    ): Doc =
+        Clause(
+            policy,
+            open,
+            close,
+            Chunk(params, body),
+            sep = empty,
+            trailingSep = false,
+            forcedOpen = forcedOpen,
+            forcedClose = forcedClose
+        )
 
     /** Approximates a clause with the Wadler-style combinators so the generic
       * printers can render it; the scalafmt printer interprets the policy

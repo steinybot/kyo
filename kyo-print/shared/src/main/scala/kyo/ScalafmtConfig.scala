@@ -25,7 +25,8 @@ final case class ScalafmtConfig(
     danglingParentheses: ScalafmtConfig.DanglingParentheses = ScalafmtConfig.DanglingParentheses(),
     align: ScalafmtConfig.Align = ScalafmtConfig.Align(),
     binPack: ScalafmtConfig.BinPack = ScalafmtConfig.BinPack(),
-    configStyle: ScalafmtConfig.ConfigStyle = ScalafmtConfig.ConfigStyle()
+    configStyle: ScalafmtConfig.ConfigStyle = ScalafmtConfig.ConfigStyle(),
+    newlines: ScalafmtConfig.Newlines = ScalafmtConfig.Newlines()
 ) derives CanEqual:
 
     /** Resolves the clause policy the parity engine applies at a site.
@@ -50,6 +51,25 @@ final case class ScalafmtConfig(
             case BinPack.ParentCtors.Always                  => Doc.BinPackMode.Always
             case BinPack.ParentCtors.Oneline                 => Doc.BinPackMode.Oneline
             case BinPack.ParentCtors.OnelineIfPrimaryOneline => Doc.BinPackMode.OnelineIfPrimaryOneline
+        def toDocSource(s: ScalafmtConfig.Newlines.Source): Doc.SourcePolicy = s match
+            case ScalafmtConfig.Newlines.Source.Classic => Doc.SourcePolicy.Classic
+            case ScalafmtConfig.Newlines.Source.Keep    => Doc.SourcePolicy.Keep
+            case ScalafmtConfig.Newlines.Source.Fold    => Doc.SourcePolicy.Fold
+            case ScalafmtConfig.Newlines.Source.Unfold  => Doc.SourcePolicy.Unfold
+        def toDocBop(b: ScalafmtConfig.Newlines.BeforeOpenParen): Doc.BeforeOpenParen = b match
+            case ScalafmtConfig.Newlines.BeforeOpenParen.Fold   => Doc.BeforeOpenParen.Fold
+            case ScalafmtConfig.Newlines.BeforeOpenParen.Unfold => Doc.BeforeOpenParen.Unfold
+            case ScalafmtConfig.Newlines.BeforeOpenParen.Keep   => Doc.BeforeOpenParen.Keep
+        def toDocBclp(b: ScalafmtConfig.Newlines.BeforeCurlyLambdaParams): Doc.BeforeCurlyLambdaParams = b match
+            case ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Never                 => Doc.BeforeCurlyLambdaParams.Never
+            case ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Always                => Doc.BeforeCurlyLambdaParams.Always
+            case ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Multiline             => Doc.BeforeCurlyLambdaParams.Multiline
+            case ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.MultilineWithCaseOnly => Doc.BeforeCurlyLambdaParams.MultilineWithCaseOnly
+        def toDocAclp(a: ScalafmtConfig.Newlines.AfterCurlyLambdaParams): Doc.AfterCurlyLambdaParams = a match
+            case ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Never  => Doc.AfterCurlyLambdaParams.Never
+            case ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Always => Doc.AfterCurlyLambdaParams.Always
+            case ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Keep   => Doc.AfterCurlyLambdaParams.Keep
+            case ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Squash => Doc.AfterCurlyLambdaParams.Squash
         site match
             case Doc.ClauseSite.Call =>
                 Doc.ClausePolicy(
@@ -58,7 +78,9 @@ final case class ScalafmtConfig(
                     dangling = danglingParentheses.callSite,
                     align = align.openParenCallSite,
                     binPack = siteMode(binPack.callSite),
-                    configStyle = configStyle.callSite
+                    configStyle = configStyle.callSite,
+                    source = toDocSource(newlines.source),
+                    beforeOpenParen = newlines.beforeOpenParenCallSite.map(toDocBop)
                 )
             case Doc.ClauseSite.Defn =>
                 Doc.ClausePolicy(
@@ -67,7 +89,9 @@ final case class ScalafmtConfig(
                     dangling = danglingParentheses.defnSite,
                     align = align.openParenDefnSite,
                     binPack = siteMode(binPack.defnSite),
-                    configStyle = configStyle.defnSite
+                    configStyle = configStyle.defnSite,
+                    source = toDocSource(newlines.source),
+                    beforeOpenParen = newlines.beforeOpenParenDefnSite.map(toDocBop)
                 )
             case Doc.ClauseSite.Extend =>
                 Doc.ClausePolicy(
@@ -76,7 +100,22 @@ final case class ScalafmtConfig(
                     dangling = false,
                     align = false,
                     binPack = ctorMode(binPack.parentConstructors),
-                    configStyle = false
+                    configStyle = false,
+                    source = toDocSource(newlines.source),
+                    beforeOpenParen = None
+                )
+            case Doc.ClauseSite.Lambda =>
+                Doc.ClausePolicy(
+                    site = site,
+                    indent = indent.callSite,
+                    dangling = true,
+                    align = false,
+                    binPack = Doc.BinPackMode.Never,
+                    configStyle = false,
+                    source = toDocSource(newlines.source),
+                    beforeOpenParen = None,
+                    beforeCurlyLambdaParams = toDocBclp(newlines.beforeCurlyLambdaParams),
+                    afterCurlyLambdaParams = toDocAclp(newlines.afterCurlyLambdaParams)
                 )
         end match
     end clausePolicy
@@ -101,6 +140,11 @@ object ScalafmtConfig:
             callSite = BinPack.Site.Always,
             defnSite = BinPack.Site.Always,
             parentConstructors = BinPack.ParentCtors.Always
+        ),
+        newlines = Newlines(
+            avoidInResultType = true,
+            neverBeforeJsNative = true,
+            sometimesBeforeColonInMethodReturnType = false
         )
     )
 
@@ -219,5 +263,62 @@ object ScalafmtConfig:
         def apply(prefer: Boolean): ConfigStyle =
             ConfigStyle(callSite = prefer, defnSite = prefer)
     end ConfigStyle
+
+    /** Controls line break placement, source newline interpretation, and
+      * construct-specific break policies.
+      *
+      * Mirrors the `newlines` section of scalafmt.
+      */
+    final case class Newlines(
+        source: Newlines.Source = Newlines.Source.Classic,
+        beforeOpenParenCallSite: Option[Newlines.BeforeOpenParen] = None,
+        beforeOpenParenDefnSite: Option[Newlines.BeforeOpenParen] = None,
+        sometimesBeforeColonInMethodReturnType: Boolean = true,
+        beforeCurlyLambdaParams: Newlines.BeforeCurlyLambdaParams = Newlines.BeforeCurlyLambdaParams.Never,
+        afterCurlyLambdaParams: Newlines.AfterCurlyLambdaParams = Newlines.AfterCurlyLambdaParams.Never,
+        beforeTemplateBodyIfBreakInParentCtors: Boolean = false,
+        alwaysBeforeElseAfterCurlyIf: Boolean = false,
+        beforeMultiline: Option[Newlines.Source] = None,
+        forceBeforeMultilineAssign: Newlines.ForceBeforeMultilineAssign = Newlines.ForceBeforeMultilineAssign.Never,
+        avoidInResultType: Boolean = false,
+        avoidAfterYield: Boolean = true,
+        neverBeforeJsNative: Boolean = false
+    ) derives CanEqual
+
+    object Newlines:
+
+        /** Interpretation of line breaks present in the input source.
+          *
+          * `Classic` folds single-delimiter breaks into spaces and preserves
+          * breaks at both delimiters. `Keep` preserves existing line breaks
+          * wherever valid. `Fold` ignores source breaks and collapses into
+          * horizontal layout when width permits. `Unfold` ignores source
+          * breaks and prefers vertical layout.
+          */
+        enum Source derives CanEqual:
+            case Classic, Keep, Fold, Unfold
+        end Source
+
+        /** Break policy before the opening parenthesis of a parameter group. */
+        enum BeforeOpenParen derives CanEqual:
+            case Fold, Unfold, Keep
+        end BeforeOpenParen
+
+        /** Break policy between the opening curly brace and lambda parameters. */
+        enum BeforeCurlyLambdaParams derives CanEqual:
+            case Never, Always, Multiline, MultilineWithCaseOnly
+        end BeforeCurlyLambdaParams
+
+        /** Break and blank-line policy following the arrow of a curly lambda. */
+        enum AfterCurlyLambdaParams derives CanEqual:
+            case Never, Always, Keep, Squash
+        end AfterCurlyLambdaParams
+
+        /** Whether to force a line break before the body of a multiline assignment. */
+        enum ForceBeforeMultilineAssign derives CanEqual:
+            case Never, Any, Def, AnyMember, TopMember
+        end ForceBeforeMultilineAssign
+
+    end Newlines
 
 end ScalafmtConfig

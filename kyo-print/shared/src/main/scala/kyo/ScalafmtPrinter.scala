@@ -217,31 +217,160 @@ private[kyo] object ScalafmtPrinter extends Printer:
             end match
         end render
 
+        private def probeIsCase(doc: Doc): Boolean =
+            doc match
+                case Doc.Text(t)          => t.trim.startsWith("case ")
+                case Doc.Concat(first, _) => probeIsCase(first)
+                case _                    => false
+        end probeIsCase
+
+        private def renderLambdaClause(c: Doc.Clause, base: Int): Unit =
+            val params = c.elems(0)
+            val body   = if c.elems.length > 1 then c.elems(1) else Doc.Empty
+            val bclp   = c.policy.beforeCurlyLambdaParams
+            val aclp   = c.policy.afterCurlyLambdaParams
+
+            val allowFlat = bclp != Doc.BeforeCurlyLambdaParams.Always &&
+                aclp != Doc.AfterCurlyLambdaParams.Always
+            val flatW =
+                for
+                    openW   <- flatWidth(c.open)
+                    paramsW <- flatWidth(params)
+                    bodyW   <- flatWidth(body)
+                    closeW  <- flatWidth(c.close)
+                yield openW + (if paramsW > 0 then 1 + paramsW else 0) +
+                    (if bodyW > 0 then 1 + bodyW else 0) + (if closeW > 0 then 1 + closeW else 0)
+
+            val fitsFlat = allowFlat &&
+                (aclp match
+                    case Doc.AfterCurlyLambdaParams.Squash => flatW.exists(col + _ <= width)
+                    case _                                 =>
+                        c.policy.source match
+                            case Doc.SourcePolicy.Fold => flatW.exists(col + _ <= width)
+                            case Doc.SourcePolicy.Keep => !c.forcedOpen && !c.forcedClose && flatW.exists(col + _ <= width)
+                            case _                     => !c.forcedOpen && !c.forcedClose && flatW.exists(col + _ <= width))
+
+            if fitsFlat then
+                render(c.open, base, true)
+                emitSpace()
+                render(params, base, true)
+                if body ne Doc.Empty then
+                    emitSpace()
+                    render(body, base, true)
+                end if
+                emitSpace()
+                render(c.close, base, true)
+            else
+                val elemIndent = base + c.policy.indent
+                render(c.open, base, false)
+
+                val isCase            = probeIsCase(params)
+                val breakBeforeParams = bclp match
+                    case Doc.BeforeCurlyLambdaParams.Always                => true
+                    case Doc.BeforeCurlyLambdaParams.Multiline             => true
+                    case Doc.BeforeCurlyLambdaParams.MultilineWithCaseOnly => isCase
+                    case Doc.BeforeCurlyLambdaParams.Never                 => false
+
+                val bodyFitsOnSameLine = breakBeforeParams &&
+                    !c.forcedOpen &&
+                    aclp != Doc.AfterCurlyLambdaParams.Always &&
+                    (for
+                        paramsW <- flatWidth(params)
+                        bodyW   <- flatWidth(body)
+                    yield elemIndent + paramsW + (if bodyW > 0 then 1 + bodyW else 0) <= width).getOrElse(false)
+
+                if breakBeforeParams then
+                    emitNewline(elemIndent)
+                    render(params, elemIndent, false)
+                else
+                    emitSpace()
+                    render(params, base, false)
+                end if
+
+                if body ne Doc.Empty then
+                    if bodyFitsOnSameLine then
+                        emitSpace()
+                        render(body, elemIndent, true)
+                    else
+                        val bodyIndent = elemIndent + (if breakBeforeParams then c.policy.indent else 0)
+                        aclp match
+                            case Doc.AfterCurlyLambdaParams.Always =>
+                                emitNewline(bodyIndent)
+                                emitNewline(bodyIndent)
+                            case Doc.AfterCurlyLambdaParams.Keep if c.forcedOpen =>
+                                emitNewline(bodyIndent)
+                                emitNewline(bodyIndent)
+                            case _ =>
+                                emitNewline(bodyIndent)
+                        end match
+                        render(body, bodyIndent, false)
+                    end if
+                end if
+
+                emitNewline(base)
+                render(c.close, base, false)
+            end if
+        end renderLambdaClause
+
         private def renderClause(c: Doc.Clause, base: Int): Unit =
             if c.elems.isEmpty then
                 render(c.open, base, false)
                 render(c.close, base, false)
+            else if c.policy.site == Doc.ClauseSite.Lambda then
+                renderLambdaClause(c, base)
             else
-                // Config style detected in the source: a break before the
-                // closing delimiter plus either a break after the opening
-                // delimiter or the scala.js rule (no dangling and no
-                // alignment) preserves the broken form, with the close on its
-                // own line regardless of the dangling flag.
-                val preserved = c.policy.configStyle && c.forcedClose &&
-                    (c.forcedOpen || (!c.policy.dangling && !c.policy.align))
-                // Without the config-style preference, a bin-packing clause
-                // keeps source breaks at both delimiters and packs between
-                // them.
-                val keptDelims = !c.policy.configStyle && c.forcedOpen && c.forcedClose &&
-                    c.policy.binPack != Doc.BinPackMode.Never
-                val fitsFlat = !preserved && !keptDelims &&
-                    clauseFlatWidth(c).exists(col + _ <= width)
-                if preserved then renderOnePerLine(c, base, forceDangling = true, allowAlign = false)
-                else if fitsFlat then renderFlatClause(c, base)
-                else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, base)
-                else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, base)
-                else renderPacked(c, base, keptDelims)
-                end if
+                val bop          = c.policy.beforeOpenParen
+                val needBopBreak = bop match
+                    case Some(Doc.BeforeOpenParen.Unfold) => true
+                    case Some(Doc.BeforeOpenParen.Fold)   =>
+                        clauseFlatWidth(c).fold(true)(col + _ > width)
+                    case Some(Doc.BeforeOpenParen.Keep) => c.forcedOpen
+                    case None                           => false
+                val bopIndent  = if c.policy.site == Doc.ClauseSite.Defn then 2 else c.policy.indent
+                val clauseBase = if needBopBreak then base + bopIndent else base
+                if needBopBreak then emitNewline(clauseBase)
+
+                c.policy.source match
+                    case Doc.SourcePolicy.Fold =>
+                        val fitsFlat = clauseFlatWidth(c).exists(col + _ <= width)
+                        if fitsFlat then renderFlatClause(c, clauseBase)
+                        else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, clauseBase)
+                        else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, clauseBase)
+                        else renderPacked(c, clauseBase, keptDelims = false)
+                        end if
+
+                    case Doc.SourcePolicy.Unfold =>
+                        val fitsFlat = clauseFlatWidth(c).exists(col + _ <= width) && c.elems.length <= 1
+                        if fitsFlat then renderFlatClause(c, clauseBase)
+                        else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, clauseBase)
+                        else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, clauseBase)
+                        else renderPacked(c, clauseBase, keptDelims = false)
+                        end if
+
+                    case Doc.SourcePolicy.Keep =>
+                        val hasBreak = c.forcedOpen || c.forcedClose
+                        val fitsFlat = !hasBreak && clauseFlatWidth(c).exists(col + _ <= width)
+                        if fitsFlat then renderFlatClause(c, clauseBase)
+                        else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, clauseBase)
+                        else if c.policy.binPack == Doc.BinPackMode.Never then
+                            renderOnePerLine(c, clauseBase, forceDangling = c.forcedClose)
+                        else renderPacked(c, clauseBase, keptDelims = c.forcedOpen && c.forcedClose)
+                        end if
+
+                    case Doc.SourcePolicy.Classic =>
+                        val preserved = c.policy.configStyle && c.forcedClose &&
+                            (c.forcedOpen || (!c.policy.dangling && !c.policy.align))
+                        val keptDelims = !c.policy.configStyle && c.forcedOpen && c.forcedClose &&
+                            c.policy.binPack != Doc.BinPackMode.Never
+                        val fitsFlat = !preserved && !keptDelims &&
+                            clauseFlatWidth(c).exists(col + _ <= width)
+                        if preserved then renderOnePerLine(c, clauseBase, forceDangling = true, allowAlign = false)
+                        else if fitsFlat then renderFlatClause(c, clauseBase)
+                        else if c.policy.site == Doc.ClauseSite.Extend then renderTemplateClause(c, clauseBase)
+                        else if c.policy.binPack == Doc.BinPackMode.Never then renderOnePerLine(c, clauseBase)
+                        else renderPacked(c, clauseBase, keptDelims)
+                        end if
+                end match
             end if
         end renderClause
 

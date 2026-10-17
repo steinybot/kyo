@@ -29,6 +29,9 @@ class ScalafmtPrinterTest extends kyo.test.Test[Any]:
     private def defnPolicy(config: ScalafmtConfig): Doc.ClausePolicy =
         config.clausePolicy(Doc.ClauseSite.Defn)
 
+    private def lambdaPolicy(config: ScalafmtConfig): Doc.ClausePolicy =
+        config.clausePolicy(Doc.ClauseSite.Lambda)
+
     private def obj(header: String)(body: Doc): Doc =
         Doc.text(header).append(Doc.hardNewline)
             .append(body.indent(2))
@@ -836,6 +839,372 @@ class ScalafmtPrinterTest extends kyo.test.Test[Any]:
                 .append(Doc.hardNewline).append(Doc.hardNewline).append(Doc.text("// preserves config style"))
                 .append(Doc.hardNewline).append(defn3)
             val doc = obj("object a {")(body)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.source = fold folds broken call site to flat (classic/source-fold-callsite-broken)" in {
+            val c      = caseById("classic/source-fold-callsite-broken.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Fold)
+            )
+            val clause = callClause(config, "send(", Seq("alpha", "beta", "gamma"), forcedOpen = true, forcedClose = true)
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = fold preserves flat call site (classic/source-fold-callsite-flat)" in {
+            val c      = caseById("classic/source-fold-callsite-flat.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Fold)
+            )
+            val clause = callClause(config, "send(", Seq("alpha", "beta", "gamma"))
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = fold breaks overflowing call site from broken source (classic/source-fold-callsite-overflow-broken)" in {
+            val c      = caseById("classic/source-fold-callsite-overflow-broken.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Fold)
+            )
+            val clause = callClause(
+                config,
+                "program(",
+                Seq("aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee"),
+                forcedOpen = true,
+                forcedClose = true
+            )
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = fold breaks overflowing call site from flat source (classic/source-fold-callsite-overflow-flat)" in {
+            val c      = caseById("classic/source-fold-callsite-overflow-flat.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Fold)
+            )
+            val clause = callClause(
+                config,
+                "program(",
+                Seq("aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee")
+            )
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = fold folds broken defn site to flat (classic/source-fold-defnsite-broken)" in {
+            val c      = caseById("classic/source-fold-defnsite-broken.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Fold)
+            )
+            val clause = Doc.clause(
+                defnPolicy(config),
+                Doc.text("def f("),
+                Doc.text("): Unit = ()"),
+                sep = Doc.text(","),
+                trailingSep = false,
+                forcedOpen = true,
+                forcedClose = true
+            )(texts("a: Int", "b: String"))
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = keep keeps broken call site (classic/source-keep-callsite-broken)" in {
+            val c      = caseById("classic/source-keep-callsite-broken.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Keep)
+            )
+            val clause = callClause(config, "send(", Seq("alpha", "beta", "gamma"), forcedOpen = true, forcedClose = true)
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = keep keeps flat call site flat (classic/source-keep-callsite-flat)" in {
+            val c      = caseById("classic/source-keep-callsite-flat.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Keep)
+            )
+            val clause = callClause(config, "send(", Seq("alpha", "beta", "gamma"))
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.source = keep keeps broken defn site (classic/source-keep-defnsite-broken)" in {
+            val c      = caseById("classic/source-keep-defnsite-broken.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(source = ScalafmtConfig.Newlines.Source.Keep)
+            )
+            val clause = Doc.clause(
+                defnPolicy(config),
+                Doc.text("def f("),
+                Doc.text("): Unit = ()"),
+                sep = Doc.text(","),
+                trailingSep = false,
+                forcedOpen = true,
+                forcedClose = true
+            )(texts("a: Int", "b: String"))
+            assert(render(obj("object a {")(clause), config) == c.expected)
+        }
+
+        "newlines.beforeOpenParenXxxSite (docs/newlines-beforeopenparenxxxsite-1)" in {
+            val c      = caseById("docs/newlines-beforeopenparenxxxsite-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 20,
+                align = ScalafmtConfig.Align(openParenDefnSite = true),
+                newlines = ScalafmtConfig.Newlines(
+                    beforeOpenParenDefnSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Fold),
+                    beforeOpenParenCallSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Unfold),
+                    sometimesBeforeColonInMethodReturnType = true
+                )
+            )
+            val defn1 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("foo1: String"))
+            val defn2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("foo2: String"), Doc.text("foo3: String"))
+            val defn  = Doc.text("def fooFunc")
+                .append(defn1)
+                .append(defn2)
+                .append(Doc.hardNewline)
+                .append(Doc.text("  : String = ???"))
+            val call1 = Doc.clause(callPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("\"foo1\""))
+            val call2 = Doc.clause(callPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("\"foo2\""), Doc.text("\"foo3\""))
+            val call  = Doc.text("val res = fooFunc")
+                .append(call1)
+                .append(call2)
+            val d = defn.append(Doc.hardNewline).append(call)
+            assert(render(d, config) == c.expected)
+        }
+
+        "newlines.beforeOpenParenXxxSite (docs/newlines-beforeopenparenxxxsite-2)" in {
+            val c      = caseById("docs/newlines-beforeopenparenxxxsite-2.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 20,
+                align = ScalafmtConfig.Align(openParenCallSite = true),
+                newlines = ScalafmtConfig.Newlines(
+                    beforeOpenParenDefnSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Unfold),
+                    beforeOpenParenCallSite = Some(ScalafmtConfig.Newlines.BeforeOpenParen.Fold),
+                    sometimesBeforeColonInMethodReturnType = false
+                )
+            )
+            val defn1 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("foo1: String"))
+            val defn2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text("): String = ???"))(
+                Doc.text("foo2: String"),
+                Doc.text("foo3: String")
+            )
+            val defn = Doc.text("def fooFunc")
+                .append(defn1)
+                .append(defn2)
+            val call1 = Doc.clause(callPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("\"foo1\""))
+            val call2 = Doc.clause(callPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("\"foo2\""), Doc.text("\"foo3\""))
+            val call  = Doc.text("val res = fooFunc")
+                .append(call1)
+                .append(call2)
+            val d = defn.append(Doc.hardNewline).append(call)
+            assert(render(d, config) == c.expected)
+        }
+
+        "newlines.sometimesBeforeColonInMethodReturnType (docs/newlines-sometimesbeforecoloninmethodreturntype-1)" in {
+            val c      = caseById("docs/newlines-sometimesbeforecoloninmethodreturntype-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(sometimesBeforeColonInMethodReturnType = true)
+            )
+            val doc = Doc.text("def someVeryLongMethodName")
+                .append(Doc.hardNewline)
+                .append(Doc.text("    : Map[String, String] = ???"))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.alwaysBeforeElseAfterCurlyIf = true (docs/newlines-alwaysbeforeelseaftercurlyif-1)" in {
+            val c      = caseById("docs/newlines-alwaysbeforeelseaftercurlyif-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(alwaysBeforeElseAfterCurlyIf = true)
+            )
+            val ifBranch = Doc.text("if (someCond) {")
+                .append(Doc.hardNewline).append(Doc.text("  foo()"))
+                .append(Doc.hardNewline).append(Doc.text("}"))
+            val elseBranch = Doc.hardNewline.append(Doc.text("else {"))
+                .append(Doc.hardNewline).append(Doc.text("  bar()"))
+                .append(Doc.hardNewline).append(Doc.text("}"))
+            val doc = ifBranch.append(elseBranch)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.alwaysBeforeElseAfterCurlyIf = false (docs/newlines-alwaysbeforeelseaftercurlyif-2)" in {
+            val c      = caseById("docs/newlines-alwaysbeforeelseaftercurlyif-2.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(alwaysBeforeElseAfterCurlyIf = false)
+            )
+            val ifBranch = Doc.text("if (someCond) {")
+                .append(Doc.hardNewline).append(Doc.text("  foo()"))
+                .append(Doc.hardNewline).append(Doc.text("}"))
+            val elseBranch = Doc.space.append(Doc.text("else {"))
+                .append(Doc.hardNewline).append(Doc.text("  bar()"))
+                .append(Doc.hardNewline).append(Doc.text("}"))
+            val doc = ifBranch.append(elseBranch)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.beforeCurlyLambdaParams = never (docs/newlines-beforecurlylambdaparams-1)" in {
+            val c      = caseById("docs/newlines-beforecurlylambdaparams-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(beforeCurlyLambdaParams = ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Never)
+            )
+            val p  = lambdaPolicy(config)
+            val l1 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l2 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l3 = Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l4 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i (long comment)\"")))
+            val doc = Doc.text("// should keep one-line").append(Doc.hardNewline).append(l1)
+                .append(Doc.hardNewline).append(l2)
+                .append(Doc.hardNewline).append(Doc.text("// should break on arrow since case doesn't fit on a line"))
+                .append(Doc.hardNewline).append(l3)
+                .append(Doc.hardNewline).append(l4)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.beforeCurlyLambdaParams = always (docs/newlines-beforecurlylambdaparams-2)" in {
+            val c      = caseById("docs/newlines-beforecurlylambdaparams-2.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(beforeCurlyLambdaParams = ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Always)
+            )
+            val p  = lambdaPolicy(config)
+            val l1 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l2 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l3 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i (long comment)\"")))
+            val l4 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2} (long comment)\"")))
+            val doc = Doc.text("// should break on brace, though fits on the same line").append(Doc.hardNewline).append(l1)
+                .append(Doc.hardNewline).append(l2)
+                .append(Doc.hardNewline).append(l3)
+                .append(Doc.hardNewline).append(Doc.text("// should break on brace and arrow as lambda doesn't fit on a line"))
+                .append(Doc.hardNewline).append(l4)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.beforeCurlyLambdaParams = multiline (docs/newlines-beforecurlylambdaparams-3)" in {
+            val c      = caseById("docs/newlines-beforecurlylambdaparams-3.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(beforeCurlyLambdaParams = ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.Multiline)
+            )
+            val p  = lambdaPolicy(config)
+            val l1 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l2 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l3 = Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l4 = Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l5 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2} (long comment)\"")))
+            val l6 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i (long comment)\"")))
+            val doc = Doc.text("// should keep one-line").append(Doc.hardNewline).append(l1)
+                .append(Doc.hardNewline).append(l2)
+                .append(Doc.hardNewline).append(Doc.text("// should break on brace as lambda doesn't fit on the same line"))
+                .append(Doc.hardNewline).append(l3)
+                .append(Doc.hardNewline).append(l4)
+                .append(Doc.hardNewline).append(Doc.text("// should break on brace and arrow as lambda doesn't fit on a line"))
+                .append(Doc.hardNewline).append(l5)
+                .append(Doc.hardNewline).append(l6)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.beforeCurlyLambdaParams = multilineWithCaseOnly (docs/newlines-beforecurlylambdaparams-4)" in {
+            val c      = caseById("docs/newlines-beforecurlylambdaparams-4.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines =
+                    ScalafmtConfig.Newlines(beforeCurlyLambdaParams = ScalafmtConfig.Newlines.BeforeCurlyLambdaParams.MultilineWithCaseOnly)
+            )
+            val p  = lambdaPolicy(config)
+            val l1 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l2 = Doc.text("x.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l3 = Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2}\"")))
+            val l4 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("s\"${x._1} -> ${x._2} (long comment)\"")))
+            val l5 = Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i\"")))
+            val l6 =
+                Doc.text("x.zipWithIndex.map ").append(Doc.lambda(p, Doc.text("case (c, i) =>"), Doc.text("s\"$c -> $i (long comment)\"")))
+            val doc = Doc.text("// should keep one-line").append(Doc.hardNewline).append(l1)
+                .append(Doc.hardNewline).append(l2)
+                .append(Doc.hardNewline).append(Doc.text("// should break after arrow as lambda doesn't fit on the same line"))
+                .append(Doc.hardNewline).append(l3)
+                .append(Doc.hardNewline).append(l4)
+                .append(Doc.hardNewline).append(Doc.text("// should break on brace as lambda doesn't fit on the same line"))
+                .append(Doc.hardNewline).append(l5)
+                .append(Doc.hardNewline).append(Doc.text("// should break on brace and arrow as lambda doesn't fit on a line"))
+                .append(Doc.hardNewline).append(l6)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.afterCurlyLambdaParams = squash (docs/newlines-aftercurlylambdaparams-1)" in {
+            val c      = caseById("docs/newlines-aftercurlylambdaparams-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(afterCurlyLambdaParams = ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Squash)
+            )
+            val p   = lambdaPolicy(config)
+            val l1  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)"), forcedOpen = true))
+            val l2  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)")))
+            val doc = Doc.text("// remove all blank lines if any").append(Doc.hardNewline)
+                .append(Doc.text("// one-line formatting is allowed")).append(Doc.hardNewline)
+                .append(l1).append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(l2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.afterCurlyLambdaParams = never (docs/newlines-aftercurlylambdaparams-2)" in {
+            val c      = caseById("docs/newlines-aftercurlylambdaparams-2.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(afterCurlyLambdaParams = ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Never)
+            )
+            val p   = lambdaPolicy(config)
+            val l1  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)"), forcedOpen = true))
+            val l2  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)")))
+            val doc = Doc.text("// remove all blank lines if any").append(Doc.hardNewline)
+                .append(Doc.text("// one-line formatting depends on newlines.source:")).append(Doc.hardNewline)
+                .append(Doc.text("// yes for fold; no for unfold; otherwise, only if there was no break")).append(Doc.hardNewline)
+                .append(l1).append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(l2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.afterCurlyLambdaParams = keep (docs/newlines-aftercurlylambdaparams-3)" in {
+            val c      = caseById("docs/newlines-aftercurlylambdaparams-3.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(afterCurlyLambdaParams = ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Keep)
+            )
+            val p   = lambdaPolicy(config)
+            val l1  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)"), forcedOpen = true))
+            val l2  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)")))
+            val doc = Doc.text("// if blank lines are present, keep only one").append(Doc.hardNewline)
+                .append(Doc.text("// one-line formatting depends on newlines.source:")).append(Doc.hardNewline)
+                .append(Doc.text("// if no blank for fold; no for unfold; otherwise, only if there was no break")).append(Doc.hardNewline)
+                .append(l1).append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(l2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlines.afterCurlyLambdaParams = always (docs/newlines-aftercurlylambdaparams-4)" in {
+            val c      = caseById("docs/newlines-aftercurlylambdaparams-4.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                newlines = ScalafmtConfig.Newlines(afterCurlyLambdaParams = ScalafmtConfig.Newlines.AfterCurlyLambdaParams.Always)
+            )
+            val p   = lambdaPolicy(config)
+            val l1  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)"), forcedOpen = true))
+            val l2  = Doc.text("something.map ").append(Doc.lambda(p, Doc.text("x =>"), Doc.text("f(x)")))
+            val doc = Doc.text("// ensure a single blank line").append(Doc.hardNewline)
+                .append(Doc.text("// one-line formatting is not allowed")).append(Doc.hardNewline)
+                .append(l1).append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(l2)
             assert(render(doc, config) == c.expected)
         }
     }
