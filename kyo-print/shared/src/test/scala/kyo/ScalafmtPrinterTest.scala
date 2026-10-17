@@ -1209,6 +1209,307 @@ class ScalafmtPrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "oracle parity: verticalMultiline defn formatting" - {
+
+        "below arityThreshold stays flat on single line" in {
+            val c      = caseById("classic/verticalmultiline-below-threshold.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true, arityThreshold = 3)
+            )
+            val clause = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text("): Unit = ()"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val doc = obj("object a {")(clause)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "at arityThreshold breaks vertically" in {
+            val c      = caseById("classic/verticalmultiline-at-threshold.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true, arityThreshold = 2)
+            )
+            val clause = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text("): Unit = ()"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val doc = obj("object a {")(clause)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "above arityThreshold breaks vertically" in {
+            val c      = caseById("classic/verticalmultiline-above-threshold.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true, arityThreshold = 2)
+            )
+            val clause = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text("): Unit = ()"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String"),
+                Doc.text("c: Long")
+            )
+            val doc = obj("object a {")(clause)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "curried groups format with attached close and continuation at threshold" in {
+            val c      = caseById("classic/verticalmultiline-curried-at-threshold.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true, arityThreshold = 2)
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text(")"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text("): Unit = ()"))(
+                Doc.text("c: Double")
+            )
+            val doc = obj("object a {")(g1.append(g2))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlineAfterOpenParen forces breaks in continuation parameter groups" in {
+            val c      = caseById("classic/verticalmultiline-newline-after-open-paren.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlineAfterOpenParen = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text(")"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text("): Unit = ()"))(
+                Doc.text("c: Double"),
+                Doc.text("d: Long")
+            )
+            val doc = obj("object a {")(g1.append(g2))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter group with newlineAfterImplicitKW" in {
+            val c      = caseById("classic/verticalmultiline-implicit-after.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlinesAfterImplicitKW = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text(")"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): Unit = ()"))(
+                Doc.text("c: Double"),
+                Doc.text("d: Long")
+            )
+            val doc = obj("object a {")(g1.append(g2))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter group with newlineBeforeImplicitKW" in {
+            val c      = caseById("classic/verticalmultiline-implicit-before.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlinesBeforeImplicitKW = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text(")"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): Unit = ()"))(
+                Doc.text("c: Double"),
+                Doc.text("d: Long")
+            )
+            val doc = obj("object a {")(g1.append(g2))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter group with newlineBeforeImplicitKW and newlineAfterImplicitKW" in {
+            val c      = caseById("classic/verticalmultiline-implicit-before-after.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlinesBeforeImplicitKW = true,
+                    newlinesAfterImplicitKW = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def f("), Doc.text(")"))(
+                Doc.text("a: Int"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): Unit = ()"))(
+                Doc.text("c: Double"),
+                Doc.text("d: Long")
+            )
+            val doc = obj("object a {")(g1.append(g2))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "arityThreshold boundary on classes and defs (docs/verticalmultiline-aritythreshold-1)" in {
+            val c      = caseById("docs/verticalmultiline-aritythreshold-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true, arityThreshold = 2)
+            )
+            val foo = Doc.clause(defnPolicy(config), Doc.text("case class Foo("), Doc.text(")"))(
+                Doc.text("x: String")
+            )
+            val bar = Doc.clause(
+                defnPolicy(config).copy(dangling = false),
+                Doc.text("case class Bar("),
+                Doc.text(")")
+            )(
+                Doc.text("x: String"),
+                Doc.text("y: String")
+            )
+            val fooDef = Doc.clause(defnPolicy(config), Doc.text("def foo("), Doc.text(")"))(
+                Doc.text("x: String"),
+                Doc.text("y: String")
+            )
+            val hello = Doc.clause(defnPolicy(config), Doc.text("def hello("), Doc.text(")"))(Doc.text("how: String"))
+                .append(Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(")"))(Doc.text("are: String")))
+                .append(Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(") = how + are + you"))(Doc.text("you: String")))
+            val body = fooDef.append(Doc.hardNewline).append(hello)
+            val doc  = foo.append(Doc.hardNewline).append(bar).append(Doc.hardNewline).append(obj("object A {")(body))
+            assert(render(doc, config) == c.expected)
+        }
+
+        "newlineAfterOpenParen = true with indent.defnSite = 2 (docs/verticalmultiline-newlineafteropenparen-1)" in {
+            val c      = caseById("docs/verticalmultiline-newlineafteropenparen-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                indent = ScalafmtConfig.Indent(defnSite = 2),
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlineAfterOpenParen = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def other("), Doc.text(")"))(
+                Doc.text("a: String"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(") = a + b + c"))(
+                Doc.text("c: String"),
+                Doc.text("d: String")
+            )
+            val doc = g1.append(g2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "danglingParentheses excluded with verticalMultiline (docs/verticalmultiline-excludedanglingparens-1)" in {
+            val c      = caseById("docs/verticalmultiline-excludedanglingparens-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 40,
+                indent = ScalafmtConfig.Indent(defnSite = 2),
+                danglingParentheses = ScalafmtConfig.DanglingParentheses(defnSite = false),
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlineAfterOpenParen = true
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def other("), Doc.text(")"))(
+                Doc.text("a: String"),
+                Doc.text("b: String")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("("), Doc.text(") = a + b + c"))(
+                Doc.text("c: String"),
+                Doc.text("d: String")
+            )
+            val call = Doc.clause(callPolicy(config), Doc.text("other("), Doc.text(")"))(
+                Doc.text("a"),
+                Doc.text("b")
+            ).append(Doc.clause(callPolicy(config), Doc.text("("), Doc.text(")"))(
+                Doc.text("c"),
+                Doc.text("d")
+            ))
+            val doc = g1.append(g2).append(Doc.hardNewline).append(call)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter list modifier force = [before] (docs/vertical-multiline-with-implicit-parameter-lists-1)" in {
+            val c      = caseById("docs/vertical-multiline-with-implicit-parameter-lists-1.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 60,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true),
+                newlines = ScalafmtConfig.Newlines(
+                    implicitParamListModifierForce = List(ScalafmtConfig.Newlines.BeforeAfter.Before)
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def format("), Doc.text(")"))(
+                Doc.text("code: String"),
+                Doc.text("age: Int")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): String"))(
+                Doc.text("ev: Parser"),
+                Doc.text("c: Context")
+            )
+            val doc = g1.append(g2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter list modifier force = [after] (docs/vertical-multiline-with-implicit-parameter-lists-2)" in {
+            val c      = caseById("docs/vertical-multiline-with-implicit-parameter-lists-2.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 60,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true),
+                newlines = ScalafmtConfig.Newlines(
+                    implicitParamListModifierForce = List(ScalafmtConfig.Newlines.BeforeAfter.After)
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def format("), Doc.text(")"))(
+                Doc.text("code: String"),
+                Doc.text("age: Int")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): String"))(
+                Doc.text("ev: Parser"),
+                Doc.text("c: Context")
+            )
+            val doc = g1.append(g2)
+            assert(render(doc, config) == c.expected)
+        }
+
+        "implicit parameter list modifier force = [before, after] (docs/vertical-multiline-with-implicit-parameter-lists-3)" in {
+            val c      = caseById("docs/vertical-multiline-with-implicit-parameter-lists-3.stat:example")
+            val config = ScalafmtConfig(
+                maxColumn = 60,
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(atDefnSite = true),
+                newlines = ScalafmtConfig.Newlines(
+                    implicitParamListModifierForce = List(
+                        ScalafmtConfig.Newlines.BeforeAfter.Before,
+                        ScalafmtConfig.Newlines.BeforeAfter.After
+                    )
+                )
+            )
+            val g1 = Doc.clause(defnPolicy(config), Doc.text("def format("), Doc.text(")"))(
+                Doc.text("code: String"),
+                Doc.text("age: Int")
+            )
+            val g2 = Doc.clause(defnPolicy(config), Doc.text("(implicit "), Doc.text("): String"))(
+                Doc.text("ev: Parser"),
+                Doc.text("c: Context")
+            )
+            val doc = g1.append(g2)
+            assert(render(doc, config) == c.expected)
+        }
+    }
+
     "clause layout rules" - {
 
         "flat at exact fit, broken one column below" in {

@@ -104,6 +104,16 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(!config.newlines.avoidInResultType)
             assert(config.newlines.avoidAfterYield)
             assert(!config.newlines.neverBeforeJsNative)
+            assert(!config.verticalMultiline.atDefnSite)
+            assert(config.verticalMultiline.arityThreshold == 100)
+            assert(!config.verticalMultiline.newlineBeforeOpenParen)
+            assert(!config.verticalMultiline.newlineAfterOpenParen)
+            assert(!config.verticalMultiline.newlinesAfterImplicitKW)
+            assert(!config.verticalMultiline.newlinesBeforeImplicitKW)
+            assert(!config.verticalMultiline.closeParenNewline)
+            assert(!config.verticalMultiline.includeImplicitKw)
+            assert(!config.verticalMultiline.includeApplyKw)
+            assert(!config.verticalMultiline.keepSymbols)
         }
 
         "construction without arguments yields the default preset" in {
@@ -214,6 +224,38 @@ class ScalafmtConfigTest extends kyo.test.Test[Any]:
             assert(config.clausePolicy(Doc.ClauseSite.Call).configStyle)
             assert(config.clausePolicy(Doc.ClauseSite.Defn).configStyle)
             assert(!config.clausePolicy(Doc.ClauseSite.Extend).configStyle)
+        }
+
+        "defaults resolve verticalMultiline to None at every site" in {
+            val config = ScalafmtConfig.default
+            assert(config.clausePolicy(Doc.ClauseSite.Call).verticalMultiline.isEmpty)
+            assert(config.clausePolicy(Doc.ClauseSite.Defn).verticalMultiline.isEmpty)
+            assert(config.clausePolicy(Doc.ClauseSite.Extend).verticalMultiline.isEmpty)
+            assert(config.clausePolicy(Doc.ClauseSite.Lambda).verticalMultiline.isEmpty)
+        }
+
+        "verticalMultiline at defnSite resolves to Doc.VerticalMultiline policy with implicit modifiers" in {
+            val config = ScalafmtConfig(
+                verticalMultiline = ScalafmtConfig.VerticalMultiline(
+                    atDefnSite = true,
+                    arityThreshold = 2,
+                    newlineAfterOpenParen = true,
+                    newlinesAfterImplicitKW = true
+                ),
+                newlines = ScalafmtConfig.Newlines(
+                    implicitParamListModifierForce = List(ScalafmtConfig.Newlines.BeforeAfter.Before)
+                )
+            )
+            val defn = config.clausePolicy(Doc.ClauseSite.Defn)
+            assert(defn.verticalMultiline.isDefined)
+            val vm = defn.verticalMultiline.get
+            assert(vm.atDefnSite)
+            assert(vm.arityThreshold == 2)
+            assert(vm.newlineAfterOpenParen)
+            assert(vm.newlinesAfterImplicitKW)
+            assert(vm.newlinesBeforeImplicitKW)
+            assert(!vm.closeParenNewline)
+            assert(config.clausePolicy(Doc.ClauseSite.Call).verticalMultiline.isEmpty)
         }
     }
 

@@ -26,7 +26,8 @@ final case class ScalafmtConfig(
     align: ScalafmtConfig.Align = ScalafmtConfig.Align(),
     binPack: ScalafmtConfig.BinPack = ScalafmtConfig.BinPack(),
     configStyle: ScalafmtConfig.ConfigStyle = ScalafmtConfig.ConfigStyle(),
-    newlines: ScalafmtConfig.Newlines = ScalafmtConfig.Newlines()
+    newlines: ScalafmtConfig.Newlines = ScalafmtConfig.Newlines(),
+    verticalMultiline: ScalafmtConfig.VerticalMultiline = ScalafmtConfig.VerticalMultiline()
 ) derives CanEqual:
 
     /** Resolves the clause policy the parity engine applies at a site.
@@ -83,6 +84,10 @@ final case class ScalafmtConfig(
                     beforeOpenParen = newlines.beforeOpenParenCallSite.map(toDocBop)
                 )
             case Doc.ClauseSite.Defn =>
+                val forceBefore = verticalMultiline.newlinesBeforeImplicitKW ||
+                    newlines.implicitParamListModifierForce.contains(ScalafmtConfig.Newlines.BeforeAfter.Before)
+                val forceAfter = verticalMultiline.newlinesAfterImplicitKW ||
+                    newlines.implicitParamListModifierForce.contains(ScalafmtConfig.Newlines.BeforeAfter.After)
                 Doc.ClausePolicy(
                     site = site,
                     indent = indent.defnSite,
@@ -91,7 +96,22 @@ final case class ScalafmtConfig(
                     binPack = siteMode(binPack.defnSite),
                     configStyle = configStyle.defnSite,
                     source = toDocSource(newlines.source),
-                    beforeOpenParen = newlines.beforeOpenParenDefnSite.map(toDocBop)
+                    beforeOpenParen = newlines.beforeOpenParenDefnSite.map(toDocBop),
+                    verticalMultiline =
+                        if verticalMultiline.atDefnSite then
+                            Some(Doc.VerticalMultiline(
+                                atDefnSite = verticalMultiline.atDefnSite,
+                                arityThreshold = verticalMultiline.arityThreshold,
+                                newlineBeforeOpenParen = verticalMultiline.newlineBeforeOpenParen,
+                                newlineAfterOpenParen = verticalMultiline.newlineAfterOpenParen,
+                                newlinesAfterImplicitKW = forceAfter,
+                                newlinesBeforeImplicitKW = forceBefore,
+                                closeParenNewline = verticalMultiline.closeParenNewline,
+                                includeImplicitKw = verticalMultiline.includeImplicitKw,
+                                includeApplyKw = verticalMultiline.includeApplyKw,
+                                keepSymbols = verticalMultiline.keepSymbols
+                            ))
+                        else None
                 )
             case Doc.ClauseSite.Extend =>
                 Doc.ClausePolicy(
@@ -282,10 +302,16 @@ object ScalafmtConfig:
         forceBeforeMultilineAssign: Newlines.ForceBeforeMultilineAssign = Newlines.ForceBeforeMultilineAssign.Never,
         avoidInResultType: Boolean = false,
         avoidAfterYield: Boolean = true,
-        neverBeforeJsNative: Boolean = false
+        neverBeforeJsNative: Boolean = false,
+        implicitParamListModifierForce: List[Newlines.BeforeAfter] = Nil
     ) derives CanEqual
 
     object Newlines:
+
+        /** Whether an implicit keyword modifier forces breaks before or after. */
+        enum BeforeAfter derives CanEqual:
+            case Before, After
+        end BeforeAfter
 
         /** Interpretation of line breaks present in the input source.
           *
@@ -320,5 +346,58 @@ object ScalafmtConfig:
         end ForceBeforeMultilineAssign
 
     end Newlines
+
+    /** Definition-site multiline parameter list formatting.
+      *
+      * Mirrors the `verticalMultiline` section of scalafmt: when enabled at
+      * definition sites and a method's parameter count meets or exceeds
+      * `arityThreshold` or its signature overflows `maxColumn`, parameter
+      * groups break vertically with one parameter per line indented by
+      * `indent.defnSite`. Group delimiters `)(` and dangling closing
+      * delimiters are indented two spaces less than `indent.defnSite`.
+      */
+    final case class VerticalMultiline(
+        atDefnSite: Boolean = false,
+        arityThreshold: Int = 100,
+        newlineBeforeOpenParen: Boolean = false,
+        newlineAfterOpenParen: Boolean = false,
+        newlinesAfterImplicitKW: Boolean = false,
+        newlinesBeforeImplicitKW: Boolean = false,
+        closeParenNewline: Boolean = false,
+        includeImplicitKw: Boolean = false,
+        includeApplyKw: Boolean = false,
+        keepSymbols: Boolean = false
+    ) derives CanEqual:
+        def newlineAfterImplicitKW: Boolean  = newlinesAfterImplicitKW
+        def newlineBeforeImplicitKW: Boolean = newlinesBeforeImplicitKW
+        def atDefinitionSite: Boolean        = atDefnSite
+    end VerticalMultiline
+
+    object VerticalMultiline:
+        def apply(
+            atDefnSite: Boolean = false,
+            arityThreshold: Int = 100,
+            newlineBeforeOpenParen: Boolean = false,
+            newlineAfterOpenParen: Boolean = false,
+            newlinesAfterImplicitKW: Boolean = false,
+            newlinesBeforeImplicitKW: Boolean = false,
+            closeParenNewline: Boolean = false,
+            includeImplicitKw: Boolean = false,
+            includeApplyKw: Boolean = false,
+            keepSymbols: Boolean = false
+        ): VerticalMultiline =
+            new VerticalMultiline(
+                atDefnSite = atDefnSite,
+                arityThreshold = arityThreshold,
+                newlineBeforeOpenParen = newlineBeforeOpenParen,
+                newlineAfterOpenParen = newlineAfterOpenParen,
+                newlinesAfterImplicitKW = newlinesAfterImplicitKW,
+                newlinesBeforeImplicitKW = newlinesBeforeImplicitKW,
+                closeParenNewline = closeParenNewline,
+                includeImplicitKw = includeImplicitKw,
+                includeApplyKw = includeApplyKw,
+                keepSymbols = keepSymbols
+            )
+    end VerticalMultiline
 
 end ScalafmtConfig

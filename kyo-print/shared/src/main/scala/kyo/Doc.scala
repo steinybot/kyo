@@ -133,6 +133,20 @@ object Doc:
       * layout with breaks around both delimiters render in the preserved
       * config-style form.
       */
+    /** Layout policy for definition-site vertical multiline formatting. */
+    final case class VerticalMultiline(
+        atDefnSite: Boolean = false,
+        arityThreshold: Int = 100,
+        newlineBeforeOpenParen: Boolean = false,
+        newlineAfterOpenParen: Boolean = false,
+        newlinesAfterImplicitKW: Boolean = false,
+        newlinesBeforeImplicitKW: Boolean = false,
+        closeParenNewline: Boolean = false,
+        includeImplicitKw: Boolean = false,
+        includeApplyKw: Boolean = false,
+        keepSymbols: Boolean = false
+    ) derives CanEqual
+
     final case class ClausePolicy(
         site: Doc.ClauseSite,
         indent: Int,
@@ -143,7 +157,8 @@ object Doc:
         source: Doc.SourcePolicy = Doc.SourcePolicy.Classic,
         beforeOpenParen: Option[Doc.BeforeOpenParen] = None,
         beforeCurlyLambdaParams: Doc.BeforeCurlyLambdaParams = Doc.BeforeCurlyLambdaParams.Never,
-        afterCurlyLambdaParams: Doc.AfterCurlyLambdaParams = Doc.AfterCurlyLambdaParams.Never
+        afterCurlyLambdaParams: Doc.AfterCurlyLambdaParams = Doc.AfterCurlyLambdaParams.Never,
+        verticalMultiline: Option[Doc.VerticalMultiline] = None
     ) derives CanEqual
 
     val empty: Doc = Empty

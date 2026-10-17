@@ -136,8 +136,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
             yield
                 if isSpaceJoined(c) then openW + elemWs.map(1 + _).sum + closeW
                 else
-                    openW + elemWs.sum + (c.elems.length - 1) * (flatWidth(c.sep).getOrElse(0) + 1) +
-                        closeW
+                    val sepW = if c.elems.length > 1 then (c.elems.length - 1) * (flatWidth(c.sep).getOrElse(0) + 1) else 0
+                    openW + elemWs.sum + sepW + closeW
         end clauseFlatWidth
 
         private def allElemWidths(c: Doc.Clause): Option[List[Int]] =
@@ -176,7 +176,41 @@ private[kyo] object ScalafmtPrinter extends Printer:
             probe.newlines > 0
         end breaksWhenRendered
 
+        private def isDefnClause(doc: Doc): Boolean =
+            doc match
+                case c: Doc.Clause =>
+                    c.policy.site == Doc.ClauseSite.Defn && c.policy.verticalMultiline.exists(_.atDefnSite)
+                case _ => false
+
+        private def extractDefnClauses(doc: Doc): Option[(List[Doc.Clause], Doc)] =
+            doc match
+                case c: Doc.Clause if isDefnClause(c) =>
+                    Some((List(c), Doc.Empty))
+                case Doc.Concat(first, second) =>
+                    extractDefnClauses(first) match
+                        case Some((firstClauses, Doc.Empty)) =>
+                            extractDefnClauses(second) match
+                                case Some((secondClauses, rest)) =>
+                                    Some((firstClauses ::: secondClauses, rest))
+                                case None =>
+                                    Some((firstClauses, second))
+                        case Some((firstClauses, restFirst)) =>
+                            Some((firstClauses, Doc.Concat(restFirst, second)))
+                        case None =>
+                            None
+                case _ =>
+                    None
+
         def render(doc: Doc, base: Int, flat: Boolean): Unit =
+            if !flat then
+                extractDefnClauses(doc) match
+                    case Some((clauses, rest)) if clauses.nonEmpty =>
+                        renderDefnClauseChain(clauses, base)
+                        if rest ne Doc.Empty then
+                            render(rest, base, flat)
+                        return
+                    case _ => ()
+            end if
             doc match
                 case Doc.Empty => ()
 
@@ -312,12 +346,147 @@ private[kyo] object ScalafmtPrinter extends Printer:
             end if
         end renderLambdaClause
 
+        private def docString(doc: Doc): String =
+            doc match
+                case Doc.Empty                 => ""
+                case Doc.Text(t)               => t
+                case Doc.Concat(first, second) => docString(first) + docString(second)
+                case Doc.Indent(_, inner)      => docString(inner)
+                case Doc.Align(inner)          => docString(inner)
+                case Doc.Group(inner)          => docString(inner)
+                case Doc.Choice(broken, _)     => docString(broken)
+                case _                         => ""
+            end match
+        end docString
+
+        private def renderDefnClauseChain(clauses: List[Doc.Clause], base: Int): Unit =
+            val vm                          = clauses.head.policy.verticalMultiline.get
+            val totalArity                  = clauses.map(_.elems.length).sum
+            val meetsArity                  = totalArity >= vm.arityThreshold
+            val hasForced                   = clauses.exists(_.forcedOpen)
+            val chainFlatWidth: Option[Int] =
+                clauses.foldLeft[Option[Int]](Some(0)) { (acc, c) =>
+                    for
+                        total <- acc
+                        w     <- clauseFlatWidth(c)
+                    yield total + w
+                }
+            val fitsFlat    = chainFlatWidth.exists(col + _ <= width)
+            val shouldBreak = meetsArity || !fitsFlat || hasForced
+
+            if !shouldBreak then
+                for c <- clauses do
+                    renderFlatClause(c, base)
+            else
+                var k = 0
+                val n = clauses.length
+                while k < n do
+                    val c       = clauses(k)
+                    val isFirst = k == 0
+                    val isLast  = k == n - 1
+                    renderVerticalMultilineClauseInChain(c, base, isFirst, isLast)
+                    k += 1
+                end while
+            end if
+        end renderDefnClauseChain
+
+        private def renderVerticalMultilineClauseInChain(
+            c: Doc.Clause,
+            base: Int,
+            isFirst: Boolean,
+            isLast: Boolean
+        ): Unit =
+            val vm         = c.policy.verticalMultiline.get
+            val elemIndent = base + c.policy.indent
+            val sepIndent  = base + math.max(0, c.policy.indent - 2)
+
+            if isFirst && vm.newlineBeforeOpenParen then
+                emitNewline(sepIndent)
+
+            val openText        = docString(c.open)
+            val firstElemText   = if c.elems.nonEmpty then docString(c.elems(0)) else ""
+            val isImplicitGroup = openText.contains("implicit") || openText.contains("using") ||
+                firstElemText.startsWith("implicit ") || firstElemText.startsWith("using ")
+
+            if isImplicitGroup then
+                val kw                  = if openText.contains("using") || firstElemText.startsWith("using ") then "using" else "implicit"
+                val (openPrefix, elem0) =
+                    if openText.contains(kw) then
+                        val idx    = openText.indexOf(kw)
+                        val prefix = openText.substring(0, idx)
+                        (prefix, c.elems(0))
+                    else
+                        val prefix = openText
+                        val rest   = firstElemText.substring(kw.length + 1)
+                        (prefix, Doc.text(rest))
+
+                render(Doc.text(openPrefix), base, false)
+                if vm.newlinesBeforeImplicitKW then
+                    emitNewline(elemIndent)
+                    emitText(kw)
+                else
+                    emitText(kw)
+                end if
+
+                if vm.newlinesAfterImplicitKW then
+                    emitNewline(elemIndent)
+                else
+                    emitSpace()
+                end if
+
+                render(elem0, elemIndent, false)
+                var i = 1
+                while i < c.elems.length do
+                    render(c.sep, elemIndent, false)
+                    emitNewline(elemIndent)
+                    render(c.elems(i), elemIndent, false)
+                    i += 1
+                end while
+            else
+                render(c.open, base, false)
+                val shouldBreakAfterOpen =
+                    if isFirst then true
+                    else vm.newlineAfterOpenParen || c.elems.length >= vm.arityThreshold
+
+                if shouldBreakAfterOpen && c.elems.nonEmpty then
+                    emitNewline(elemIndent)
+
+                if c.elems.nonEmpty then
+                    render(c.elems(0), elemIndent, false)
+                    var i = 1
+                    while i < c.elems.length do
+                        render(c.sep, elemIndent, false)
+                        emitNewline(elemIndent)
+                        render(c.elems(i), elemIndent, false)
+                        i += 1
+                    end while
+                end if
+            end if
+
+            if c.trailingSep then
+                render(c.sep, elemIndent, false)
+
+            if c.close ne Doc.Empty then
+                if !isLast then
+                    emitNewline(sepIndent)
+                    render(c.close, sepIndent, false)
+                else if c.policy.dangling || vm.closeParenNewline then
+                    emitNewline(sepIndent)
+                    render(c.close, sepIndent, false)
+                else
+                    render(c.close, elemIndent, false)
+                end if
+            end if
+        end renderVerticalMultilineClauseInChain
+
         private def renderClause(c: Doc.Clause, base: Int): Unit =
             if c.elems.isEmpty then
                 render(c.open, base, false)
                 render(c.close, base, false)
             else if c.policy.site == Doc.ClauseSite.Lambda then
                 renderLambdaClause(c, base)
+            else if c.policy.site == Doc.ClauseSite.Defn && c.policy.verticalMultiline.exists(_.atDefnSite) then
+                renderDefnClauseChain(List(c), base)
             else
                 val bop          = c.policy.beforeOpenParen
                 val needBopBreak = bop match
