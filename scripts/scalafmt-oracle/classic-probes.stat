@@ -371,4 +371,65 @@ object a {
     b: String
   ): Unit = ()
 }
+<<< verticalmultiline-below-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 3
+---
+object a {
+  def f(a: Int, b: String): Unit = ()
+}
+<<< verticalmultiline-at-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String): Unit = ()
+}
+<<< verticalmultiline-above-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String, c: Long): Unit = ()
+}
+<<< verticalmultiline-curried-at-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String)(c: Double): Unit = ()
+}
+<<< verticalmultiline-newline-after-open-paren
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+verticalMultiline.newlineAfterOpenParen = true
+---
+object a {
+  def f(a: Int, b: String)(c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-after
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [after]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-before
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [before]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-before-after
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [before, after]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+
 
