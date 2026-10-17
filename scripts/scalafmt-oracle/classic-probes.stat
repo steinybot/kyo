@@ -303,3 +303,72 @@ object a {
   program(alpha, beta, gamma
   )
 }
+<<< source-fold-callsite-broken
+newlines.source = fold
+---
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
+<<< source-fold-callsite-flat
+newlines.source = fold
+---
+object a {
+  send(alpha, beta, gamma)
+}
+<<< source-fold-callsite-overflow-broken
+newlines.source = fold
+---
+object a {
+  program(
+    aaaaaaaa,
+    bbbbbbbb,
+    cccccccc,
+    dddddddd,
+    eeeeeeee
+  )
+}
+<<< source-fold-callsite-overflow-flat
+newlines.source = fold
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< source-keep-callsite-broken
+newlines.source = keep
+---
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
+<<< source-keep-callsite-flat
+newlines.source = keep
+---
+object a {
+  send(alpha, beta, gamma)
+}
+<<< source-fold-defnsite-broken
+newlines.source = fold
+---
+object a {
+  def f(
+    a: Int,
+    b: String
+  ): Unit = ()
+}
+<<< source-keep-defnsite-broken
+newlines.source = keep
+---
+object a {
+  def f(
+    a: Int,
+    b: String
+  ): Unit = ()
+}
+

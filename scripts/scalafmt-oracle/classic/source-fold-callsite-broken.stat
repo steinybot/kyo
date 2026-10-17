@@ -1,0 +1,15 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.source = fold
+<<< example
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
+>>>
+object a {
+  send(alpha, beta, gamma)
+}
