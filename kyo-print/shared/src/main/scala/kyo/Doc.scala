@@ -475,17 +475,28 @@ object Doc:
             else if c.policy.binPack != BinPackMode.Never then
                 wrap(c.open, c.sep, c.close)(elems)
             else
-                val broken = lowerBroken(c, elems)
-                val flat   = c.open.append(separate(c.sep.append(singleSpace))(elems)).append(c.close)
-                group(choice(flat, broken))
+                group { choice =>
+                    val brokenSep = c.sep.append(newline)
+                    val flatSep   = c.sep.append(singleSpace)
+                    val inner     = separate(choice(flatSep, brokenSep))(elems).indent(c.policy.indent)
+                    val body      = c.open.append(choice.emptyOrNewline).append(inner)
+                    if c.policy.dangling && (c.close ne Empty) then
+                        body.append(choice.emptyOrNewline).append(c.close)
+                    else
+                        body.append(c.close)
+                    end if
+                }
             end if
         end if
     end lowerClause
 
     private def lowerExtend(c: Clause, elems: Chunk[Doc]): Doc =
-        val broken = c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
-        val flat   = c.open.append(separate(singleSpace)(elems))
-        group(choice(flat, broken))
+        group { choice =>
+            val inner =
+                if elems.isEmpty then empty
+                else separate(choice(singleSpace, newline))(elems).indent(c.policy.indent)
+            c.open.append(choice(empty, newline)).append(inner)
+        }
     end lowerExtend
 
     private def lowerBroken(c: Clause, elems: Chunk[Doc]): Doc =
@@ -602,12 +613,16 @@ object Doc:
         if docs.isEmpty then open.append(close)
         else
             val (brokenSep, flatSep) = resolveSeparators(sep)
-            val brokenInner          =
-                if docs.length == 1 then docs.head.indent(indent)
-                else separate(brokenSep)(docs).indent(indent)
-            val broken = open.append(newline).append(brokenInner).append(newline).append(close)
-            val flat   = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(flat, broken))
+            group { choice =>
+                val sepDoc = choice(flatSep, brokenSep)
+                val body   =
+                    if docs.length == 1 then docs.head.indent(indent)
+                    else separate(sepDoc)(docs).indent(indent)
+                open.append(choice.emptyOrNewline)
+                    .append(body)
+                    .append(choice.emptyOrNewline)
+                    .append(close)
+            }
 
     def chop(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
         chop(open, sep, close, 4)(docs)
@@ -625,12 +640,15 @@ object Doc:
         if docs.isEmpty then open.append(close)
         else
             val (brokenSep, flatSep) = resolveSeparators(sep)
-            val brokenInner          =
-                if docs.length == 1 then docs.head.indent(indent)
-                else separate(brokenSep)(docs).indent(indent)
-            val broken = open.append(newline).append(brokenInner).append(close)
-            val flat   = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(flat, broken))
+            group { choice =>
+                val sepDoc = choice(flatSep, brokenSep)
+                val body   =
+                    if docs.length == 1 then docs.head.indent(indent)
+                    else separate(sepDoc)(docs).indent(indent)
+                open.append(choice.emptyOrNewline)
+                    .append(body)
+                    .append(close)
+            }
 
     def chopClosed(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
         chopClosed(open, sep, close, 4)(docs)
@@ -649,9 +667,10 @@ object Doc:
         else if docs.length == 1 then open.append(docs.head).append(close)
         else
             val (brokenSep, flatSep) = resolveSeparators(sep)
-            val broken               = open.append(align(separate(brokenSep)(docs).append(close)))
-            val flat                 = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(flat, broken))
+            group { choice =>
+                val sepDoc = choice(flatSep, brokenSep)
+                open.append(align(separate(sepDoc)(docs).append(close)))
+            }
 
     def hang(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
         hang(open, sep, close)(Chunk.from(first +: rest))

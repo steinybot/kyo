@@ -699,42 +699,106 @@ class DocTest extends kyo.test.Test[Any]:
         }
 
         "single element" in {
-            val broken   = open.append(Doc.newline).append(a.indent(4)).append(Doc.newline).append(close)
-            val flat     = open.append(a).append(close)
-            val expected = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chop(open, sep, close)(a) == expected)
-            assert(Doc.chop(open, sep, close)(Chunk(a)) == expected)
+            val doc = Doc.chop(open, sep, close)(a)
+            val gid = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val expected = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(a.indent(4))
+                    .append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
+            val chunkDoc = Doc.chop(open, sep, close)(Chunk(a))
+            val chunkGid = chunkDoc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(chunkGid >= 0)
+            val expectedChunk = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(a.indent(4))
+                    .append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(close),
+                chunkGid
+            )
+            assert(chunkDoc == expectedChunk)
         }
 
         "multiple elements" in {
-            val brokenSep   = sep.append(Doc.newline)
-            val flatSep     = sep.append(Doc.space)
-            val brokenInner = a.append(brokenSep).append(b).indent(4)
-            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
-            val flatInner   = a.append(flatSep).append(b)
-            val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chop(open, sep, close)(a, b) == expected)
-            assert(Doc.chop(open, sep, close)(Chunk(a, b)) == expected)
+            val brokenSep = sep.append(Doc.newline)
+            val flatSep   = sep.append(Doc.space)
+            val doc       = Doc.chop(open, sep, close)(a, b)
+            val gid       = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val sepDoc      = Doc.Choice(flatSep, brokenSep, gid)
+            val brokenInner = a.append(sepDoc).append(b).indent(4)
+            val expected    = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(brokenInner)
+                    .append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
+            val chunkDoc = Doc.chop(open, sep, close)(Chunk(a, b))
+            val chunkGid = chunkDoc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(chunkGid >= 0)
+            val chunkSepDoc      = Doc.Choice(flatSep, brokenSep, chunkGid)
+            val chunkBrokenInner = a.append(chunkSepDoc).append(b).indent(4)
+            val expectedChunk    = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(chunkBrokenInner)
+                    .append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(close),
+                chunkGid
+            )
+            assert(chunkDoc == expectedChunk)
         }
 
         "custom indent" in {
-            val brokenSep   = sep.append(Doc.newline)
-            val brokenInner = a.append(brokenSep).append(b).indent(2)
-            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
-            val flat        = open.append(a.append(sep.append(Doc.space)).append(b)).append(close)
-            val expected    = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chop(open, sep, close, indent = 2)(a, b) == expected)
+            val brokenSep = sep.append(Doc.newline)
+            val flatSep   = sep.append(Doc.space)
+            val doc       = Doc.chop(open, sep, close, indent = 2)(a, b)
+            val gid       = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val sepDoc      = Doc.Choice(flatSep, brokenSep, gid)
+            val brokenInner = a.append(sepDoc).append(b).indent(2)
+            val expected    = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(brokenInner)
+                    .append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
         }
 
         "choice separator preserves zero-trailing-whitespace invariant" in {
-            val commaSep    = Doc.choice(flat = Doc.text(", "), broken = Doc.text(",").append(Doc.newline))
-            val brokenInner = a.append(Doc.text(",").append(Doc.newline)).append(b).indent(4)
-            val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
-            val flatInner   = a.append(Doc.text(", ")).append(b)
-            val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chop(open, commaSep, close)(a, b) == expected)
+            val commaSep = Doc.choice(flat = Doc.text(", "), broken = Doc.text(",").append(Doc.newline))
+            val doc      = Doc.chop(open, commaSep, close)(a, b)
+            val gid      = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val sepDoc   = Doc.Choice(Doc.text(", "), Doc.text(",").append(Doc.newline), gid)
+            val body     = a.append(sepDoc).append(b).indent(4)
+            val expected = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(body)
+                    .append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
         }
     }
 
@@ -749,23 +813,63 @@ class DocTest extends kyo.test.Test[Any]:
         }
 
         "single element" in {
-            val broken   = open.append(Doc.newline).append(a.indent(4)).append(close)
-            val flat     = open.append(a).append(close)
-            val expected = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chopClosed(open, sep, close)(a) == expected)
-            assert(Doc.chopClosed(open, sep, close)(Chunk(a)) == expected)
+            val doc = Doc.chopClosed(open, sep, close)(a)
+            val gid = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val expected = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(a.indent(4))
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
+            val chunkDoc = Doc.chopClosed(open, sep, close)(Chunk(a))
+            val chunkGid = chunkDoc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(chunkGid >= 0)
+            val expectedChunk = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(a.indent(4))
+                    .append(close),
+                chunkGid
+            )
+            assert(chunkDoc == expectedChunk)
         }
 
         "multiple elements" in {
-            val brokenSep   = sep.append(Doc.newline)
-            val flatSep     = sep.append(Doc.space)
-            val brokenInner = a.append(brokenSep).append(b).indent(4)
-            val broken      = open.append(Doc.newline).append(brokenInner).append(close)
-            val flatInner   = a.append(flatSep).append(b)
-            val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.chopClosed(open, sep, close)(a, b) == expected)
-            assert(Doc.chopClosed(open, sep, close)(Chunk(a, b)) == expected)
+            val brokenSep = sep.append(Doc.newline)
+            val flatSep   = sep.append(Doc.space)
+            val doc       = Doc.chopClosed(open, sep, close)(a, b)
+            val gid       = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val sepDoc      = Doc.Choice(flatSep, brokenSep, gid)
+            val brokenInner = a.append(sepDoc).append(b).indent(4)
+            val expected    = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, gid))
+                    .append(brokenInner)
+                    .append(close),
+                gid
+            )
+            assert(doc == expected)
+            val chunkDoc = Doc.chopClosed(open, sep, close)(Chunk(a, b))
+            val chunkGid = chunkDoc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(chunkGid >= 0)
+            val chunkSepDoc      = Doc.Choice(flatSep, brokenSep, chunkGid)
+            val chunkBrokenInner = a.append(chunkSepDoc).append(b).indent(4)
+            val expectedChunk    = Doc.Group(
+                open.append(Doc.Choice(Doc.empty, Doc.newline, chunkGid))
+                    .append(chunkBrokenInner)
+                    .append(close),
+                chunkGid
+            )
+            assert(chunkDoc == expectedChunk)
         }
     }
 
@@ -787,11 +891,28 @@ class DocTest extends kyo.test.Test[Any]:
         "multiple elements" in {
             val brokenSep = sep.append(Doc.newline)
             val flatSep   = sep.append(Doc.space)
-            val broken    = open.append(Doc.align(a.append(brokenSep).append(b).append(close)))
-            val flat      = open.append(a.append(flatSep).append(b)).append(close)
-            val expected  = Doc.group(Doc.choice(flat, broken))
-            assert(Doc.hang(open, sep, close)(a, b) == expected)
-            assert(Doc.hang(open, sep, close)(Chunk(a, b)) == expected)
+            val doc       = Doc.hang(open, sep, close)(a, b)
+            val gid       = doc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(gid >= 0)
+            val sepDoc   = Doc.Choice(flatSep, brokenSep, gid)
+            val expected = Doc.Group(
+                open.append(Doc.align(a.append(sepDoc).append(b).append(close))),
+                gid
+            )
+            assert(doc == expected)
+            val chunkDoc = Doc.hang(open, sep, close)(Chunk(a, b))
+            val chunkGid = chunkDoc match
+                case Doc.Group(_, id) => id
+                case _                => -1
+            assert(chunkGid >= 0)
+            val chunkSepDoc   = Doc.Choice(flatSep, brokenSep, chunkGid)
+            val expectedChunk = Doc.Group(
+                open.append(Doc.align(a.append(chunkSepDoc).append(b).append(close))),
+                chunkGid
+            )
+            assert(chunkDoc == expectedChunk)
         }
     }
 
@@ -833,16 +954,25 @@ class DocTest extends kyo.test.Test[Any]:
             assert(chunk.join(open, sep, close) == Doc.join(open, sep, close)(chunk))
         }
 
+        def stripGroupIds(doc: Doc): Doc =
+            doc match
+                case Doc.Group(inner, _)         => Doc.Group(stripGroupIds(inner), 0)
+                case Doc.Choice(flat, broken, _) => Doc.Choice(stripGroupIds(flat), stripGroupIds(broken), 0)
+                case Doc.Concat(first, second)   => Doc.Concat(stripGroupIds(first), stripGroupIds(second))
+                case Doc.Indent(spaces, child)   => Doc.Indent(spaces, stripGroupIds(child))
+                case Doc.Align(child)            => Doc.Align(stripGroupIds(child))
+                case other                       => other
+
         "chop" in {
-            assert(chunk.chop(open, sep, close) == Doc.chop(open, sep, close)(chunk))
+            assert(stripGroupIds(chunk.chop(open, sep, close)) == stripGroupIds(Doc.chop(open, sep, close)(chunk)))
         }
 
         "chopClosed" in {
-            assert(chunk.chopClosed(open, sep, close) == Doc.chopClosed(open, sep, close)(chunk))
+            assert(stripGroupIds(chunk.chopClosed(open, sep, close)) == stripGroupIds(Doc.chopClosed(open, sep, close)(chunk)))
         }
 
         "hang" in {
-            assert(chunk.hang(open, sep, close) == Doc.hang(open, sep, close)(chunk))
+            assert(stripGroupIds(chunk.hang(open, sep, close)) == stripGroupIds(Doc.hang(open, sep, close)(chunk)))
         }
 
         "wrap" in {
