@@ -94,6 +94,73 @@ class PrinterTest extends kyo.test.Test[Any]:
                 )
                 assert(Printer.greedy.print(doc, 80) == "fn(a\n     b")
             }
+
+            "single column alignment pads to column boundary" in {
+                val doc = Doc.align { col =>
+                    Doc.concat(
+                        Doc.text("val a "),
+                        col,
+                        Doc.text("= 1"),
+                        Doc.newline,
+                        Doc.text("val longerName "),
+                        col,
+                        Doc.text("= 2")
+                    )
+                }
+                assert(Printer.greedy.print(doc, 80) == "val a          = 1\nval longerName = 2")
+            }
+
+            "single column with offset adds padding" in {
+                val doc = Doc.align { col =>
+                    Doc.concat(
+                        Doc.text("val a "),
+                        col.indent(2),
+                        Doc.text("= 1"),
+                        Doc.newline,
+                        Doc.text("val longerName "),
+                        col.indent(2),
+                        Doc.text("= 2")
+                    )
+                }
+                assert(Printer.greedy.print(doc, 80) == "val a            = 1\nval longerName   = 2")
+            }
+
+            "multi-column alignment aligns table columns" in {
+                val doc = Doc.align(2) { cols =>
+                    Doc.concat(
+                        Doc.text("a"),
+                        cols(0),
+                        Doc.text("b"),
+                        cols(1),
+                        Doc.text("c"),
+                        Doc.newline,
+                        Doc.text("long"),
+                        cols(0),
+                        Doc.text("longer"),
+                        cols(1),
+                        Doc.text("d")
+                    )
+                }
+                assert(Printer.greedy.print(doc, 80) == "a   b     c\nlonglongerd")
+            }
+
+            "marker following newline aligns continuation line" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align { col =>
+                        Doc.text("line1").append(Doc.newline).append(col).append(Doc.text("line2"))
+                    }
+                )
+                assert(Printer.greedy.print(doc, 80) == "prefix: line1\n        line2")
+            }
+
+            "marker with offset following newline indents continuation line" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align { col =>
+                        Doc.text("line1").append(Doc.newline).append(col.indent(4)).append(Doc.text("line2"))
+                    }
+                )
+                assert(Printer.greedy.print(doc, 80) == "prefix: line1\n            line2")
+            }
         }
 
         "grouping and lookahead" - {
@@ -161,6 +228,52 @@ class PrinterTest extends kyo.test.Test[Any]:
             "selects broken alternative outside group" in {
                 val doc = Doc.choice(flat = Doc.text("flat"), broken = Doc.text("broken"))
                 assert(Printer.greedy.print(doc, 80) == "broken")
+            }
+
+            "scoped group choice all flat when group fits" in {
+                val doc = Doc.group { choice =>
+                    Doc.concat(
+                        Doc.text("call("),
+                        choice.spaceOrNewline,
+                        Doc.text("arg1,"),
+                        choice.spaceOrNewline,
+                        Doc.text("arg2)")
+                    )
+                }
+                assert(Printer.greedy.print(doc, 30) == "call( arg1, arg2)")
+            }
+
+            "scoped group choice all broken when group overflows" in {
+                val doc = Doc.group { choice =>
+                    Doc.concat(
+                        Doc.text("call("),
+                        choice(Doc.empty, Doc.newline.indent(4)),
+                        Doc.text("arg1,"),
+                        choice(Doc.space, Doc.newline.indent(4)),
+                        Doc.text("arg2)")
+                    )
+                }
+                assert(Printer.greedy.print(doc, 10) == "call(\n    arg1,\n    arg2)")
+            }
+
+            "nested scoped groups coordinate choices independently" in {
+                val doc = Doc.group { outerChoice =>
+                    Doc.concat(
+                        Doc.text("outer("),
+                        outerChoice(Doc.empty, Doc.newline.indent(2)),
+                        Doc.group { innerChoice =>
+                            Doc.concat(
+                                Doc.text("inner("),
+                                innerChoice(Doc.empty, Doc.newline.indent(4)),
+                                Doc.text("x, y)")
+                            )
+                        },
+                        outerChoice(Doc.empty, Doc.newline),
+                        Doc.text(")")
+                    )
+                }
+                // When width is 15, outer breaks, but inner("inner(x, y)") is 11 chars so it fits flat:
+                assert(Printer.greedy.print(doc, 15) == "outer(\n  inner(x, y)\n)")
             }
         }
 
@@ -301,6 +414,21 @@ class PrinterTest extends kyo.test.Test[Any]:
                 )
                 assert(Printer.compact.print(doc, 80) == "prefix: line1 line2")
             }
+
+            "ignores column alignment markers" in {
+                val doc = Doc.align(2) { cols =>
+                    Doc.concat(
+                        Doc.text("val a "),
+                        cols(0),
+                        Doc.text("= 1"),
+                        Doc.newline,
+                        Doc.text("val longerName "),
+                        cols(0),
+                        Doc.text("= 2")
+                    )
+                }
+                assert(Printer.compact.print(doc, 80) == "val a = 1 val longerName = 2")
+            }
         }
 
         "grouping and choice" - {
@@ -320,6 +448,19 @@ class PrinterTest extends kyo.test.Test[Any]:
                     broken = Doc.text("outerBroken")
                 )
                 assert(Printer.compact.print(doc, 80) == "innerFlat")
+            }
+
+            "scoped group choice selects flat alternative" in {
+                val doc = Doc.group { choice =>
+                    Doc.concat(
+                        Doc.text("call("),
+                        choice(Doc.empty, Doc.newline.indent(4)),
+                        Doc.text("arg1,"),
+                        choice.spaceOrNewline,
+                        Doc.text("arg2)")
+                    )
+                }
+                assert(Printer.compact.print(doc, 1) == "call(arg1, arg2)")
             }
         }
 
@@ -468,6 +609,40 @@ class PrinterTest extends kyo.test.Test[Any]:
                 )
                 assert(Printer.optimal.print(doc, 80) == "fn(a\n     b")
             }
+
+            "single column alignment pads to column boundary" in {
+                val doc = Doc.align { col =>
+                    Doc.concat(
+                        Doc.text("val a "),
+                        col,
+                        Doc.text("= 1"),
+                        Doc.newline,
+                        Doc.text("val longerName "),
+                        col,
+                        Doc.text("= 2")
+                    )
+                }
+                assert(Printer.optimal.print(doc, 80) == "val a          = 1\nval longerName = 2")
+            }
+
+            "multi-column alignment aligns table columns" in {
+                val doc = Doc.align(2) { cols =>
+                    Doc.concat(
+                        Doc.text("a"),
+                        cols(0),
+                        Doc.text("b"),
+                        cols(1),
+                        Doc.text("c"),
+                        Doc.newline,
+                        Doc.text("long"),
+                        cols(0),
+                        Doc.text("longer"),
+                        cols(1),
+                        Doc.text("d")
+                    )
+                }
+                assert(Printer.optimal.print(doc, 80) == "a   b     c\nlonglongerd")
+            }
         }
 
         "choice and optimality" - {
@@ -497,6 +672,32 @@ class PrinterTest extends kyo.test.Test[Any]:
                 // "first-option-long s2" length 17 + 1 + 2 = 20 <= 25 (fits!)
                 // "first-option-long second-long" length 17 + 1 + 11 = 29
                 assert(Printer.optimal.print(doc, 22) == "first-option-long s2")
+            }
+
+            "scoped group choice all flat when group fits" in {
+                val doc = Doc.group { choice =>
+                    Doc.concat(
+                        Doc.text("call("),
+                        choice.spaceOrNewline,
+                        Doc.text("arg1,"),
+                        choice.spaceOrNewline,
+                        Doc.text("arg2)")
+                    )
+                }
+                assert(Printer.optimal.print(doc, 30) == "call( arg1, arg2)")
+            }
+
+            "scoped group choice all broken when group overflows" in {
+                val doc = Doc.group { choice =>
+                    Doc.concat(
+                        Doc.text("call("),
+                        choice(Doc.empty, Doc.newline.indent(4)),
+                        Doc.text("arg1,"),
+                        choice(Doc.space, Doc.newline.indent(4)),
+                        Doc.text("arg2)")
+                    )
+                }
+                assert(Printer.optimal.print(doc, 10) == "call(\n    arg1,\n    arg2)")
             }
         }
 

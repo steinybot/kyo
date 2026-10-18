@@ -99,6 +99,9 @@ private[kyo] object ScalafmtPrinter extends Printer:
             col += 1
         end emitSpace
 
+        private var alignTargets: Map[Int, Int]       = Map.empty
+        private var groupDecisions: Map[Int, Boolean] = Map.empty
+
         private def emitNewline(indent: Int): Unit =
             sb.append('\n')
             col = indent
@@ -111,21 +114,29 @@ private[kyo] object ScalafmtPrinter extends Printer:
           */
         def flatWidth(doc: Doc): Option[Int] =
             doc match
-                case Doc.Empty                 => Some(0)
-                case Doc.Text(text)            => Some(text.length)
-                case Doc.Newline               => Some(1)
-                case Doc.HardNewline           => None
-                case Doc.Indent(_, inner)      => flatWidth(inner)
-                case Doc.Align(inner)          => flatWidth(inner)
-                case Doc.Group(inner, _)       => flatWidth(inner)
-                case Doc.Choice(flat, _, _)    => flatWidth(flat)
+                case Doc.Empty                     => Some(0)
+                case Doc.Text(text)                => Some(text.length)
+                case Doc.Newline                   => Some(1)
+                case Doc.HardNewline               => None
+                case Doc.Indent(_, inner)          => flatWidth(inner)
+                case Doc.Align(inner)              => flatWidth(inner)
+                case Doc.Group(inner, _)           => flatWidth(inner)
+                case Doc.Choice(flat, broken, gid) =>
+                    val chooseFlat =
+                        if gid >= 0 then groupDecisions.getOrElse(gid, true)
+                        else true
+                    if chooseFlat then flatWidth(flat) else flatWidth(broken)
                 case Doc.Concat(first, second) =>
                     for
                         a <- flatWidth(first)
                         b <- flatWidth(second)
                     yield a + b
-                case Doc.Alignment(_, offset) => Some(math.max(0, offset))
-                case c: Doc.Clause            => clauseFlatWidth(c)
+                case Doc.Alignment(id, offset) =>
+                    val target = alignTargets.get(id) match
+                        case Some(t) => t + offset
+                        case None    => offset
+                    Some(math.max(0, target))
+                case c: Doc.Clause => clauseFlatWidth(c)
             end match
         end flatWidth
 
@@ -173,6 +184,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
         private def breaksWhenRendered(elem: Doc, startCol: Int): Boolean =
             val probe = new Renderer(width)
             probe.col = startCol
+            probe.alignTargets = alignTargets
+            probe.groupDecisions = groupDecisions
             probe.render(elem, startCol, flat = false)
             probe.newlines > 0
         end breaksWhenRendered
@@ -229,25 +242,51 @@ private[kyo] object ScalafmtPrinter extends Printer:
                         col = newBase
                     render(inner, newBase, flat)
 
-                case Doc.Align(inner) => render(inner, base, flat)
+                case Doc.Align(inner) =>
+                    val oldTargets   = alignTargets
+                    val innerTargets = Printer.computeAlignments(inner, col, col)
+                    if innerTargets.nonEmpty then
+                        alignTargets = alignTargets ++ innerTargets
+                    render(inner, col, flat)
+                    alignTargets = oldTargets
 
                 case Doc.Concat(first, second) =>
                     render(first, base, flat)
                     render(second, base, flat)
 
-                case Doc.Group(inner, _) =>
-                    if flat then render(inner, base, true)
+                case Doc.Group(inner, id) =>
+                    val oldDecisions = groupDecisions
+                    if flat then
+                        if id >= 0 then groupDecisions = groupDecisions.updated(id, true)
+                        render(inner, base, true)
                     else
-                        flatWidth(inner) match
-                            case Some(w) if col + w <= width => render(inner, base, true)
-                            case _                           => render(inner, base, false)
+                        val nextTest = if id >= 0 then groupDecisions.updated(id, true) else groupDecisions
+                        groupDecisions = nextTest
+                        val isFlat = flatWidth(inner) match
+                            case Some(w) if col + w <= width => true
+                            case _                           => false
+                        val finalDecisions = if id >= 0 then oldDecisions.updated(id, isFlat) else oldDecisions
+                        groupDecisions = finalDecisions
+                        render(inner, base, isFlat)
                     end if
+                    groupDecisions = oldDecisions
 
-                case Doc.Choice(flatAlt, broken, _) =>
-                    render(if flat then flatAlt else broken, base, flat)
+                case Doc.Choice(flatAlt, broken, gid) =>
+                    val chooseFlat =
+                        if gid >= 0 then
+                            groupDecisions.get(gid) match
+                                case Some(f) => f
+                                case None    => flat
+                        else
+                            flat
+                    render(if chooseFlat then flatAlt else broken, base, chooseFlat)
 
-                case Doc.Alignment(_, offset) =>
-                    if offset > 0 then emitText(" " * offset)
+                case Doc.Alignment(id, offset) =>
+                    val targetCol = alignTargets.get(id) match
+                        case Some(t) => t + offset
+                        case None    => col + math.max(0, offset)
+                    val spaces = math.max(0, targetCol - col)
+                    if spaces > 0 then emitText(" " * spaces)
 
                 case c: Doc.Clause =>
                     if flat then renderFlatClause(c, base)

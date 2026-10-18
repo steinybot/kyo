@@ -81,7 +81,93 @@ object Printer:
       */
     val scalafmt: Printer = ScalafmtPrinter
 
-    private case class Work(indent: Int, isFlat: Boolean, doc: Doc)
+    private[kyo] def hasAlignments(doc: Doc): Boolean =
+        doc match
+            case _: Doc.Alignment    => true
+            case Doc.Concat(a, b)    => hasAlignments(a) || hasAlignments(b)
+            case Doc.Indent(_, d)    => hasAlignments(d)
+            case Doc.Align(d)        => hasAlignments(d)
+            case Doc.Group(d, _)     => hasAlignments(d)
+            case Doc.Choice(a, b, _) =>
+                hasAlignments(a) || hasAlignments(b)
+            case Doc.Clause(_, o, c, es, s, _, _, _) =>
+                hasAlignments(o) || hasAlignments(c) || hasAlignments(s) || es.exists(hasAlignments)
+            case _ => false
+
+    private[kyo] def computeAlignments(
+        doc: Doc,
+        entranceCol: Int,
+        entranceIndent: Int
+    ): Map[Int, Int] =
+        if !hasAlignments(doc) then Map.empty
+        else
+            var targets       = Map.empty[Int, Int]
+            var changed       = true
+            var iterations    = 0
+            val maxIterations = 16
+
+            while changed && iterations < maxIterations do
+                iterations += 1
+                var measured = Map.empty[Int, Int]
+                var col      = entranceCol
+                var indent   = entranceIndent
+
+                def measure(d: Doc): Unit =
+                    d match
+                        case Doc.Empty      => ()
+                        case Doc.Text(text) =>
+                            col += text.length
+                        case Doc.Newline =>
+                            col = indent
+                        case Doc.HardNewline =>
+                            col = indent
+                        case Doc.Indent(spaces, child) =>
+                            val oldIndent = indent
+                            indent += spaces
+                            measure(child)
+                            indent = oldIndent
+                        case Doc.Align(child) =>
+                            val oldIndent = indent
+                            indent = col
+                            measure(child)
+                            indent = oldIndent
+                        case Doc.Concat(first, second) =>
+                            measure(first)
+                            measure(second)
+                        case Doc.Group(child, _) =>
+                            measure(child)
+                        case Doc.Choice(flat, broken, _) =>
+                            measure(broken)
+                        case Doc.Alignment(id, offset) =>
+                            val currentTarget = targets.getOrElse(id, 0)
+                            val colBefore     = col
+                            val prevMax       = measured.getOrElse(id, colBefore)
+                            measured = measured.updated(id, math.max(prevMax, colBefore))
+                            val aligned = math.max(colBefore, currentTarget + offset)
+                            col = aligned
+                        case c: Doc.Clause =>
+                            measure(Doc.lowerClause(c))
+                end measure
+
+                measure(doc)
+
+                if measured == targets then
+                    changed = false
+                else
+                    targets = measured
+                end if
+            end while
+
+            targets
+    end computeAlignments
+
+    private case class Work(
+        indent: Int,
+        isFlat: Boolean,
+        doc: Doc,
+        alignTargets: Map[Int, Int] = Map.empty,
+        groupDecisions: Map[Int, Boolean] = Map.empty
+    )
 
     private case class StreamState(work: List[Work], col: Int, pendingIndent: Int)
 
@@ -110,22 +196,49 @@ object Printer:
                             case Doc.HardNewline =>
                                 true
                             case Doc.Indent(spaces, inner) =>
-                                fits(budget, Work(head.indent + spaces, head.isFlat, inner) :: rest)
+                                fits(budget, Work(head.indent + spaces, head.isFlat, inner, head.alignTargets, head.groupDecisions) :: rest)
                             case Doc.Align(inner) =>
-                                fits(budget, Work(head.indent, head.isFlat, inner) :: rest)
+                                val innerTargets = computeAlignments(inner, 0, 0)
+                                val nextTargets  = if innerTargets.isEmpty then head.alignTargets else head.alignTargets ++ innerTargets
+                                fits(budget, Work(head.indent, head.isFlat, inner, nextTargets, head.groupDecisions) :: rest)
                             case Doc.Concat(first, second) =>
-                                fits(budget, Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: rest)
-                            case Doc.Group(inner, _) =>
-                                fits(budget, Work(head.indent, head.isFlat, inner) :: rest)
-                            case Doc.Choice(flat, broken, _) =>
-                                if head.isFlat then
-                                    fits(budget, Work(head.indent, true, flat) :: rest)
+                                fits(
+                                    budget,
+                                    Work(head.indent, head.isFlat, first, head.alignTargets, head.groupDecisions) ::
+                                        Work(head.indent, head.isFlat, second, head.alignTargets, head.groupDecisions) :: rest
+                                )
+                            case Doc.Group(inner, gid) =>
+                                val nextDecisions =
+                                    if gid >= 0 then
+                                        head.groupDecisions.get(gid) match
+                                            case Some(_) => head.groupDecisions
+                                            case None    => head.groupDecisions.updated(gid, head.isFlat)
+                                    else
+                                        head.groupDecisions
+                                fits(budget, Work(head.indent, head.isFlat, inner, head.alignTargets, nextDecisions) :: rest)
+                            case Doc.Choice(flat, broken, gid) =>
+                                val chooseFlat =
+                                    if gid >= 0 then
+                                        head.groupDecisions.get(gid) match
+                                            case Some(isFlat) => isFlat
+                                            case None         => head.isFlat
+                                    else
+                                        head.isFlat
+                                if chooseFlat then
+                                    fits(budget, Work(head.indent, true, flat, head.alignTargets, head.groupDecisions) :: rest)
                                 else
-                                    fits(budget, Work(head.indent, false, broken) :: rest)
-                            case Doc.Alignment(_, offset) =>
-                                fits(budget - math.max(0, offset), rest)
+                                    fits(budget, Work(head.indent, false, broken, head.alignTargets, head.groupDecisions) :: rest)
+                                end if
+                            case Doc.Alignment(id, offset) =>
+                                val spaces = head.alignTargets.get(id) match
+                                    case Some(t) => math.max(0, t + offset)
+                                    case None    => math.max(0, offset)
+                                fits(budget - spaces, rest)
                             case c: Doc.Clause =>
-                                fits(budget, Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: rest)
+                                fits(
+                                    budget,
+                                    Work(head.indent, head.isFlat, Doc.lowerClause(c), head.alignTargets, head.groupDecisions) :: rest
+                                )
 
         def print(doc: Doc, width: Int): String =
             if doc eq Doc.Empty then ""
@@ -187,43 +300,71 @@ object Printer:
                                 pendingIndent = newIndent
                                 col = newIndent
                             end if
-                            work = Work(newIndent, head.isFlat, inner) :: work
+                            work = Work(newIndent, head.isFlat, inner, head.alignTargets, head.groupDecisions) :: work
 
                         case Doc.Align(inner) =>
-                            work = Work(col, head.isFlat, inner) :: work
+                            val innerTargets = computeAlignments(inner, col, col)
+                            val nextTargets  = if innerTargets.isEmpty then head.alignTargets else head.alignTargets ++ innerTargets
+                            work = Work(col, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
 
                         case Doc.Concat(first, second) =>
-                            work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
+                            work = Work(head.indent, head.isFlat, first, head.alignTargets, head.groupDecisions) ::
+                                Work(head.indent, head.isFlat, second, head.alignTargets, head.groupDecisions) :: work
 
-                        case Doc.Choice(flat, broken, _) =>
-                            if head.isFlat then
-                                work = Work(head.indent, true, flat) :: work
+                        case Doc.Choice(flat, broken, gid) =>
+                            val chooseFlat =
+                                if gid >= 0 then
+                                    head.groupDecisions.get(gid) match
+                                        case Some(isFlat) => isFlat
+                                        case None         => head.isFlat
+                                else
+                                    head.isFlat
+                            if chooseFlat then
+                                work = Work(head.indent, true, flat, head.alignTargets, head.groupDecisions) :: work
                             else
-                                work = Work(head.indent, false, broken) :: work
+                                work = Work(head.indent, false, broken, head.alignTargets, head.groupDecisions) :: work
                             end if
 
-                        case Doc.Alignment(_, offset) =>
-                            if offset > 0 then
+                        case Doc.Alignment(id, offset) =>
+                            val targetCol = head.alignTargets.get(id) match
+                                case Some(t) => t + offset
+                                case None    => col + math.max(0, offset)
+                            val spaces = math.max(0, targetCol - col)
+                            if spaces > 0 then
+                                if pendingIndent >= 0 then
+                                    val indentSpaces = math.max(0, pendingIndent)
+                                    var i            = 0
+                                    while i < indentSpaces do
+                                        sb.append(' ')
+                                        i += 1
+                                    end while
+                                    col += indentSpaces
+                                    pendingIndent = -1
+                                end if
                                 var i = 0
-                                while i < offset do
+                                while i < spaces do
                                     sb.append(' ')
                                     i += 1
                                 end while
-                                col += offset
+                                col += spaces
                             end if
 
                         case c: Doc.Clause =>
-                            work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
+                            work = Work(head.indent, head.isFlat, Doc.lowerClause(c), head.alignTargets, head.groupDecisions) :: work
 
-                        case Doc.Group(inner, _) =>
+                        case Doc.Group(inner, gid) =>
                             if head.isFlat then
-                                work = Work(head.indent, true, inner) :: work
+                                val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                                work = Work(head.indent, true, inner, head.alignTargets, nextDecisions) :: work
                             else
-                                val flatFits = fits(width - col, Work(head.indent, true, inner) :: work)
+                                val testDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                                val flatFits = fits(width - col, Work(head.indent, true, inner, head.alignTargets, testDecisions) :: work)
                                 if flatFits then
-                                    work = Work(head.indent, true, inner) :: work
+                                    val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                                    work = Work(head.indent, true, inner, head.alignTargets, nextDecisions) :: work
                                 else
-                                    work = Work(head.indent, false, inner) :: work
+                                    val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, false) else head.groupDecisions
+                                    work = Work(head.indent, false, inner, head.alignTargets, nextDecisions) :: work
                                 end if
                             end if
                     end match
@@ -297,43 +438,71 @@ object Printer:
                             pendingIndent = newIndent
                             col = newIndent
                         end if
-                        work = Work(newIndent, head.isFlat, inner) :: work
+                        work = Work(newIndent, head.isFlat, inner, head.alignTargets, head.groupDecisions) :: work
 
                     case Doc.Align(inner) =>
-                        work = Work(col, head.isFlat, inner) :: work
+                        val innerTargets = computeAlignments(inner, col, col)
+                        val nextTargets  = if innerTargets.isEmpty then head.alignTargets else head.alignTargets ++ innerTargets
+                        work = Work(col, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
 
                     case Doc.Concat(first, second) =>
-                        work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
+                        work = Work(head.indent, head.isFlat, first, head.alignTargets, head.groupDecisions) ::
+                            Work(head.indent, head.isFlat, second, head.alignTargets, head.groupDecisions) :: work
 
-                    case Doc.Choice(flat, broken, _) =>
-                        if head.isFlat then
-                            work = Work(head.indent, true, flat) :: work
+                    case Doc.Choice(flat, broken, gid) =>
+                        val chooseFlat =
+                            if gid >= 0 then
+                                head.groupDecisions.get(gid) match
+                                    case Some(isFlat) => isFlat
+                                    case None         => head.isFlat
+                            else
+                                head.isFlat
+                        if chooseFlat then
+                            work = Work(head.indent, true, flat, head.alignTargets, head.groupDecisions) :: work
                         else
-                            work = Work(head.indent, false, broken) :: work
+                            work = Work(head.indent, false, broken, head.alignTargets, head.groupDecisions) :: work
                         end if
 
-                    case Doc.Alignment(_, offset) =>
-                        if offset > 0 then
+                    case Doc.Alignment(id, offset) =>
+                        val targetCol = head.alignTargets.get(id) match
+                            case Some(t) => t + offset
+                            case None    => col + math.max(0, offset)
+                        val spaces = math.max(0, targetCol - col)
+                        if spaces > 0 then
+                            if pendingIndent >= 0 then
+                                val indentSpaces = math.max(0, pendingIndent)
+                                var i            = 0
+                                while i < indentSpaces do
+                                    sb.append(' ')
+                                    i += 1
+                                end while
+                                col += indentSpaces
+                                pendingIndent = -1
+                            end if
                             var i = 0
-                            while i < offset do
+                            while i < spaces do
                                 sb.append(' ')
                                 i += 1
                             end while
-                            col += offset
+                            col += spaces
                         end if
 
                     case c: Doc.Clause =>
-                        work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
+                        work = Work(head.indent, head.isFlat, Doc.lowerClause(c), head.alignTargets, head.groupDecisions) :: work
 
-                    case Doc.Group(inner, _) =>
+                    case Doc.Group(inner, gid) =>
                         if head.isFlat then
-                            work = Work(head.indent, true, inner) :: work
+                            val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                            work = Work(head.indent, true, inner, head.alignTargets, nextDecisions) :: work
                         else
-                            val flatFits = fits(width - col, Work(head.indent, true, inner) :: work)
+                            val testDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                            val flatFits      = fits(width - col, Work(head.indent, true, inner, head.alignTargets, testDecisions) :: work)
                             if flatFits then
-                                work = Work(head.indent, true, inner) :: work
+                                val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, true) else head.groupDecisions
+                                work = Work(head.indent, true, inner, head.alignTargets, nextDecisions) :: work
                             else
-                                work = Work(head.indent, false, inner) :: work
+                                val nextDecisions = if gid >= 0 then head.groupDecisions.updated(gid, false) else head.groupDecisions
+                                work = Work(head.indent, false, inner, head.alignTargets, nextDecisions) :: work
                             end if
                         end if
                 end match
@@ -414,14 +583,7 @@ object Printer:
                         case Doc.Choice(flat, _, _) =>
                             work = flat :: work
 
-                        case Doc.Alignment(_, offset) =>
-                            if offset > 0 then
-                                var i = 0
-                                while i < offset do
-                                    sb.append(' ')
-                                    i += 1
-                                end while
-                            end if
+                        case Doc.Alignment(_, _) => ()
 
                         case c: Doc.Clause =>
                             work = Doc.lowerClause(c) :: work
@@ -471,14 +633,7 @@ object Printer:
                     case Doc.Choice(flat, _, _) =>
                         work = flat :: work
 
-                    case Doc.Alignment(_, offset) =>
-                        if offset > 0 then
-                            var i = 0
-                            while i < offset do
-                                sb.append(' ')
-                                i += 1
-                            end while
-                        end if
+                    case Doc.Alignment(_, _) => ()
 
                     case c: Doc.Clause =>
                         work = Doc.lowerClause(c) :: work
@@ -614,7 +769,15 @@ object Printer:
             case object BrokenGroup extends Mode
         end Mode
 
-        private case class MemoKey(doc: Doc, col: Int, indent: Int, pendingIndent: Int, mode: Mode)
+        private case class MemoKey(
+            doc: Doc,
+            col: Int,
+            indent: Int,
+            pendingIndent: Int,
+            mode: Mode,
+            alignTargets: Map[Int, Int],
+            groupDecisions: Map[Int, Boolean]
+        )
 
         private def resolve(
             doc: Doc,
@@ -623,9 +786,11 @@ object Printer:
             pendingIndent: Int,
             mode: Mode,
             width: Int,
-            memo: java.util.HashMap[MemoKey, List[Measure]]
+            memo: java.util.HashMap[MemoKey, List[Measure]],
+            alignTargets: Map[Int, Int],
+            groupDecisions: Map[Int, Boolean]
         ): List[Measure] =
-            val key = MemoKey(doc, col, indent, pendingIndent, mode)
+            val key = MemoKey(doc, col, indent, pendingIndent, mode, alignTargets, groupDecisions)
             val hit = memo.get(key)
             if hit != null then hit
             else
@@ -666,60 +831,112 @@ object Printer:
                         val newIndent  = indent + spaces
                         val newPending = if pendingIndent >= 0 then newIndent else -1
                         val newCol     = if pendingIndent >= 0 then newIndent else col
-                        resolve(inner, newCol, newIndent, newPending, mode, width, memo)
+                        resolve(inner, newCol, newIndent, newPending, mode, width, memo, alignTargets, groupDecisions)
 
                     case Doc.Align(inner) =>
-                        val alignCol = if pendingIndent >= 0 then pendingIndent else col
-                        resolve(inner, col, alignCol, pendingIndent, mode, width, memo)
+                        val alignCol     = if pendingIndent >= 0 then pendingIndent else col
+                        val innerTargets = computeAlignments(inner, alignCol, alignCol)
+                        val nextTargets  = if innerTargets.isEmpty then alignTargets else alignTargets ++ innerTargets
+                        resolve(inner, col, alignCol, pendingIndent, mode, width, memo, nextTargets, groupDecisions)
 
                     case Doc.Concat(first, second) =>
-                        val leftMs = resolve(first, col, indent, pendingIndent, mode, width, memo)
-                        processConcat(leftMs, m1 => resolve(second, m1.last, indent, m1.pendingIndent, mode, width, memo))
+                        val leftMs = resolve(first, col, indent, pendingIndent, mode, width, memo, alignTargets, groupDecisions)
+                        processConcat(
+                            leftMs,
+                            m1 => resolve(second, m1.last, indent, m1.pendingIndent, mode, width, memo, alignTargets, groupDecisions)
+                        )
 
-                    case Doc.Group(inner, _) =>
+                    case Doc.Group(inner, id) =>
                         mode match
                             case Mode.Flat =>
-                                resolve(inner, col, indent, pendingIndent, Mode.Flat, width, memo)
+                                val flatDecisions = if id >= 0 then groupDecisions.updated(id, true) else groupDecisions
+                                resolve(inner, col, indent, pendingIndent, Mode.Flat, width, memo, alignTargets, flatDecisions)
                             case _ =>
-                                val flatMs      = resolve(inner, col, indent, pendingIndent, Mode.Flat, width, memo)
+                                val flatDecisions   = if id >= 0 then groupDecisions.updated(id, true) else groupDecisions
+                                val brokenDecisions = if id >= 0 then groupDecisions.updated(id, false) else groupDecisions
+                                val flatMs          =
+                                    resolve(inner, col, indent, pendingIndent, Mode.Flat, width, memo, alignTargets, flatDecisions)
                                 val fittingFlat = flatMs.filter(_.cost.overflow == 0)
-                                val brokenMs    = resolve(inner, col, indent, pendingIndent, Mode.BrokenGroup, width, memo)
+                                val brokenMs    =
+                                    resolve(inner, col, indent, pendingIndent, Mode.BrokenGroup, width, memo, alignTargets, brokenDecisions)
                                 if fittingFlat.nonEmpty then
                                     merge(brokenMs, fittingFlat)
                                 else
                                     brokenMs
                                 end if
 
-                    case Doc.Choice(flat, broken, _) =>
-                        mode match
-                            case Mode.Flat =>
-                                resolve(flat, col, indent, pendingIndent, Mode.Flat, width, memo)
-                            case Mode.BrokenGroup =>
-                                resolve(broken, col, indent, pendingIndent, Mode.BrokenGroup, width, memo)
-                            case Mode.General =>
-                                val flatMs   = resolve(flat, col, indent, pendingIndent, Mode.General, width, memo)
-                                val flatBest = flatMs.minBy(_.cost.overflow)
-                                if flatBest.cost.overflow == 0 then
-                                    flatMs
-                                else
-                                    val brokenMs   = resolve(broken, col, indent, pendingIndent, Mode.General, width, memo)
-                                    val brokenBest = brokenMs.minBy(_.cost.overflow)
-                                    if brokenBest.cost.overflow < flatBest.cost.overflow then
-                                        brokenMs
-                                    else
-                                        flatMs
-                                    end if
-                                end if
+                    case Doc.Choice(flat, broken, gid) =>
+                        val fixed = if gid >= 0 then groupDecisions.get(gid) else None
+                        fixed match
+                            case Some(true) =>
+                                resolve(flat, col, indent, pendingIndent, mode, width, memo, alignTargets, groupDecisions)
+                            case Some(false) =>
+                                resolve(broken, col, indent, pendingIndent, mode, width, memo, alignTargets, groupDecisions)
+                            case None =>
+                                mode match
+                                    case Mode.Flat =>
+                                        resolve(flat, col, indent, pendingIndent, Mode.Flat, width, memo, alignTargets, groupDecisions)
+                                    case Mode.BrokenGroup =>
+                                        resolve(
+                                            broken,
+                                            col,
+                                            indent,
+                                            pendingIndent,
+                                            Mode.BrokenGroup,
+                                            width,
+                                            memo,
+                                            alignTargets,
+                                            groupDecisions
+                                        )
+                                    case Mode.General =>
+                                        val flatMs = resolve(
+                                            flat,
+                                            col,
+                                            indent,
+                                            pendingIndent,
+                                            Mode.General,
+                                            width,
+                                            memo,
+                                            alignTargets,
+                                            groupDecisions
+                                        )
+                                        val flatBest = flatMs.minBy(_.cost.overflow)
+                                        if flatBest.cost.overflow == 0 then
+                                            flatMs
+                                        else
+                                            val brokenMs =
+                                                resolve(
+                                                    broken,
+                                                    col,
+                                                    indent,
+                                                    pendingIndent,
+                                                    Mode.General,
+                                                    width,
+                                                    memo,
+                                                    alignTargets,
+                                                    groupDecisions
+                                                )
+                                            val brokenBest = brokenMs.minBy(_.cost.overflow)
+                                            if brokenBest.cost.overflow < flatBest.cost.overflow then
+                                                brokenMs
+                                            else
+                                                flatMs
+                                            end if
+                                        end if
+                        end match
 
                     case a: Doc.Alignment =>
-                        val spaces = math.max(0, a.offset)
+                        val targetCol = alignTargets.get(a.id) match
+                            case Some(t) => t + a.offset
+                            case None    => col + math.max(0, a.offset)
+                        val spaces = math.max(0, targetCol - col)
                         val newCol = col + spaces
                         val cost   = textCost(col, spaces, width)
                         val tok    = if spaces > 0 then TText(" " * spaces) :: Nil else Nil
                         List(Measure(newCol, pendingIndent, cost, tok))
 
                     case c: Doc.Clause =>
-                        resolve(Doc.lowerClause(c), col, indent, pendingIndent, mode, width, memo)
+                        resolve(Doc.lowerClause(c), col, indent, pendingIndent, mode, width, memo, alignTargets, groupDecisions)
                 memo.put(key, res)
                 res
             end if
@@ -729,7 +946,7 @@ object Printer:
             if doc eq Doc.Empty then Nil
             else
                 val memo = new java.util.HashMap[MemoKey, List[Measure]]()
-                val ms   = resolve(doc, 0, 0, -1, Mode.General, width, memo)
+                val ms   = resolve(doc, 0, 0, -1, Mode.General, width, memo, Map.empty, Map.empty)
                 if ms.isEmpty then Nil
                 else
                     var best = ms.head

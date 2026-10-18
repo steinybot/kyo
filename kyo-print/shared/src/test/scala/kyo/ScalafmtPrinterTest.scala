@@ -1573,6 +1573,70 @@ class ScalafmtPrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "aligned columns" - {
+        "single column alignment pads to column boundary" in {
+            val doc = Doc.align { col =>
+                Doc.concat(
+                    Doc.text("val a "),
+                    col,
+                    Doc.text("= 1"),
+                    Doc.newline,
+                    Doc.text("val longerName "),
+                    col,
+                    Doc.text("= 2")
+                )
+            }
+            assert(Printer.scalafmt.print(doc, 80) == "val a          = 1\nval longerName = 2")
+        }
+
+        "multi-column alignment aligns table columns" in {
+            val doc = Doc.align(2) { cols =>
+                Doc.concat(
+                    Doc.text("a"),
+                    cols(0),
+                    Doc.text("b"),
+                    cols(1),
+                    Doc.text("c"),
+                    Doc.newline,
+                    Doc.text("long"),
+                    cols(0),
+                    Doc.text("longer"),
+                    cols(1),
+                    Doc.text("d")
+                )
+            }
+            assert(Printer.scalafmt.print(doc, 80) == "a   b     c\nlonglongerd")
+        }
+    }
+
+    "scoped group choices" - {
+        "all choices flat when group fits within width" in {
+            val doc = Doc.group { choice =>
+                Doc.concat(
+                    Doc.text("call("),
+                    choice.spaceOrNewline,
+                    Doc.text("arg1,"),
+                    choice.spaceOrNewline,
+                    Doc.text("arg2)")
+                )
+            }
+            assert(Printer.scalafmt.print(doc, 30) == "call( arg1, arg2)")
+        }
+
+        "all choices broken when group exceeds width" in {
+            val doc = Doc.group { choice =>
+                Doc.concat(
+                    Doc.text("call("),
+                    choice(Doc.empty, Doc.newline.indent(4)),
+                    Doc.text("arg1,"),
+                    choice(Doc.space, Doc.newline.indent(4)),
+                    Doc.text("arg2)")
+                )
+            }
+            assert(Printer.scalafmt.print(doc, 10) == "call(\n    arg1,\n    arg2)")
+        }
+    }
+
     "printStream" - {
         "emits the same text as print, chunked by line" in {
             val policy = Doc.ClausePolicy(Doc.ClauseSite.Call, 2, true, false, Doc.BinPackMode.Never)
