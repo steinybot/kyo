@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 20
+comments.wrap = standalone
+<<< example
+/* long multiline comment */
+// long singleline comment
+val a = 1 // short
+val b = 2 // long singleline comment
+>>>
+/* long multiline
+ * comment */
+// long singleline comment
+val a = 1 // short
+val b =
+  2 // long singleline comment

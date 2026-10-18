@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.ifElseExpressions = true
+<<< example
+
+if (a > b) {
+  doSomething()
+} else {
+  doAnything()
+}
+>>>
+if (a > b)
+  doSomething()
+else
+  doAnything()

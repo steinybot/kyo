@@ -457,6 +457,7 @@ lazy val kyoJVM: Project = project
         `kyo-kernel`.jvm,
         `kyo-prelude`.jvm,
         `kyo-parse`.jvm,
+        `kyo-print`.jvm,
         `kyo-core`.jvm,
         `kyo-offheap`.jvm,
         `kyo-ffi`.jvm,
@@ -561,6 +562,7 @@ lazy val kyoJS = project
         `kyo-kernel`.js,
         `kyo-prelude`.js,
         `kyo-parse`.js,
+        `kyo-print`.js,
         `kyo-core`.js,
         `kyo-ffi`.js,
         `kyo-ffi-it`.js,
@@ -645,6 +647,7 @@ lazy val kyoNative = project
         `kyo-mime`.native,
         `kyo-prelude`.native,
         `kyo-parse`.native,
+        `kyo-print`.native,
         `kyo-kernel`.native,
         `kyo-stats-registry`.native,
         `kyo-config`.native,
@@ -735,6 +738,7 @@ lazy val kyoWasm = project
         `kyo-kernel`.wasm,
         `kyo-prelude`.wasm,
         `kyo-parse`.wasm,
+        `kyo-print`.wasm,
         `kyo-schema`.wasm,
         `kyo-schema-json`.wasm,
         `kyo-schema-protobuf`.wasm,
@@ -1068,6 +1072,18 @@ lazy val `kyo-parse` =
         .dependsOn(`kyo-prelude`)
         .withKyoTest
         .in(file("kyo-parse"))
+        .settings(`kyo-settings`)
+        .jvmSettings(mimaCheck(false))
+        .nativeSettings(`native-settings`)
+        .jsSettings(`js-settings`)
+        .wasmSettings(`wasm-settings`)
+
+lazy val `kyo-print` =
+    crossProject(JSPlatform, JVMPlatform, NativePlatform, WasmPlatform)
+        .crossType(CrossType.Full)
+        .dependsOn(`kyo-prelude`)
+        .withKyoTest
+        .in(file("kyo-print"))
         .settings(`kyo-settings`)
         .jvmSettings(mimaCheck(false))
         .nativeSettings(`native-settings`)
@@ -1961,6 +1977,7 @@ lazy val `kyo-ffi-it` =
 lazy val `kyo-ffi-codegen` =
     project
         .in(file("kyo-ffi/codegen"))
+        .dependsOn(`kyo-print`.jvm)
         .dependsOn(`kyo-ffi`.jvm % Test)
         .settings(
             `kyo-settings`,

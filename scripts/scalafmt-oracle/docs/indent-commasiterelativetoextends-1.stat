@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+runner.dialect = scala3
+indent.extendSite = 4
+indent.commaSiteRelativeToExtends = 4
+maxColumn = 20
+<<< example
+trait Foo extends A, B, C, D, E {
+  def foo: Boolean = true
+}
+>>>
+trait Foo
+    extends A,
+        B,
+        C,
+        D,
+        E {
+  def foo: Boolean =
+    true
+}

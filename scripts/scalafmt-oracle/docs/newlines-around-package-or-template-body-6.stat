@@ -1,0 +1,42 @@
+runner.dialect = sbt1
+maxColumn = 40
+newlines.source = keep
+newlines.beforeTemplateBodyIfBreakInParentCtors = false
+<<< example
+package core {
+  class C1 extends S { // no breaks between "C1" and "{"
+    def one = 1
+  }
+  class C1(
+    param: Int
+  ) extends S { // no breaks between ")" and "{"
+    def one = 1
+  }
+  class C1 extends S { // no breaks between "C1" and "=>"
+    self =>
+    def one = 1
+  }
+  class C1
+    extends S { // break between "C1" and "{"
+    def one = 1
+  }
+}
+>>>
+package core {
+  class C1 extends S { // no breaks between "C1" and "{"
+    def one = 1
+  }
+  class C1(
+      param: Int
+  ) extends S { // no breaks between ")" and "{"
+    def one = 1
+  }
+  class C1 extends S { // no breaks between "C1" and "=>"
+    self =>
+    def one = 1
+  }
+  class C1
+      extends S { // break between "C1" and "{"
+    def one = 1
+  }
+}

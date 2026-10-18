@@ -1,0 +1,26 @@
+runner.dialect = scala213
+maxColumn = 40
+align.preset = some
+<<< example
+x match { // true for case arrows
+  case 2 => 22
+  case 22 => 222
+}
+
+val x = 2 // false for assignment
+val xx = 22
+
+case object B extends A // false for `extends`
+case object BB extends A
+>>>
+x match { // true for case arrows
+  case 2  => 22
+  case 22 => 222
+}
+
+val x = 2 // false for assignment
+val xx = 22
+
+case object B
+    extends A // false for `extends`
+case object BB extends A

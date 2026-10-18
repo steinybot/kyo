@@ -1,0 +1,27 @@
+runner.dialect = scala213
+maxColumn = 40
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+<<< example
+case class Foo(x: String)
+case class Bar(x: String, y: String)
+object A {
+  def foo(x: String, y: String)
+  def hello(how: String)(are: String)(you: String) = how + are + you
+}
+>>>
+case class Foo(x: String)
+case class Bar(
+    x: String,
+    y: String)
+object A {
+  def foo(
+      x: String,
+      y: String
+    )
+  def hello(
+      how: String
+    )(are: String
+    )(you: String
+    ) = how + are + you
+}

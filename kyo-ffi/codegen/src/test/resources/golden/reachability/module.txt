@@ -1,0 +1,17 @@
+{
+  "reflection": [
+    { "type": "kyo.example.MetaImpl", "methods": [ { "name": "<init>", "parameterTypes": [] } ] },
+    { "type": "kyo.example.MetaOtherImpl", "methods": [ { "name": "<init>", "parameterTypes": [] } ] }
+  ],
+  "foreign": {
+    "downcalls": [
+      { "returnType": "void", "parameterTypes": ["void*", "jint"], "options": { "captureCallState": true } },
+      { "returnType": "jint", "parameterTypes": ["void*"], "options": { "captureCallState": true, "critical": { "allowHeapAccess": true } } },
+      { "returnType": "void", "parameterTypes": ["void*"], "options": { "captureCallState": true } },
+      { "returnType": "jint", "parameterTypes": [], "options": { "captureCallState": true } }
+    ],
+    "upcalls": [
+      { "returnType": "void", "parameterTypes": ["jint"] }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 20
+runner.dialect = scala3 // for CallSite
+align.openParenCallSite = true
+newlines {
+  beforeOpenParenDefnSite = unfold
+  beforeOpenParenCallSite = fold
+  sometimesBeforeColonInMethodReturnType = false
+}
+<<< example
+def fooFunc(foo1: String)(foo2: String, foo3: String): String = ???
+val res = fooFunc("foo1")("foo2", "foo3")
+>>>
+def fooFunc
+  (foo1: String)
+  (
+      foo2: String,
+      foo3: String
+  ): String = ???
+val res = fooFunc
+  ("foo1")
+  ("foo2", "foo3")

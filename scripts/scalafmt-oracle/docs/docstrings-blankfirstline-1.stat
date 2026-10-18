@@ -1,0 +1,21 @@
+runner.dialect = scala213
+maxColumn = 40
+# do not force a blank first line
+docstrings.blankFirstLine = fold
+docstrings.style = SpaceAsterisk
+maxColumn = 30
+<<< example
+/** Scaladoc oneline */
+/** Scaladoc multiline1
+  */
+/**
+  * Scaladoc multiline2
+  */
+val a = 1
+>>>
+/** Scaladoc oneline */
+/** Scaladoc multiline1
+  */
+/** Scaladoc multiline2
+  */
+val a = 1

@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 60
+newlines.implicitParamListModifierForce = [before,after]
+<<< example
+def format(code: String, age: Int)(implicit ev: Parser, c: Context): String
+>>>
+def format(code: String, age: Int)(
+    implicit
+    ev: Parser,
+    c: Context
+): String

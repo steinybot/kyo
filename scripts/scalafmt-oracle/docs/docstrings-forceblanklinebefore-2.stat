@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+docstrings.forceBlankLineBefore = false
+<<< example
+object Stuff {
+  /** Some function */
+  def hello = ()
+}
+>>>
+object Stuff {
+  /** Some function */
+  def hello = ()
+}

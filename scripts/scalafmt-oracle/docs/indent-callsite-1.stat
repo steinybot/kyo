@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+indent.callSite = 2
+<<< example
+function(
+argument1, // indented by 2
+""
+)
+>>>
+function(
+  argument1, // indented by 2
+  ""
+)

@@ -1,0 +1,9 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 40
+newlines.sometimesBeforeColonInMethodReturnType = true
+<<< example
+def someVeryLongMethodName: Map[String, String] = ???
+>>>
+def someVeryLongMethodName
+    : Map[String, String] = ???

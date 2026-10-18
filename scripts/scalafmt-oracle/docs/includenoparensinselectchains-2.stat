@@ -1,0 +1,9 @@
+runner.dialect = scala213
+maxColumn = 40
+includeNoParensInSelectChains = false
+<<< example
+List(1).toIterator.buffered.map(_ + 2).filter(_ > 2)
+>>>
+List(1).toIterator.buffered
+  .map(_ + 2)
+  .filter(_ > 2)

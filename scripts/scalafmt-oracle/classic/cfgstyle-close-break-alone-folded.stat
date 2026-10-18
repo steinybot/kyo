@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+<<< example
+object a {
+  send(alpha, beta, gammaLongIdentifier
+  )
+}
+>>>
+object a {
+  send(alpha, beta, gammaLongIdentifier)
+}

@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+align.openParenDefnSite = true
+<<< example
+class IntString(int: Int, string: String)
+
+class IntStringLong(int: Int,
+    string: String,
+  long: Long)
+>>>
+class IntString(int: Int,
+                string: String
+)
+
+class IntStringLong(int: Int,
+                    string: String,
+                    long: Long
+)

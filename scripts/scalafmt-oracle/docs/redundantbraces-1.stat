@@ -1,0 +1,10 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+<<< example
+def foo = {
+  List(1, 2, 3).sum
+}
+>>>
+def foo =
+  List(1, 2, 3).sum

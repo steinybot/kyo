@@ -1,0 +1,27 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.beforeCurlyLambdaParams = always
+<<< example
+// should break on brace, though fits on the same line
+x.map { x => s"${x._1} -> ${x._2}" }
+x.map { case (c, i) => s"$c -> $i" }
+x.zipWithIndex.map { case (c, i) => s"$c -> $i (long comment)" }
+// should break on brace and arrow as lambda doesn't fit on a line
+x.zipWithIndex.map { x => s"${x._1} -> ${x._2} (long comment)" }
+>>>
+// should break on brace, though fits on the same line
+x.map {
+  x => s"${x._1} -> ${x._2}"
+}
+x.map {
+  case (c, i) => s"$c -> $i"
+}
+x.zipWithIndex.map {
+  case (c, i) =>
+    s"$c -> $i (long comment)"
+}
+// should break on brace and arrow as lambda doesn't fit on a line
+x.zipWithIndex.map {
+  x =>
+    s"${x._1} -> ${x._2} (long comment)"
+}

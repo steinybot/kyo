@@ -1,0 +1,49 @@
+runner.dialect = scala213
+maxColumn = 40
+indentOperator.exemptScope = all
+<<< example
+function(
+  a &&
+    b,
+  a &&
+    b
+)
+function(a &&
+    b)(a &&
+    b)
+function(
+  a &&
+    b
+)(
+  a &&
+    b
+)
+function {
+  a &&
+    b
+}
+>>>
+function(
+  a &&
+  b,
+  a &&
+  b
+)
+function(
+  a &&
+  b
+)(
+  a &&
+  b
+)
+function(
+  a &&
+  b
+)(
+  a &&
+  b
+)
+function {
+  a &&
+  b
+}

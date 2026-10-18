@@ -1,0 +1,24 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 50
+danglingParentheses.callSite = false
+newlines.avoidForSimpleOverflow = [tooLong]
+<<< example
+object Example {
+  foo_bar_baz("the quick brown fox jumps over the lazy dog") {
+    println("")
+  }
+  foo_bar_baz("the quick brown fox jumps over a dog") {
+    println("")
+  }
+}
+>>>
+object Example {
+  foo_bar_baz("the quick brown fox jumps over the lazy dog") {
+    println("")
+  }
+  foo_bar_baz(
+    "the quick brown fox jumps over a dog") {
+    println("")
+  }
+}

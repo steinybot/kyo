@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [SortModifiers]
+rewrite.sortModifiers.order = [
+  "implicit", "final", "sealed", "abstract",
+  "override", "private", "protected", "lazy"
+]
+<<< example
+override implicit final val x = 2
+>>>
+implicit final override val x = 2

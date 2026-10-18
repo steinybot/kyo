@@ -1,0 +1,25 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 40
+newlines.avoidInResultType = true
+newlines.neverBeforeJsNative = true
+<<< example
+// no newlines in result type
+def permissionState(a: A = js.native): js.Promise[PushPermissionState] = js.native
+// no newlines in result type
+val permissionState: js.Promise[PushPermissionState] = js.native
+// can't format without newlines
+implicit protected val td: TildeArrow {
+  type Out = RouteTestResult } = TildeArrow.injectIntoRoute
+>>>
+// no newlines in result type
+def permissionState(
+    a: A = js.native
+): js.Promise[PushPermissionState] = js.native
+// no newlines in result type
+val permissionState
+    : js.Promise[PushPermissionState] = js.native
+// can't format without newlines
+implicit protected val td: TildeArrow {
+  type Out = RouteTestResult
+} = TildeArrow.injectIntoRoute

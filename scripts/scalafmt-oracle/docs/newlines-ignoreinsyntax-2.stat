@@ -1,0 +1,14 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.ignoreInSyntax = false
+<<< example
+// detects newline in string, forces proper multi-line formatting
+println(s"""${1}
+    """.stripMargin
+)
+>>>
+// detects newline in string, forces proper multi-line formatting
+println(
+  s"""${1}
+    """.stripMargin
+)

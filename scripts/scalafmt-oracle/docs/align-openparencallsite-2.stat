@@ -1,0 +1,23 @@
+runner.dialect = scala213
+maxColumn = 40
+align.openParenCallSite = false
+<<< example
+foo(arg1, arg2)
+
+function(arg1, // no align by (
+    arg2,
+ arg3)
+
+function(
+  argument1,
+  argument2)
+>>>
+foo(arg1, arg2)
+
+function(
+  arg1, // no align by (
+  arg2,
+  arg3
+)
+
+function(argument1, argument2)

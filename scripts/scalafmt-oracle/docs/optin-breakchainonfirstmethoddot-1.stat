@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+optIn.breakChainOnFirstMethodDot = false
+<<< example
+// collapse into a single line
+foo
+  .map(_ + 1)
+  .filter(_ > 2)
+>>>
+// collapse into a single line
+foo.map(_ + 1).filter(_ > 2)

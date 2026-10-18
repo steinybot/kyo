@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+<<< example
+object a {
+  def f(a: Int, b: String
+  ): Unit = ()
+}
+>>>
+object a {
+  def f(a: Int, b: String): Unit = ()
+}

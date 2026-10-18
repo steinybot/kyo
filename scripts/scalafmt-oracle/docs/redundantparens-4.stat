@@ -1,0 +1,22 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantParens]
+rewrite.redundantParens.infixSide = many
+<<< example
+// many+
+foo || (bar == baz) // high precedence infix
+foo or (bar || baz) // non-symbolic outer op; low precedence infix
+foo |: (bar |: baz) // identical op: non-symbolic; right infix, right assoc
+(foo :| bar) :| baz // identical op: symbolic; left infix, left assoc
+(foo or bar) or baz // identical op: non-symbolic; left infix, left assoc
+// all
+foo || (bar && baz) // low precedence infix
+>>>
+// many+
+foo || bar == baz // high precedence infix
+foo or bar || baz // non-symbolic outer op; low precedence infix
+foo |: bar |: baz // identical op: non-symbolic; right infix, right assoc
+foo :| bar :| baz // identical op: symbolic; left infix, left assoc
+foo or bar or baz // identical op: non-symbolic; left infix, left assoc
+// all
+foo || (bar && baz) // low precedence infix

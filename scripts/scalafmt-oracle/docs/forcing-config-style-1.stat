@@ -1,0 +1,37 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.configStyleCallSite.forceIfOptimized = true
+newlines.configStyleDefnSite.forceIfOptimized = false
+runner.optimizer.callSite { minSpan = 5, minCount = 2 }
+maxColumn = 60
+<<< example
+object a {
+  // this is a definition, not a method call
+  def method(a: String, b: String = null): Boolean
+
+  // keeps single line; min offset not satisfied
+  method(a, b)
+
+  // keeps single line; min arg not satisfied
+  method(SomeVeryVeryVeryVeryLongArgument)
+
+  // forces config style
+  method(foo, bar)
+}
+>>>
+object a {
+  // this is a definition, not a method call
+  def method(a: String, b: String = null): Boolean
+
+  // keeps single line; min offset not satisfied
+  method(a, b)
+
+  // keeps single line; min arg not satisfied
+  method(SomeVeryVeryVeryVeryLongArgument)
+
+  // forces config style
+  method(
+    foo,
+    bar
+  )
+}

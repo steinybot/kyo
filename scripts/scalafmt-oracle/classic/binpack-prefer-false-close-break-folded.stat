@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+<<< example
+object a {
+  program(alpha, beta, gamma
+  )
+}
+>>>
+object a {
+  program(alpha, beta, gamma)
+}

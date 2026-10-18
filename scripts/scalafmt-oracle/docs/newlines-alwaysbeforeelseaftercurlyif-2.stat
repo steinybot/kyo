@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.alwaysBeforeElseAfterCurlyIf = false
+<<< example
+if (someCond) {
+  foo()
+}
+else {
+  bar()
+}
+>>>
+if (someCond) {
+  foo()
+} else {
+  bar()
+}

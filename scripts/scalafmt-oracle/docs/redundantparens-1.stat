@@ -1,0 +1,17 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantParens]
+<<< example
+for {
+  a <- b
+  if (a.nonEmpty)
+} yield a
+
+val z = (insertData *> readDatabase(id))
+>>>
+for {
+  a <- b
+  if a.nonEmpty
+} yield a
+
+val z = insertData *> readDatabase(id)

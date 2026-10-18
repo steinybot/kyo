@@ -1,0 +1,17 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.parentConstructors = oneline
+<<< example
+object a {
+  trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
+}
+>>>
+object a {
+  trait Foo
+      extends Baz
+      with Qux(
+        argumentOneLongName,
+        argumentTwoLongName
+      )
+      with Bar
+}

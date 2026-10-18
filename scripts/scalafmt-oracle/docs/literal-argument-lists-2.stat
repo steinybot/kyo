@@ -1,0 +1,21 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.literalArgumentLists = false
+<<< example
+val secret: List[Bit] = List(0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1)
+>>>
+val secret: List[Bit] = List(
+  0,
+  0,
+  1,
+  1,
+  1,
+  1,
+  1,
+  0,
+  0,
+  1,
+  1,
+  0,
+  1
+)

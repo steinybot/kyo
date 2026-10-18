@@ -1,0 +1,34 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.callSite = true
+binPack.indentCallSiteSingleArg = false
+indent.callSite = 2
+maxColumn = 20
+<<< example
+foo(bar(baz.qux(xyz + zyx)))
+foo(bar((_, _) =>
+  baz { qux =>
+    noop
+  } baz { qux =>
+    noop
+  } baz //
+    { qux =>
+      noop
+    } baz { qux =>
+      noop
+    }))
+>>>
+foo(bar(baz
+  .qux(xyz + zyx)))
+foo(bar((_, _) =>
+  baz { qux =>
+    noop
+  } baz { qux =>
+    noop
+  } baz //
+    { qux =>
+      noop
+    } baz { qux =>
+      noop
+    }
+))

@@ -1,5 +1,7 @@
 package kyo.ffi.codegen.emitters
 
+import kyo.Doc
+import kyo.Printer
 import kyo.ffi.codegen.model.*
 
 /** Emits the Scala.js (`koffi`-backed) implementation source for a single binding trait.
@@ -12,34 +14,39 @@ import kyo.ffi.codegen.model.*
   *     Seq(KoffiFn(...), ...))`.
   *
   * Emission is validated against a real Node + koffi install in integration tests.
+  *
+  * Emission builds a `Doc` layout tree (only intentional, hard line breaks) rendered once by [[emit]]; nested regions are indented with
+  * `Doc.indent` instead of re-processing emitted strings.
   */
 object JsEmitter extends EmitterBase.Ops with PlatformTypes:
 
     /** Emit the full contents of `{spec.simpleName}Impl.scala`. */
     def emit(spec: TraitSpec): String =
-        val sb = new StringBuilder
-        sb ++= emitHeader(spec)
-        sb ++= "\n"
-        sb ++= emitImplClass(spec)
-        sb ++= "\n"
-        sb ++= emitImplCompanion(spec)
-        sb.toString
+        val doc =
+            emitHeader(spec)
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(emitImplClass(spec))
+                .append(Doc.hardNewline).append(Doc.hardNewline)
+                .append(emitImplCompanion(spec))
+                .append(Doc.hardNewline)
+        Printer.greedy.print(doc, EmitterBase.RenderWidth)
     end emit
 
     // -------------------------------------------------------------------------
     // Header
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitHeader(spec: TraitSpec): String =
+    private[codegen] def emitHeader(spec: TraitSpec): Doc =
         emitHeader(
             spec,
-            """import scala.scalajs.js
-              |import scala.scalajs.js.annotation.*
-              |import scala.scalajs.js.typedarray.*
-              |import scala.scalajs.reflect.annotation.EnableReflectiveInstantiation
-              |import kyo.ffi.*
-              |import kyo.ffi.internal.{AbiCheck, JsRawSegment, KoffiFacade, KoffiFn, NativeFacade, NativeLoader, StructAbiCheck}
-              |""".stripMargin
+            List(
+                "import scala.scalajs.js",
+                "import scala.scalajs.js.annotation.*",
+                "import scala.scalajs.js.typedarray.*",
+                "import scala.scalajs.reflect.annotation.EnableReflectiveInstantiation",
+                "import kyo.ffi.*",
+                "import kyo.ffi.internal.{AbiCheck, JsRawSegment, KoffiFacade, KoffiFn, NativeFacade, NativeLoader, StructAbiCheck}"
+            )
         )
     end emitHeader
 
@@ -47,36 +54,34 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
     // Impl class
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplClass(spec: TraitSpec): String =
-        val sb = new StringBuilder
+    private[codegen] def emitImplClass(spec: TraitSpec): Doc =
+        val head = List.newBuilder[Doc]
         // `@EnableReflectiveInstantiation` tells the Scala.js linker to retain the nullary constructor so
         // `scala.reflect.Reflect.lookupInstantiatableClass` (used by `Ffi.load`) can instantiate it at runtime.
-        sb ++= s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:\n"
+        head += text(s"@EnableReflectiveInstantiation final class ${spec.simpleName}Impl extends ${spec.simpleName}:")
         // Import `facade` and, when the trait declares callbacks, the per-callback proto handles
         // registered in the companion. Wildcard-select works because the companion exposes these as
         // private vals, which are still visible to nested references inside the class body.
-        sb ++= s"    import ${spec.simpleName}Impl.*\n"
-        sb ++= companionInitLine(spec.simpleName)
-        spec.methods.foreach { m =>
-            sb ++= "\n"
-            sb ++= emitMethod(m, spec)
+        head += text(s"    import ${spec.simpleName}Impl.*")
+        head += text(companionInitLine(spec.simpleName))
+        val classDoc = spec.methods.foldLeft(hardLines(head.result())) { (acc, m) =>
+            acc.append(Doc.hardNewline).append(Doc.hardNewline).append(emitMethod(m, spec))
         }
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        classDoc.append(Doc.hardNewline).append(text(s"end ${spec.simpleName}Impl"))
     end emitImplClass
 
-    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethod(method: MethodSpec, spec: TraitSpec): Doc =
         // Variadic bindings append a trailing `args: Any*` to the Scala-level signature.
         val sig  = methodSignature(method, includeVarargs = true)
-        val body = indentBody(emitMethodBody(method, spec))
-        sig + "\n" + body + "\n"
+        val body = Doc.indent(8, emitMethodBody(method, spec))
+        sig.append(Doc.hardNewline).append(body)
     end emitMethod
 
     /** Emit the method body. Shared across callback-free, transient, and retained methods, the plain body already handles `FnPtrT` and
       * `GuardT` parameter marshalling when `method.callbackKind != None`. Variadic bindings take the dedicated [[emitVariadicMethodBody]]
       * path.
       */
-    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private[codegen] def emitMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         if method.hasVarargs then emitVariadicMethodBody(method, spec)
         else emitPlainMethodBody(method, spec)
 
@@ -86,7 +91,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
       * The koffi function is registered with a trailing `"..."` arg marker (see [[emitKoffiFn]]), which tells koffi the function is
       * variadic and each vararg at call time must already be pinned to a koffi type via `koffi.as(...)`.
       */
-    private def emitVariadicMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private def emitVariadicMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         // Validate fixed-arg shape, variadic v1 supports primitives / String / Buffer on the fixed side.
         method.params.foreach { p =>
             p.tpe match
@@ -109,8 +114,6 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
                         "variadic v1 supports only Unit / primitive returns"
                 )
         end match
-
-        val sb = new StringBuilder
 
         // Fixed-arg marshalling, same rules as the plain body (BooleanT → 0/1, Long → js.BigInt, String → direct, Buffer → Uint8Array).
         case class Marshalled(passExpr: String, setup: List[String])
@@ -139,63 +142,58 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             end match
         }
 
-        marshalled.flatMap(_.setup).foreach { l =>
-            sb ++= l
-            sb ++= "\n"
-        }
-
         // Compose fixed-arg pass list + marshalled varargs via JsVariadicMarshaller. koffi's bound `func`
         // is a JS function; apply it via `applyDynamic` so we can splat a single variable-length JS array
         // of args (Scala can't mix named fixed params and a repeated-seq splat in one call).
-        sb ++= s"""val __kyoVarargs = kyo.ffi.internal.JsVariadicMarshaller.marshalVarargs(args, "${spec.fqcn}", "${method.scalaName}")\n"""
-        val fixedPassList = marshalled.map(m => s"${m.passExpr}.asInstanceOf[js.Any]")
-        sb ++= s"val __kyoAllArgs = js.Array[js.Any](${fixedPassList.mkString(", ")})\n"
-        sb ++= "var __kyoVI = 0\n"
-        sb ++= "while __kyoVI < __kyoVarargs.length do\n"
-        sb ++= "    val _ = __kyoAllArgs.push(__kyoVarargs(__kyoVI))\n"
-        sb ++= "    __kyoVI += 1\n"
         val callExpr = s"""facade.applyDynamic("${method.scalaName}")(__kyoAllArgs.toSeq*)"""
 
-        val fqnLit    = s""""${spec.fqcn}""""
-        val methodLit = s""""${method.scalaName}""""
+        val body = List.newBuilder[String]
+        marshalled.flatMap(_.setup).foreach(l => body += l)
+        body += s"""val __kyoVarargs = kyo.ffi.internal.JsVariadicMarshaller.marshalVarargs(args, "${spec.fqcn}", "${method.scalaName}")"""
+        val fixedPassList = marshalled.map(m => s"${m.passExpr}.asInstanceOf[js.Any]")
+        body += s"val __kyoAllArgs = js.Array[js.Any](${fixedPassList.mkString(", ")})"
+        body += "var __kyoVI = 0"
+        body += "while __kyoVI < __kyoVarargs.length do"
+        body += "    val _ = __kyoAllArgs.push(__kyoVarargs(__kyoVI))"
+        body += "    __kyoVI += 1"
 
         method.returnShape match
             case ReturnShape.Void =>
-                sb ++= s"val _ = $callExpr\n"
+                body += s"val _ = $callExpr"
                 if method.withError then
-                    sb ++= "val __errno = KoffiFacade.errno()\n"
-                    sb ++= "Ffi.Outcome.fromValueErrno(0L, __errno)\n"
+                    body += "val __errno = KoffiFacade.errno()"
+                    body += "Ffi.Outcome.fromValueErrno(0L, __errno)"
                 else
-                    sb ++= "()\n"
+                    body += "()"
                 end if
             case ReturnShape.Primitive(TypeRef.BooleanT) =>
-                sb ++= s"val retVal = $callExpr.asInstanceOf[Int]\n"
+                body += s"val retVal = $callExpr.asInstanceOf[Int]"
                 if method.withError then
-                    sb ++= "val __errno = KoffiFacade.errno()\n"
-                    sb ++= "Ffi.Outcome.fromValueErrno(if retVal != 0 then 1L else 0L, __errno)\n"
+                    body += "val __errno = KoffiFacade.errno()"
+                    body += "Ffi.Outcome.fromValueErrno(if retVal != 0 then 1L else 0L, __errno)"
                 else
-                    sb ++= "retVal != 0\n"
+                    body += "retVal != 0"
                 end if
             case ReturnShape.Primitive(TypeRef.LongT) =>
-                sb ++= s"val retVal = $callExpr.asInstanceOf[js.BigInt].toString.toLong\n"
+                body += s"val retVal = $callExpr.asInstanceOf[js.BigInt].toString.toLong"
                 if method.withError then
-                    sb ++= "val __errno = KoffiFacade.errno()\n"
-                    sb ++= "Ffi.Outcome.fromValueErrno(retVal, __errno)\n"
+                    body += "val __errno = KoffiFacade.errno()"
+                    body += "Ffi.Outcome.fromValueErrno(retVal, __errno)"
                 else
-                    sb ++= "retVal\n"
+                    body += "retVal"
                 end if
             case ReturnShape.Primitive(t) =>
-                sb ++= s"val retVal = $callExpr.asInstanceOf[${jsScalaReturn(t)}]\n"
+                body += s"val retVal = $callExpr.asInstanceOf[${jsScalaReturn(t)}]"
                 if method.withError then
-                    sb ++= "val __errno = KoffiFacade.errno()\n"
-                    sb ++= s"Ffi.Outcome.fromValueErrno(retVal.toLong, __errno)\n"
+                    body += "val __errno = KoffiFacade.errno()"
+                    body += "Ffi.Outcome.fromValueErrno(retVal.toLong, __errno)"
                 else
-                    sb ++= "retVal\n"
+                    body += "retVal"
                 end if
             case _ => throw new IllegalStateException("unreachable")
         end match
 
-        sb.toString
+        hardTextLines(body.result())
     end emitVariadicMethodBody
 
     /** Method body. Callback-free, transient, and retained callbacks all share this path; the callback-specific pieces differ per
@@ -204,12 +202,12 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
       *     `koffi.pointer(proto)` position, no `register`/`unregister` needed). Scala.js lifts a Scala `FunctionN` to a `js.Function` at
       *     the call site. This avoids the koffi handle round-trip and its associated lifetime management entirely for transient calls.
       *   - **Retained**: call `KoffiFacade.register(fn, KoffiFacade.pointer(proto))` to get a C-callable handle, schedule a
-      *     `KoffiFacade.unregister(handle)` cleanup on the user-supplied `Ffi.Guard` via `unsafeRetainCleanup`, and pass the handle at the
-      *     callback arg slot. Close-time teardown is driven by `GuardCore.forEachRetainedCleanup` on JS.
+      *     `KoffiFacade.unregister(handle)` cleanup on the user-supplied `Ffi.Guard` via `unsafeRetainCleanup`, and pass the handle at
+      *     the callback arg slot. Close-time teardown is driven by `GuardCore.forEachRetainedCleanup` on JS.
       *
       * The callback registry manages handle lifetime on the JS side.
       */
-    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): String =
+    private def emitPlainMethodBody(method: MethodSpec, spec: TraitSpec): Doc =
         val structsByName = EmitterBase.structsByName(spec)
 
         case class Marshalled(
@@ -285,7 +283,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
                         case CallbackKind.Transient =>
                             // koffi accepts a plain JS function at any arg whose declared type is `koffi.pointer(proto)`; Scala.js
                             // auto-lifts a Scala `FunctionN` to `js.Function` at the call site. No register/unregister round-trip.
-                            List(Marshalled(p.name, safeN, List(safeWrapper)))
+                            List(Marshalled(p.name, safeN, safeWrapper))
                         case CallbackKind.Retained =>
                             // Retained: obtain a C-callable handle via `KoffiFacade.register`, pin a close-time unregister on the
                             // user-supplied guard, and pass the handle at the arg slot. The guard's close() drains the cleanups via
@@ -296,8 +294,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
                                     s"Retained callback method '${method.scalaName}' is missing an Ffi.Guard parameter"
                                 )
                             )
-                            val setup = List(
-                                safeWrapper,
+                            val setup = safeWrapper ++ List(
                                 s"""val $handleN = KoffiFacade.register($safeN, KoffiFacade.pointer($protoName))""",
                                 s"${safeName(guardParam.name)}.asInstanceOf[kyo.ffi.internal.JsGuard].unsafeRetainCleanup(() => KoffiFacade.unregister($handleN))"
                             )
@@ -330,28 +327,10 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             case ReturnShape.Struct(sSpec) => Some(s"""KoffiFacade.outStruct("${sSpec.simpleName}")""")
             case _                         => None
 
-        val sb = new StringBuilder
-
-        marshalled.flatMap(_.setup).foreach { line =>
-            sb ++= line
-            sb ++= "\n"
-        }
-
-        structOutCell.foreach { alloc =>
-            sb ++= s"val $structOutName = $alloc\n"
-        }
-
-        outCells.foreach { o =>
-            sb ++= s"val ${o.name} = ${outAllocator(o.tpe)}\n"
-        }
-
         // The struct out-pointer goes FIRST; multi-value out-cells append after the user args.
         val callArgs = structOutCell.map(_ => s"$structOutName.buf").toList ++
             marshalled.map(_.passExpr) ++ outCells.map(o => s"${o.name}.buf")
         val callExpr = s"facade.${method.scalaName}(${callArgs.mkString(", ")})"
-
-        val fqnLit    = s""""${spec.fqcn}""""
-        val methodLit = s""""${method.scalaName}""""
 
         // Marshal the koffi call result into the Scala return value, parameterized on the raw-result source expression:
         //   - On the synchronous (non-blocking) path, `rawExpr` is the sync facade call `facade.<fn>(...)`.
@@ -437,6 +416,19 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             end match
         end resultMarshal
 
+        val body = List.newBuilder[Doc]
+        marshalled.flatMap(_.setup).foreach { line =>
+            body += text(line)
+        }
+
+        structOutCell.foreach { alloc =>
+            body += text(s"val $structOutName = $alloc")
+        }
+
+        outCells.foreach { o =>
+            body += text(s"val ${o.name} = ${outAllocator(o.tpe)}")
+        }
+
         if method.blocking then
             // koffi async path: run the C call on a libuv worker via `kyo.ffi.internal.BlockingBridge.runAsync`, which
             // dispatches through `KoffiFacade.callAsync` and resolves the returned `Fiber.Unsafe` from the completion
@@ -445,46 +437,39 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             // exactly the synchronous arg list (`callArgs`). The method's trailing `(using AllowUnsafe)` drives the
             // bridge, the side effect is tracked by the caller.
             val (preLines, resultExpr) = resultMarshal("raw")
-            sb ++= s"""kyo.ffi.internal.BlockingBridge.runAsync(facade, "${method.scalaName}", js.Array[js.Any](${callArgs.mkString(
-                    ", "
-                )}), (raw: js.Any) =>\n"""
-            preLines.foreach { l =>
-                sb ++= "    "
-                sb ++= l
-                sb ++= "\n"
-            }
-            if method.withError then
-                sb ++= "    val __errno = KoffiFacade.errno()\n"
-                sb ++= s"    val __kyoResult = $resultExpr\n"
-                sb ++= "    Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)\n"
-            else
-                sb ++= s"    $resultExpr\n"
-            end if
-            sb ++= ")"
-            sb.toString
+            val callbackLines          =
+                if method.withError then
+                    preLines ++ List(
+                        "val __errno = KoffiFacade.errno()",
+                        s"val __kyoResult = $resultExpr",
+                        "Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)"
+                    )
+                else preLines :+ resultExpr
+            body += text(
+                s"""kyo.ffi.internal.BlockingBridge.runAsync(facade, "${method.scalaName}", js.Array[js.Any](${callArgs.mkString(
+                        ", "
+                    )}), (raw: js.Any) =>"""
+            )
+            body += Doc.indent(4, hardTextLines(callbackLines))
+            body += text(")")
+            hardLines(body.result())
         else
             // Synchronous (non-blocking) path: call koffi directly and marshal the return inline.
             val (preLines, resultExpr) = resultMarshal(callExpr)
             preLines.foreach { l =>
-                sb ++= l
-                sb ++= "\n"
+                body += text(l)
             }
             if method.withError then
-                sb ++= "val __errno = KoffiFacade.errno()\n"
-                sb ++= s"val __kyoResult = $resultExpr\n"
-                sb ++= "Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)\n"
+                body += text("val __errno = KoffiFacade.errno()")
+                body += text(s"val __kyoResult = $resultExpr")
+                body += text("Ffi.Outcome.fromValueErrno(__kyoResult.toLong, __errno)")
             else
-                sb ++= resultExpr + "\n"
+                body += text(resultExpr)
             end if
-            sb.toString
+            hardLines(body.result())
         end if
     end emitPlainMethodBody
 
-    /** Build a `js.Dynamic.literal(...)` expression for one struct. Recurses into nested struct fields, producing nested literals.
-      *
-      * [[bindingFqn]] and [[methodName]] thread the FFI call site through to the `FfiUnsafe.expect` unwrap at Buffer-typed struct fields so
-      * alien `Buffer.Raw` carriers surface with context.
-      */
     /** Build a `js.Dynamic.literal(...)` expression for writing a case-class into a koffi struct.
       *
       * Returns `(setupLines, literalExpr)`, `setupLines` must be emitted BEFORE the literal to handle callback registration.
@@ -572,7 +557,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
 
     /** Build a koffi union value object for a union struct field: a runtime type match on `valExpr` producing
       * `js.Dynamic.literal("vK" -> <marshalled value>)` for the active variant, where `vK` is the positional member
-      * name registered by [[emitUnionRegistrations]]. koffi requires exactly the active variant set on a union value.
+      * name registered by [[emitTypeRegistrations]]. koffi requires exactly the active variant set on a union value.
       * Returns the setup lines (the `val objVar = ... match { ... }` assignment).
       */
     private def emitJsUnionFieldObject(
@@ -756,18 +741,17 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
     // Impl companion
     // -------------------------------------------------------------------------
 
-    private[codegen] def emitImplCompanion(spec: TraitSpec): String =
-        val sb            = new StringBuilder
+    private[codegen] def emitImplCompanion(spec: TraitSpec): Doc =
         val structsByName = EmitterBase.structsByName(spec)
-        sb ++= s"object ${spec.simpleName}Impl:\n"
-        sb ++= abiCheckLine(spec.fqcn)
-        sb ++= "\n"
-        sb ++= companionLoadedDef
+        val lines         = List.newBuilder[String]
+        lines += s"object ${spec.simpleName}Impl:"
+        lines += abiCheckLine(spec.fqcn)
+        lines += companionLoadedDef
         // Register all struct and union types with koffi up-front so the per-function arg/result strings (and struct
         // field types) can reference them by name. koffi resolves type-name references eagerly at registration, so the
         // emission is dependency-ordered: a union's struct member variants and a struct's struct/union field types are
         // registered before the type that references them. Packed structs go through `koffi.pack`, others `koffi.struct`.
-        sb ++= emitTypeRegistrations(spec)
+        lines ++= emitTypeRegistrations(spec)
         // Struct ABI self-check. Compare the code-generator's expected byte size against koffi's runtime `sizeof` for each
         // registered struct. Runs after every struct has been registered above so nested struct references resolve. Mismatch throws
         // `FfiLoadError.AbiMismatch` before `Ffi.load[T]` returns.
@@ -775,10 +759,10 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
         spec.structs.foreach { s =>
             if checked.contains(s.fqcn) then
                 val expected = structByteSize(s, structsByName)
-                sb ++=
+                lines +=
                     s"""    StructAbiCheck.verifyByteSize("${spec.fqcn}", "${s.simpleName}", ${expected}L, KoffiFacade.sizeof(${koffiStructHandleName(
                             s
-                        )}.asInstanceOf[js.Any]).toLong)\n"""
+                        )}.asInstanceOf[js.Any]).toLong)"""
         }
         // Register callback prototypes so the per-function arg strings can reference them by name. Each callback param produces exactly
         // one proto declaration, shared between transient and retained shapes. We bind the return
@@ -789,32 +773,31 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             emitCallbackProtos(m, spec).foreach { case (pname, expr) =>
                 // `KoffiFacade.proto` returns `js.Any`, the opaque koffi Type handle, and we store
                 // it under a companion-private val for reuse inside each method body.
-                sb ++= s"    private val $pname: scala.scalajs.js.Any = $expr\n"
+                lines += s"    private val $pname: scala.scalajs.js.Any = $expr"
             }
         }
         // The library ID, not a resolved path: a browser has no path to resolve, and asking NativeLoader for one
         // there throws before the facade is built, since the first thing it reads is `process`. NativeFacade picks
         // the transport and resolves only if that transport needs a file.
-        sb ++= s"""    private val facade = NativeFacade.load(\n"""
-        sb ++= s"""        "${spec.library}",\n"""
-        sb ++= "        Seq(\n"
-        val fnLines = spec.methods.zipWithIndex.map { case (m, i) =>
-            val last = i == spec.methods.size - 1
-            emitKoffiFn(m, spec) + (if last then "" else ",")
+        lines += s"""    private val facade = NativeFacade.load("""
+        lines += s"""        "${spec.library}","""
+        lines += "        Seq("
+        spec.methods.zipWithIndex.foreach { case (m, i) =>
+            val last  = i == spec.methods.size - 1
+            val comma = if last then "" else ","
+            lines += s"            ${emitKoffiFn(m, spec)}$comma"
         }
-        fnLines.foreach { l =>
-            sb ++= s"            $l\n"
-        }
-        sb ++= "        )\n"
-        sb ++= "    )\n"
-        sb ++= s"end ${spec.simpleName}Impl\n"
-        sb.toString
+        lines += "        )"
+        lines += "    )"
+        lines += s"end ${spec.simpleName}Impl"
+        hardTextLines(lines.result())
     end emitImplCompanion
 
     /** Emit one `KoffiFacade.proto(...)` call per callback parameter of `method`. The proto name is [[callbackProtoName]]; the argument
       * koffi types are derived from the callback's parameter types via [[koffiType]]; the return koffi type via [[jsCallbackReturnType]].
       * Non-callback methods return [[Nil]].
       */
+
     /** @return
       *   list of `(companionValName, rhsExpression)`, one entry per callback parameter of `method`. The caller emits
       *   `private val <valName> = <rhs>` so each proto is registered exactly once and the returned handle is available to body emission via
@@ -862,9 +845,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
             if s.packed then "pack"
             else "struct"
         val fields = s.fields.map(f => s""""${f.name}" -> "${koffiType(f.tpe, spec)}".asInstanceOf[js.Any]""").mkString(", ")
-        s"""    private val ${koffiStructHandleName(
-                s
-            )}: js.Dynamic = KoffiFacade.$fnName("${s.simpleName}", js.Dynamic.literal($fields))\n"""
+        s"""    private val ${koffiStructHandleName(s)}: js.Dynamic = KoffiFacade.$fnName("${s.simpleName}", js.Dynamic.literal($fields))"""
     end emitStructRegistration
 
     private def koffiStructHandleName(s: StructSpec): String =
@@ -927,7 +908,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
     // Type mapping helpers
     // -------------------------------------------------------------------------
 
-    /** Emit a one-line `val <safeN> = <wrapper>` that takes the user's callback [[userFnVal]] and returns a Scala function of the same
+    /** Emit the `val <safeN> = <wrapper>` lines that take the user's callback [[userFnVal]] and return a Scala function of the same
       * shape that wraps the user's `apply(...)` in try/catch. On exception the wrapper reports via
       * `kyo.ffi.internal.FfiErrors.reportCallbackFailed` and returns a zero default, see README "Callback exception handling".
       *
@@ -942,7 +923,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
         bindingFqn: String,
         methodName: String,
         kind: CallbackKind
-    ): String =
+    ): List[String] =
         val kindName = kind match
             case CallbackKind.Transient => "transient"
             case CallbackKind.Retained  => "retained"
@@ -951,11 +932,13 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
         val params  = cbParams.zipWithIndex.map { case (t, i) => s"a$i: ${scalaTypeOf(t)}" }.mkString(", ")
         val argList = cbParams.indices.map(i => s"a$i").mkString(", ")
         val zero    = jsZeroExpr(cbRet)
-        s"""val $safeN: $fnType = ($params) =>
-           |    try $userFnVal($argList)
-           |    catch case t: Throwable =>
-           |        kyo.ffi.internal.FfiGenErrors.reportCallbackFailed("$bindingFqn", "$methodName", "$kindName", t)
-           |        $zero""".stripMargin
+        List(
+            s"val $safeN: $fnType = ($params) =>",
+            s"    try $userFnVal($argList)",
+            "    catch case t: Throwable =>",
+            s"""        kyo.ffi.internal.FfiGenErrors.reportCallbackFailed("$bindingFqn", "$methodName", "$kindName", t)""",
+            s"        $zero"
+        )
     end emitJsCallbackWrapper
 
     /** Zero-expression for a callback return type at the JS-side Scala shim. Mirrors the typed-zero defaults of the JVM `UpcallBridge` and
@@ -1025,10 +1008,10 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
       * registrations are `KoffiFacade.union(name, { v0 -> type0, ... })` with positional `vK` member names matching the
       * write side ([[emitJsUnionFieldObject]]) and read side ([[emitJsUnionFieldRead]]).
       */
-    private def emitTypeRegistrations(spec: TraitSpec): String =
+    private def emitTypeRegistrations(spec: TraitSpec): List[String] =
         val structsByName                               = EmitterBase.structsByName(spec)
         val emitted                                     = scala.collection.mutable.Set.empty[String]
-        val sb                                          = new StringBuilder
+        val lines                                       = List.newBuilder[String]
         def emitUnionReg(variants: List[TypeRef]): Unit =
             val name = unionTypeName(variants, spec)
             if !emitted(name) then
@@ -1040,7 +1023,7 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
                 val members = variants.zipWithIndex
                     .map { case (v, i) => s""""v$i" -> "${koffiType(v, spec)}".asInstanceOf[js.Any]""" }
                     .mkString(", ")
-                sb ++= s"""    private val ${name}Handle: js.Dynamic = KoffiFacade.union("$name", js.Dynamic.literal($members))\n"""
+                lines += s"""    private val ${name}Handle: js.Dynamic = KoffiFacade.union("$name", js.Dynamic.literal($members))"""
             end if
         end emitUnionReg
         def emitStructReg(s: StructSpec): Unit =
@@ -1052,11 +1035,11 @@ object JsEmitter extends EmitterBase.Ops with PlatformTypes:
                         case _                        => ()
                 }
                 emitted += s.fqcn
-                sb ++= emitStructRegistration(s, spec)
+                lines += emitStructRegistration(s, spec)
             end if
         end emitStructReg
         spec.structs.foreach(emitStructReg)
-        sb.toString
+        lines.result()
     end emitTypeRegistrations
 
     /** koffi type-name for a CALLBACK PROTO position (param or return of a `KoffiFacade.proto`). Unlike [[koffiType]], Boolean stays "bool":

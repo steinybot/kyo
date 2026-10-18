@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 80
+newlines.avoidForSimpleOverflow = [punct]
+<<< example
+class Engine[TD, EI, PD, Q, P, A](
+    val dataSourceClassMap: Map[
+      String,
+      Class[_ <: BaseDataSource[TD, EI, Q, A]]]) {}
+>>>
+class Engine[TD, EI, PD, Q, P, A](
+    val dataSourceClassMap: Map[String, Class[_ <: BaseDataSource[TD, EI, Q, A]]]
+) {}

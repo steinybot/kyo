@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 3
+<<< example
+object a {
+  def f(a: Int, b: String): Unit = ()
+}
+>>>
+object a {
+  def f(a: Int, b: String): Unit = ()
+}

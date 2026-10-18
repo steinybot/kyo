@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 50
+rewrite.rules = [Imports]
+rewrite.imports.sort = scalastyle
+rewrite.imports.groups = [["foo\\..*"]]
+<<< example
+import foo.bar.{Random, bar, ~>, `symbol`}
+import foo.Baz.{bar => xyz, _}
+import foo.`qux`.{Random, bar, ~>, `symbol`}
+import foo._
+>>>
+import foo._
+import foo.`qux`.{`symbol`, ~>, bar, Random}
+import foo.Baz.{bar => xyz, _}
+import foo.bar.{`symbol`, ~>, bar, Random}

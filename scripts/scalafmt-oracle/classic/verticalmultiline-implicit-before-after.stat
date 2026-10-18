@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [before, after]
+<<< example
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+>>>
+object a {
+  def f(
+      a: Int,
+      b: String
+    )(
+      implicit
+      c: Double,
+      d: Long
+    ): Unit = ()
+}

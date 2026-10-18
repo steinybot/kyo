@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+literals.float=Lower
+<<< example
+42.0F
+>>>
+42.0f

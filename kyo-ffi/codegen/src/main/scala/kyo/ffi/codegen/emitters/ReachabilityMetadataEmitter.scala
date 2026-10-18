@@ -1,11 +1,13 @@
 package kyo.ffi.codegen.emitters
 
+import kyo.Doc
+import kyo.Printer
 import kyo.ffi.codegen.model.*
 
 /** Emits the GraalVM native-image `reachability-metadata.json` for one `Ffi` trait's generated JVM impl.
   *
-  * The FFM downcall and upcall descriptors are taken verbatim from [[JvmEmitter.emitFunctionDescriptor]] and
-  * [[JvmEmitter.callbackFunctionDescriptor]], the same `FunctionDescriptor`s the generated impl builds at class-construction
+  * The FFM downcall and upcall descriptors are taken verbatim from [[JvmEmitter.functionDescriptor]] and
+  * [[JvmEmitter.callbackDescriptor]], the same `FunctionDescriptor`s the generated impl builds at class-construction
   * time, then each Panama `ValueLayout` name is re-spelled as the native-image foreign token (`JAVA_INT` becomes `jint`,
   * `ADDRESS` becomes `void*`). Reusing the emitter's descriptors is what keeps this metadata from drifting away from the
   * generated code: a new binding, a changed signature, or a new option flows through the shared descriptor logic into both
@@ -41,23 +43,19 @@ object ReachabilityMetadataEmitter:
             )
         )
 
-    /** Split a `FunctionDescriptor.of(R, P...)` or `FunctionDescriptor.ofVoid(P...)` expression into its return token and
-      * parameter tokens.
+    /** Map a descriptor's return + parameter layouts to their native-image foreign tokens. A `None` return is the
+      * `FunctionDescriptor.ofVoid` shape and maps to the `void` token.
       */
-    private def parse(descriptor: String): (String, List[String]) =
-        val ofVoid = descriptor.startsWith("FunctionDescriptor.ofVoid")
-        val inner  = descriptor.substring(descriptor.indexOf('(') + 1, descriptor.lastIndexOf(')')).trim
-        val parts  = if inner.isEmpty then List.empty[String] else inner.split(",").iterator.map(_.trim).filter(_.nonEmpty).toList
-        if ofVoid then ("void", parts.map(token))
-        else (token(parts.head), parts.tail.map(token))
-    end parse
+    private def tokens(desc: JvmEmitter.FunctionDescriptorExpr): (String, List[String]) =
+        (desc.returnLayout.map(token).getOrElse("void"), desc.paramLayouts.map(token))
+    end tokens
 
     private def str(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
     private def arr(items: Seq[String]): String = items.mkString("[", ", ", "]")
 
     private def downcall(method: MethodSpec, structsByName: Map[String, StructSpec]): String =
-        val (ret, params) = parse(JvmEmitter.emitFunctionDescriptor(method, structsByName))
+        val (ret, params) = tokens(JvmEmitter.functionDescriptor(method, structsByName))
         // errno capture is always on (mirrors JvmEmitter's `capture` option); critical(true) only for a non-blocking method
         // with an array parameter, which pins the array off-heap for a zero-copy call.
         val options =
@@ -81,7 +79,7 @@ object ReachabilityMetadataEmitter:
 
     private def upcall(sig: (List[TypeRef], TypeRef)): String =
         val (params, ret) = sig
-        val (r, ps)       = parse(JvmEmitter.callbackFunctionDescriptor(params, ret))
+        val (r, ps)       = tokens(JvmEmitter.callbackDescriptor(params, ret))
         s"""      { "returnType": ${str(r)}, "parameterTypes": ${arr(ps.map(str))} }"""
     end upcall
 
@@ -109,21 +107,32 @@ object ReachabilityMetadataEmitter:
                 callbackSignatures(spec, structsByName)
             }.distinct.map(upcall)
 
-        val foreignBody =
-            val dc = s"""    "downcalls": [\n${downcalls.mkString(",\n")}\n    ]"""
-            if upcalls.isEmpty then dc
-            else dc + s""",\n    "upcalls": [\n${upcalls.mkString(",\n")}\n    ]"""
-        end foreignBody
+        // Comma-terminated JSON entry lines: every entry except the last carries the separating comma.
+        def commaTerminated(entries: List[String]): List[String] =
+            entries match
+                case Nil => Nil
+                case _   => entries.init.map(_ + ",") :+ entries.last
 
-        s"""{
-           |  "reflection": [
-           |${reflectionEntries.mkString(",\n")}
-           |  ],
-           |  "foreign": {
-           |$foreignBody
-           |  }
-           |}
-           |""".stripMargin
+        val lines = List.newBuilder[String]
+        lines += "{"
+        lines += """  "reflection": ["""
+        lines ++= commaTerminated(reflectionEntries.toList)
+        lines += "  ],"
+        lines += """  "foreign": {"""
+        lines += """    "downcalls": ["""
+        lines ++= commaTerminated(downcalls.toList)
+        if upcalls.isEmpty then
+            lines += "    ]"
+        else
+            lines += "    ],"
+            lines += """    "upcalls": ["""
+            lines ++= commaTerminated(upcalls.toList)
+            lines += "    ]"
+        end if
+        lines += "  }"
+        lines += "}"
+
+        Printer.greedy.print(EmitterBase.hardTextLines(lines.result()).append(Doc.hardNewline), EmitterBase.RenderWidth)
     end emitModule
 
 end ReachabilityMetadataEmitter

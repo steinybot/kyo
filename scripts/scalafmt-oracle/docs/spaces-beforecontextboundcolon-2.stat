@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.beforeContextBoundColon=Always
+<<< example
+def method[A: Bound]: B
+def method[A : Bound]: B
+def method[A: Bound: Bound2]: B
+>>>
+def method[A : Bound]: B
+def method[A : Bound]: B
+def method[A : Bound : Bound2]: B

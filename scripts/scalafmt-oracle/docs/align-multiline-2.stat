@@ -1,0 +1,22 @@
+runner.dialect = scala213
+maxColumn = 40
+align.preset = more
+align.multiline = false
+<<< example
+for {
+  a <- aaa
+  bbb <- bb
+  cccccc <- c {
+    3
+  }
+  dd <- ddddd
+} yield ()
+>>>
+for {
+  a   <- aaa
+  bbb <- bb
+  cccccc <- c {
+    3
+  }
+  dd <- ddddd
+} yield ()

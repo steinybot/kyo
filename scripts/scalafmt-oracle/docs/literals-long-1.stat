@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+literals.long=Upper
+<<< example
+123l
+>>>
+123L

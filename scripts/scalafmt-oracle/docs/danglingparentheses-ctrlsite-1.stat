@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+danglingParentheses.ctrlSite = true
+maxColumn=20
+<<< example
+if (something) {
+  // nothing
+}
+if (something_else) {
+  // nothing
+}
+>>>
+if (something) {
+  // nothing
+}
+if (
+  something_else
+) {
+  // nothing
+}

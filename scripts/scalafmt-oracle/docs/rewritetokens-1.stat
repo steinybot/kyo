@@ -1,0 +1,21 @@
+runner.dialect = scala213
+maxColumn = 40
+rewriteTokens = {
+  "⇒": "=>"
+  "→": "->"
+  "←": "<-"
+}
+<<< example
+val tuple = "a" → 1
+val lambda = (x: Int) ⇒ x + 1
+for {
+  a ← Option(1)
+  b ← Option(2)
+} yield a + b
+>>>
+val tuple = "a" -> 1
+val lambda = (x: Int) => x + 1
+for {
+  a <- Option(1)
+  b <- Option(2)
+} yield a + b

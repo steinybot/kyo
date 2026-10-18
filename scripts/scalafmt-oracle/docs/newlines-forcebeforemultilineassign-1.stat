@@ -1,0 +1,40 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 17
+newlines.forceBeforeMultilineAssign = def
+<<< example
+class A {
+  // break, allows params (even if it doesn't define any)
+  def foo = func(foo, bar)
+  // no break, doesn't allow params
+  val foo = func(foo, bar)
+  def foo = {
+    def a = func(foo, bar)
+    val a = func(foo, bar)
+  }
+}
+>>>
+class A {
+  // break, allows params (even if it doesn't define any)
+  def foo =
+    func(
+      foo,
+      bar
+    )
+  // no break, doesn't allow params
+  val foo = func(
+    foo,
+    bar
+  )
+  def foo = {
+    def a =
+      func(
+        foo,
+        bar
+      )
+    val a = func(
+      foo,
+      bar
+    )
+  }
+}

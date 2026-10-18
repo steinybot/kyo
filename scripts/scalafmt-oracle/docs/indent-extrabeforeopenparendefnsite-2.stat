@@ -1,0 +1,52 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 25
+indent.extraBeforeOpenParenDefnSite = 2
+newlines.beforeOpenParenDefnSite = fold
+<<< example
+case class fooClass
+  (foo1: String)
+  (foo2: String, foo3: String)
+  (foo5: String)
+abstract class fooClass
+  (foo1: String)
+  (foo2: String, foo3: String)
+  (foo5: String) {
+  def fooDef
+    (foo1: String)
+    (foo2: String, foo3: String)
+    (foo5: String)
+}
+def fooDef
+  (foo1: String)
+  (foo2: String, foo3: String)
+  (foo5: String) = {
+  // body
+}
+>>>
+case class fooClass
+  (foo1: String)
+  (
+      foo2: String,
+      foo3: String
+  )(foo5: String)
+abstract class fooClass
+    (foo1: String)
+    (
+        foo2: String,
+        foo3: String
+    )(foo5: String) {
+  def fooDef
+    (foo1: String)
+    (
+        foo2: String,
+        foo3: String
+    )(foo5: String)
+}
+def fooDef(foo1: String)
+    (
+        foo2: String,
+        foo3: String
+    )(foo5: String) = {
+  // body
+}

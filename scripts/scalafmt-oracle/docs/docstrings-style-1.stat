@@ -1,0 +1,13 @@
+runner.dialect = scala213
+maxColumn = 40
+docstrings.style = keep
+<<< example
+/**   do not touch
+ * this style
+  * keep the text as-is
+*/
+>>>
+/**   do not touch
+ * this style
+  * keep the text as-is
+*/

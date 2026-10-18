@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 50
+comments.wrap = trailing
+comments.wrapSingleLineMlcAsSlc = true
+<<< example
+/* standalone multi-line comment */
+val b = 2 /* mlc */ /* trailing mlc */
+>>>
+// standalone multi-line comment
+val b = 2 /* mlc */ // trailing mlc

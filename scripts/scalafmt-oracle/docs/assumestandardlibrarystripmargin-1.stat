@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+assumeStandardLibraryStripMargin = true
+align.stripMargin = true
+<<< example
+val example1 =
+  s"""Examples:
+  |  * one
+  |  * two
+  |  * $three
+  |""".stripMargin
+>>>
+val example1 =
+  s"""Examples:
+     |  * one
+     |  * two
+     |  * $three
+     |""".stripMargin

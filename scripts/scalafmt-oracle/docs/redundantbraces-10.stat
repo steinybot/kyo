@@ -1,0 +1,8 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.parensForOneLineApply = true
+<<< example
+xs.map { x => x + 1 }
+>>>
+xs.map(x => x + 1)

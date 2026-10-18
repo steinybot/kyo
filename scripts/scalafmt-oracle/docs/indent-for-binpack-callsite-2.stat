@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.callSite = true
+binPack.indentCallSiteOnce = false
+indent.callSite = 2
+maxColumn = 20
+<<< example
+foo(bar1(baz1(qux1, qux2), baz2), bar2(baz3, baz4))
+>>>
+foo(bar1(baz1(qux1,
+      qux2), baz2),
+  bar2(baz3, baz4))

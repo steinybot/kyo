@@ -1,0 +1,30 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [AvoidInfix]
+rewrite.avoidInfix.excludeFilters."+" = [ "map" ]
+<<< example
+a success b
+a error (b, c)
+a map { x =>
+  x + 2
+}
+"o" % "a" % "v" c(D)
+future map {
+  case e: Err => 0
+} recover (_.toString)
+future recover {
+  case e: Err => 0
+} map (_.toString)
+>>>
+a.success(b)
+a.error(b, c)
+a map { x =>
+  x + 2
+}
+("o" % "a" % "v").c(D)
+(future map { case e: Err =>
+  0
+}).recover(_.toString)
+future.recover { case e: Err =>
+  0
+} map (_.toString)

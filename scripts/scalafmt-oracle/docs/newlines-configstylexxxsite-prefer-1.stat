@@ -1,0 +1,36 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.configStyleDefnSite.prefer = true
+maxColumn=45
+<<< example
+object a {
+  // keeps single line
+  def method1(a: Int, b: String): Boolean
+
+  // forces config style
+  def method2(a: Int, b: String, c: String): Boolean
+
+  // preserves config style
+  def method3(
+    a: Int, b: String, c: String
+  ): Boolean
+}
+>>>
+object a {
+  // keeps single line
+  def method1(a: Int, b: String): Boolean
+
+  // forces config style
+  def method2(
+      a: Int,
+      b: String,
+      c: String
+  ): Boolean
+
+  // preserves config style
+  def method3(
+      a: Int,
+      b: String,
+      c: String
+  ): Boolean
+}

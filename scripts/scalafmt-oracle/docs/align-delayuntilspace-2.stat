@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+align.preset = more
+align.delayUntilSpace = false
+align.tokens."+" = [ { code = ":" }, { code = "(" }, { code = ")" }, { code = "=" } ]
+<<< example
+object a {
+  def meeethod1(pram1: AnyRef): Any = ???
+  def methd2(paaaaaram2: Any): Any = ???
+  def meth3(param333333: Any): Any = ???
+  def md4(param4: Any): Any = ???
+}
+>>>
+object a {
+  def meeethod1(pram1: AnyRef): Any =
+    ???
+  def methd2(paaaaaram2: Any): Any = ???
+  def meth3(param333333: Any): Any = ???
+  def md4  (param4     : Any): Any = ???
+}

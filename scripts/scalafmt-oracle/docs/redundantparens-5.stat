@@ -1,0 +1,10 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantParens]
+rewrite.redundantParens.infixSide = all
+<<< example
+// all
+foo || (bar && baz) // low precedence infix
+>>>
+// all
+foo || bar && baz // low precedence infix

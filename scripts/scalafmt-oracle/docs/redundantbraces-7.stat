@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.defnBodies = true
+<<< example
+def f() = {
+  1 + 1
+}
+>>>
+def f() =
+  1 + 1

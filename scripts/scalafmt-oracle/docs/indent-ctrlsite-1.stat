@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+indent.callSite = 2
+indent.ctrlSite = 4
+<<< example
+if (
+ foo && // indented by 4
+ bar
+) {
+  baz
+}
+>>>
+if (
+    foo && // indented by 4
+    bar
+) {
+  baz
+}

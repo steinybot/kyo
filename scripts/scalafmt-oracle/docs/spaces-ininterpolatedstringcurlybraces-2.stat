@@ -1,0 +1,11 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.inInterpolatedStringCurlyBraces = false
+<<< example
+s"Hello ${ oneHundred }% world!"
+s"Hello ${ th.e} world!"
+s"Hello ${the() } world!"
+>>>
+s"Hello ${oneHundred}% world!"
+s"Hello ${th.e} world!"
+s"Hello ${the()} world!"

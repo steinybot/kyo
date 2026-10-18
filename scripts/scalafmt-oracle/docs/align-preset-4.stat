@@ -1,0 +1,23 @@
+runner.dialect = scala213
+maxColumn = 40
+align.preset = most
+<<< example
+for {
+  // align <- with =
+  x <- List()
+  yyy = 2
+  // aligns body by arrow
+  zzz <- new Integer {
+    def value = 3
+  }
+} yield x
+>>>
+for {
+  // align <- with =
+  x   <- List()
+  yyy  = 2
+  // aligns body by arrow
+  zzz <- new Integer {
+           def value = 3
+         }
+} yield x

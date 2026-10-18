@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.parentConstructors = Always
+maxColumn = 30
+<<< example
+object A {
+  trait Foo
+  extends Bar
+  with Baz
+  trait Foo extends Bar with Baz
+}
+>>>
+object A {
+  trait Foo
+      extends Bar with Baz
+  trait Foo
+      extends Bar with Baz
+}

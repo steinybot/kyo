@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+docstrings.style = Asterisk
+docstrings.oneline = unfold
+<<< example
+/** Scaladoc oneline */
+/**
+  * Scaladoc multiline
+  */
+val a = 1
+>>>
+/**
+ * Scaladoc oneline
+ */
+/**
+ * Scaladoc multiline
+ */
+val a = 1

@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.afterSymbolicDefs=true
+<<< example
+def +++(a: A): F[A]
+>>>
+def +++ (a: A): F[A]

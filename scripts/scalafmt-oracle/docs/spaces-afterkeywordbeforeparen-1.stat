@@ -1,0 +1,9 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.afterKeywordBeforeParen = false
+<<< example
+if (a) println("HELLO!")
+while (a) println("HELLO!")
+>>>
+if(a) println("HELLO!")
+while(a) println("HELLO!")

@@ -1,0 +1,18 @@
+runner.dialect = scala213
+maxColumn = 40
+runner.dialect = scala213
+runner.dialectOverride.withAllowToplevelTerms = true
+runner.dialectOverride.withAllowEndMarker = true
+runner.dialectOverride.allowSignificantIndentation = true
+<<< example
+// top-level def: unsupported by scala213
+def foo = // significant indent: unsupported by scala213
+  bar
+  baz
+end foo // end marker: unsupported by scala213
+>>>
+// top-level def: unsupported by scala213
+def foo = // significant indent: unsupported by scala213
+  bar
+  baz
+end foo // end marker: unsupported by scala213

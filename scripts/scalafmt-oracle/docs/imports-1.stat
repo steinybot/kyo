@@ -1,0 +1,25 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [Imports]
+rewrite.imports.expand = true
+<<< example
+import a.{
+    b,
+    c
+  }, h.{
+    k, l
+  }
+import d.e.{f, g}
+import a.{
+    foo => bar,
+    zzzz => _,
+    _
+  }
+>>>
+import a.b
+import a.c
+import h.k
+import h.l
+import d.e.f
+import d.e.g
+import a.{foo => bar, zzzz => _, _}

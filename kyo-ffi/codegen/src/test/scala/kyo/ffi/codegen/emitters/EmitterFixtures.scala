@@ -12,7 +12,8 @@ object EmitterFixtures:
         packageName: String = "kyo.example",
         companion: Option[ConfigSpec] = None,
         enums: List[EnumSpec] = Nil,
-        nativeBundled: Boolean = false
+        nativeBundled: Boolean = false,
+        headers: Seq[String] = Seq.empty
     ): TraitSpec =
         TraitSpec(
             fqcn = s"$packageName.$simpleName",
@@ -22,6 +23,7 @@ object EmitterFixtures:
             methods = methods,
             structs = structs,
             companion = companion,
+            headers = headers,
             enums = enums,
             nativeBundled = nativeBundled
         )

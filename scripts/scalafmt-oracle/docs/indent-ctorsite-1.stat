@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+indent.ctorSite = 4
+indent.defnSite = 2
+<<< example
+class A(
+ field1: Type1 // indented by 4
+) {
+ def function2(
+  parameter1: Type1 // indented by 2
+ ): ReturnType = None
+}
+>>>
+class A(
+    field1: Type1 // indented by 4
+) {
+  def function2(
+    parameter1: Type1 // indented by 2
+  ): ReturnType = None
+}

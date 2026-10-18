@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.ignoreInSyntax = true
+<<< example
+// ignores newline in string, pretends everything fits on one line
+println(s"""${1}
+    """.stripMargin
+)
+>>>
+// ignores newline in string, pretends everything fits on one line
+println(s"""${1}
+    """.stripMargin)

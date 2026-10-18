@@ -1,0 +1,24 @@
+runner.dialect = scala213
+maxColumn = 40
+maxColumn = 40
+xmlLiterals.assumeFormatted = false
+<<< example
+object Example2 {
+  def apply() = {
+      <foo>
+        <bar>{ (1 + 2 + 3).toString("some long format") }</bar>
+      </foo>
+  }
+}
+>>>
+object Example2 {
+  def apply() = {
+    <foo>
+        <bar>{
+      (1 + 2 + 3).toString(
+        "some long format"
+      )
+    }</bar>
+      </foo>
+  }
+}

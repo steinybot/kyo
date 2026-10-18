@@ -43,3 +43,6 @@ analysis-*.md
 
 # macOS Spotlight opt-out marker (local only)
 .metadata_never_index
+
+# scala-cli build output (scripts/scalafmt-oracle)
+scripts/scalafmt-oracle/.scala-build/

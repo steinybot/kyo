@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.inByNameTypes = false
+<<< example
+def foo(a: => A): A
+>>>
+def foo(a: =>A): A

@@ -1,0 +1,28 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.generalExpressions = true
+<<< example
+
+while (x < 10) {
+  x += 1
+}
+
+str match {
+  case "a" => {
+    println("ok")
+  }
+  case _ => {
+    println("not ok")
+  }
+}
+>>>
+while (x < 10)
+  x += 1
+
+str match {
+  case "a" =>
+    println("ok")
+  case _ =>
+    println("not ok")
+}

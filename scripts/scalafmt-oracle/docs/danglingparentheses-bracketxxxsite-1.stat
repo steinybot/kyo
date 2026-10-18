@@ -1,0 +1,26 @@
+runner.dialect = scala213
+maxColumn = 40
+danglingParentheses.defnSite = true
+danglingParentheses.callSite = true
+danglingParentheses.bracketDefnSite = false
+danglingParentheses.bracketCallSite = false
+maxColumn=25
+<<< example
+object a {
+  // defnSite
+  def method[A <: Any, B]: Boolean
+
+  // callSite
+  method[String, SomeOtherType]
+}
+>>>
+object a {
+  // defnSite
+  def method[A <: Any, B]
+      : Boolean
+
+  // callSite
+  method[
+    String,
+    SomeOtherType]
+}

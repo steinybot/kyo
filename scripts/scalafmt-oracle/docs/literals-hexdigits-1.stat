@@ -1,0 +1,10 @@
+runner.dialect = scala213
+maxColumn = 40
+literals.hexDigits=Lower
+literals.long=Upper
+<<< example
+0xaAaA
+0xaAaAl
+>>>
+0xaaaa
+0xaaaaL

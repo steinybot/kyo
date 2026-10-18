@@ -1,0 +1,21 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.beforeCurlyLambdaParams = never
+<<< example
+// should keep one-line
+x.map { x => s"${x._1} -> ${x._2}" }
+x.map { case (c, i) => s"$c -> $i" }
+// should break on arrow since case doesn't fit on a line
+x.zipWithIndex.map { case (c, i) => s"$c -> $i" }
+x.zipWithIndex.map { case (c, i) => s"$c -> $i (long comment)" }
+>>>
+// should keep one-line
+x.map { x => s"${x._1} -> ${x._2}" }
+x.map { case (c, i) => s"$c -> $i" }
+// should break on arrow since case doesn't fit on a line
+x.zipWithIndex.map { case (c, i) =>
+  s"$c -> $i"
+}
+x.zipWithIndex.map { case (c, i) =>
+  s"$c -> $i (long comment)"
+}

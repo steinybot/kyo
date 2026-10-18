@@ -1,0 +1,26 @@
+runner.dialect = scala213
+maxColumn = 40
+newlines.afterCurlyLambdaParams = always
+<<< example
+// ensure a single blank line
+// one-line formatting is not allowed
+something.map { x =>
+
+
+
+  f(x)
+}
+
+something.map { x => f(x) }
+>>>
+// ensure a single blank line
+// one-line formatting is not allowed
+something.map { x =>
+
+  f(x)
+}
+
+something.map { x =>
+
+  f(x)
+}

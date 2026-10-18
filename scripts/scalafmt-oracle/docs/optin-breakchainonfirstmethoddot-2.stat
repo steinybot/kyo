@@ -1,0 +1,12 @@
+runner.dialect = scala213
+maxColumn = 40
+optIn.breakChainOnFirstMethodDot = true
+<<< example
+// preserve break on first dot and break on subsequent dots
+foo
+  .map(_ + 1).filter(_ > 2)
+>>>
+// preserve break on first dot and break on subsequent dots
+foo
+  .map(_ + 1)
+  .filter(_ > 2)

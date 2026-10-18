@@ -1,0 +1,15 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+<<< example
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), delta(epsilonLongIdentifier1, epsilonLongIdentifier2), aaaa)
+}
+>>>
+object a {
+  program(beta(gammaLongIdentifier1,
+      gammaLongIdentifier2),
+    delta(epsilonLongIdentifier1,
+      epsilonLongIdentifier2), aaaa)
+}

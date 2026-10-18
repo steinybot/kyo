@@ -1,0 +1,16 @@
+runner.dialect = scala213
+maxColumn = 40
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+<<< example
+object a {
+  def f(a: Int, b: LongTypeBB = defaultExpression(argumentA, argumentB), c: Int): Unit = ()
+}
+>>>
+object a {
+  def f(a: Int,
+      b: LongTypeBB = defaultExpression(
+        argumentA,
+        argumentB
+      ), c: Int): Unit = ()
+}

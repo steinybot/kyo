@@ -1,0 +1,7 @@
+runner.dialect = scala213
+maxColumn = 40
+spaces.inParentheses=true
+<<< example
+foo(a, b)
+>>>
+foo( a, b )

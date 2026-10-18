@@ -1,0 +1,20 @@
+runner.dialect = scala213
+maxColumn = 40
+rewrite.rules = [RedundantBraces]
+rewrite.redundantBraces.methodBodies = true
+rewrite.redundantBraces.includeUnitMethods = false
+<<< example
+def f() = {
+  1 + 1
+}
+
+def x(): Unit = {
+  println("example")
+}
+>>>
+def f() =
+  1 + 1
+
+def x(): Unit = {
+  println("example")
+}

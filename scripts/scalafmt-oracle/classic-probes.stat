@@ -1,0 +1,435 @@
+<<< callsite-always-middle-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-oneline-middle-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-always-first-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-oneline-first-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-always-last-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, bbbb, beta(gammaLongIdentifier1, gammaLongIdentifier2))
+}
+<<< callsite-oneline-last-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaa, bbbb, beta(gammaLongIdentifier1, gammaLongIdentifier2))
+}
+<<< callsite-always-flat
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-oneline-flat
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-oneline-first-multiline-closed
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+danglingParentheses.callSite = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), aaaa, bbbb)
+}
+<<< callsite-always-two-multiline
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), delta(epsilonLongIdentifier1, epsilonLongIdentifier2), aaaa)
+}
+<<< callsite-oneline-two-multiline
+binPack.callSite = oneline
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(beta(gammaLongIdentifier1, gammaLongIdentifier2), delta(epsilonLongIdentifier1, epsilonLongIdentifier2), aaaa)
+}
+<<< callsite-always-align-openparen
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+align.openParenCallSite = true
+---
+object a {
+  program(aaaa, beta(gammaLongIdentifier1, gammaLongIdentifier2), cccc)
+}
+<<< callsite-always-align-flat
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+align.openParenCallSite = true
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-always-source-open-break-joined
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< callsite-never-single-source-break-folded
+---
+object a {
+  send(
+    alpha, beta, gammaLongIdentifier)
+}
+<<< callsite-never-both-source-breaks-preserved
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< defnsite-always
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< defnsite-oneline
+binPack.defnSite = oneline
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< defnsite-always-multiline-param
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def f(a: Int, b: LongTypeBB = defaultExpression(argumentA, argumentB), c: Int): Unit = ()
+}
+<<< defnsite-oneline-multiline-param
+binPack.defnSite = oneline
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def f(a: Int, b: LongTypeBB = defaultExpression(argumentA, argumentB), c: Int): Unit = ()
+}
+<<< defnsite-always-source-open-break-joined
+binPack.defnSite = always
+newlines.configStyleDefnSite.prefer = false
+---
+object a {
+  def program(
+    alpha: Int, betaLongArgument: String, gamma: Seq[LongType]): Unit = ()
+}
+<<< parentconstructors-always-multiline-parent
+binPack.parentConstructors = always
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-never-multiline-parent
+binPack.parentConstructors = never
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-oneline-multiline-parent
+binPack.parentConstructors = oneline
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-onelineifprimaryoneline-multiline-parent
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  trait Foo extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-always-primary-flat
+binPack.parentConstructors = always
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-oneline-primary-flat
+binPack.parentConstructors = oneline
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-onelineifprimaryoneline-primary-flat
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  class Foo(alpha: Int) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz with Qux
+}
+<<< parentconstructors-always-primary-broken
+binPack.parentConstructors = always
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-oneline-primary-broken
+binPack.parentConstructors = oneline
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-onelineifprimaryoneline-primary-broken
+binPack.parentConstructors = onelineIfPrimaryOneline
+---
+object a {
+  class Foo(alpha: Int, betaLongName: String) extends Bar(argumentOneLongName, argumentTwoLongName) with Baz
+}
+<<< parentconstructors-always-midlist-multiline
+binPack.parentConstructors = always
+---
+object a {
+  trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
+}
+<<< parentconstructors-oneline-midlist-multiline
+binPack.parentConstructors = oneline
+---
+object a {
+  trait Foo extends Baz with Qux(argumentOneLongName, argumentTwoLongName) with Bar
+}
+<<< cfgstyle-close-break-alone-folded
+---
+object a {
+  send(alpha, beta, gammaLongIdentifier
+  )
+}
+<<< cfgstyle-defnsite-close-break-alone-folded
+---
+object a {
+  def f(a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-prefer-false-both-breaks-folded
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< cfgstyle-defnsite-both-breaks-preserved
+---
+object a {
+  def f(
+    a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-scalajs-close-break-preserved
+danglingParentheses.callSite = false
+---
+object a {
+  send(alpha, beta, gammaLongIdentifier
+  )
+}
+<<< cfgstyle-defnsite-scalajs-close-break-preserved
+danglingParentheses.defnSite = false
+---
+object a {
+  def f(a: Int, b: String
+  ): Unit = ()
+}
+<<< cfgstyle-align-both-breaks-preserved
+align.openParenCallSite = true
+---
+object a {
+  send(
+    alpha, beta, gamma
+  )
+}
+<<< binpack-always-configstyle-both-breaks
+binPack.callSite = always
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee
+  )
+}
+<<< binpack-always-prefer-false-both-breaks-kept
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(
+    aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee
+  )
+}
+<<< binpack-always-scalajs-close-break-preserved
+binPack.callSite = always
+danglingParentheses.callSite = false
+---
+object a {
+  program(alpha, beta, gamma
+  )
+}
+<<< binpack-prefer-false-close-break-folded
+binPack.callSite = always
+newlines.configStyleCallSite.prefer = false
+---
+object a {
+  program(alpha, beta, gamma
+  )
+}
+<<< source-fold-callsite-broken
+newlines.source = fold
+---
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
+<<< source-fold-callsite-flat
+newlines.source = fold
+---
+object a {
+  send(alpha, beta, gamma)
+}
+<<< source-fold-callsite-overflow-broken
+newlines.source = fold
+---
+object a {
+  program(
+    aaaaaaaa,
+    bbbbbbbb,
+    cccccccc,
+    dddddddd,
+    eeeeeeee
+  )
+}
+<<< source-fold-callsite-overflow-flat
+newlines.source = fold
+---
+object a {
+  program(aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee)
+}
+<<< source-keep-callsite-broken
+newlines.source = keep
+---
+object a {
+  send(
+    alpha,
+    beta,
+    gamma
+  )
+}
+<<< source-keep-callsite-flat
+newlines.source = keep
+---
+object a {
+  send(alpha, beta, gamma)
+}
+<<< source-fold-defnsite-broken
+newlines.source = fold
+---
+object a {
+  def f(
+    a: Int,
+    b: String
+  ): Unit = ()
+}
+<<< source-keep-defnsite-broken
+newlines.source = keep
+---
+object a {
+  def f(
+    a: Int,
+    b: String
+  ): Unit = ()
+}
+<<< verticalmultiline-below-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 3
+---
+object a {
+  def f(a: Int, b: String): Unit = ()
+}
+<<< verticalmultiline-at-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String): Unit = ()
+}
+<<< verticalmultiline-above-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String, c: Long): Unit = ()
+}
+<<< verticalmultiline-curried-at-threshold
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+---
+object a {
+  def f(a: Int, b: String)(c: Double): Unit = ()
+}
+<<< verticalmultiline-newline-after-open-paren
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+verticalMultiline.newlineAfterOpenParen = true
+---
+object a {
+  def f(a: Int, b: String)(c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-after
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [after]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-before
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [before]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+<<< verticalmultiline-implicit-before-after
+verticalMultiline.atDefnSite = true
+verticalMultiline.arityThreshold = 2
+newlines.implicitParamListModifierForce = [before, after]
+---
+object a {
+  def f(a: Int, b: String)(implicit c: Double, d: Long): Unit = ()
+}
+
+
