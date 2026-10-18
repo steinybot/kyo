@@ -643,6 +643,24 @@ class PrinterTest extends kyo.test.Test[Any]:
                 }
                 assert(Printer.optimal.print(doc, 80) == "a   b     c\nlonglongerd")
             }
+
+            "marker following newline aligns continuation line" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align { col =>
+                        Doc.text("line1").append(Doc.newline).append(col).append(Doc.text("line2"))
+                    }
+                )
+                assert(Printer.optimal.print(doc, 80) == "prefix: line1\n        line2")
+            }
+
+            "marker with offset following newline indents continuation line" in {
+                val doc = Doc.text("prefix: ").append(
+                    Doc.align { col =>
+                        Doc.text("line1").append(Doc.newline).append(col.indent(4)).append(Doc.text("line2"))
+                    }
+                )
+                assert(Printer.optimal.print(doc, 80) == "prefix: line1\n            line2")
+            }
         }
 
         "choice and optimality" - {
@@ -764,4 +782,286 @@ class PrinterTest extends kyo.test.Test[Any]:
         }
     }
 
+    "Multi-column alignment and Markdown table fixture" - {
+        import MarkdownTableFixture.*
+
+        def verifyTableDelimiters(rendered: String)(using kyo.test.AssertScope): Unit =
+            val lines = rendered.split('\n')
+            assert(lines.nonEmpty)
+            val pipeIndices = lines.map(line =>
+                line.zipWithIndex.collect { case ('|', idx) => idx }.toSeq
+            )
+            val firstIndices = pipeIndices.head
+            assert(firstIndices.length >= 2)
+            for indices <- pipeIndices do
+                assert(indices == firstIndices)
+        end verifyTableDelimiters
+
+        "basic markdown table generates vertically aligned columns" in {
+            val headers = Chunk("Package", "Version", "Status")
+            val rows    = Chunk(
+                Chunk("kyo-core", "0.1.0", "stable"),
+                Chunk("kyo-prelude", "0.1.0", "active"),
+                Chunk("kyo-print", "0.1.0-SNAPSHOT", "experimental")
+            )
+            val doc      = MarkdownTableFixture.table(headers, rows)
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "| Package     | Version        | Status       |",
+                "| :---        | :---           | :---         |",
+                "| kyo-core    | 0.1.0          | stable       |",
+                "| kyo-prelude | 0.1.0          | active       |",
+                "| kyo-print   | 0.1.0-SNAPSHOT | experimental |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+            verifyTableDelimiters(rendered)
+        }
+
+        "markdown table with column alignments (Left, Center, Right)" in {
+            val columns = Chunk(
+                Column("Left", ColumnAlign.Left),
+                Column("Center", ColumnAlign.Center),
+                Column("Right", ColumnAlign.Right)
+            )
+            val rows = Chunk(
+                Chunk(Doc.text("a"), Doc.text("b"), Doc.text("c")),
+                Chunk(Doc.text("longer text"), Doc.text("medium"), Doc.text("short"))
+            )
+            val doc      = MarkdownTableFixture.table(columns, rows)
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "| Left        | Center | Right |",
+                "| :---        | :---:  | ---:  |",
+                "| a           | b      | c     |",
+                "| longer text | medium | short |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+            verifyTableDelimiters(rendered)
+        }
+
+        "markdown table with ragged/uneven rows pads missing cells" in {
+            val headers = Chunk("Col1", "Col2", "Col3")
+            val rows    = Chunk(
+                Chunk("only-col1"),
+                Chunk("first", "second"),
+                Chunk("a", "b", "c")
+            )
+            val doc      = MarkdownTableFixture.table(headers, rows)
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "| Col1      | Col2   | Col3 |",
+                "| :---      | :---   | :--- |",
+                "| only-col1 |        |      |",
+                "| first     | second |      |",
+                "| a         | b      | c    |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+            verifyTableDelimiters(rendered)
+        }
+
+        "markdown table with rich Doc content" in {
+            val headers = Chunk(
+                Column(Doc.text("**Identifier**")),
+                Column(Doc.text("`Type`")),
+                Column(Doc.text("*Description*"))
+            )
+            val rows = Chunk(
+                Chunk(Doc.text("id"), Doc.text("Int"), Doc.text("Unique identifier")),
+                Chunk(Doc.text("payload"), Doc.text("Chunk[Byte]"), Doc.text("Raw payload"))
+            )
+            val doc      = MarkdownTableFixture.table(headers, rows)
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "| **Identifier** | `Type`      | *Description*     |",
+                "| :---           | :---        | :---              |",
+                "| id             | Int         | Unique identifier |",
+                "| payload        | Chunk[Byte] | Raw payload       |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+            verifyTableDelimiters(rendered)
+        }
+
+        "indented markdown table preserves outer indentation and inner column alignment" in {
+            val headers = Chunk("A", "B")
+            val rows    = Chunk(
+                Chunk("val1", "val2"),
+                Chunk("longerVal1", "v2")
+            )
+            val tableDoc = MarkdownTableFixture.table(headers, rows)
+            val doc      = Doc.text("Summary:").append(Doc.newline).append(tableDoc.indent(4))
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "Summary:",
+                "    | A          | B    |",
+                "    | :---       | :--- |",
+                "    | val1       | val2 |",
+                "    | longerVal1 | v2   |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+            val tablePart = rendered.linesIterator.drop(1).mkString("\n")
+            verifyTableDelimiters(tablePart)
+        }
+
+        "multiple independent tables maintain isolated column measurements" in {
+            val t1 = MarkdownTableFixture.table(
+                Chunk("X", "Y"),
+                Chunk(Chunk("short", "1"), Chunk("med", "2"))
+            )
+            val t2 = MarkdownTableFixture.table(
+                Chunk("SuperLongColumnHeader", "Z"),
+                Chunk(Chunk("a", "b"))
+            )
+            val doc = Doc.stack(
+                Doc.text("Table 1:"),
+                t1,
+                Doc.empty,
+                Doc.text("Table 2:"),
+                t2
+            )
+            val rendered = Printer.greedy.print(doc, 100)
+
+            val expected = Seq(
+                "Table 1:",
+                "| X     | Y    |",
+                "| :---  | :--- |",
+                "| short | 1    |",
+                "| med   | 2    |",
+                "",
+                "Table 2:",
+                "| SuperLongColumnHeader | Z    |",
+                "| :---                  | :--- |",
+                "| a                     | b    |"
+            ).mkString("\n")
+
+            assert(rendered == expected)
+        }
+
+        "empty table handling" in {
+            val emptyCols = MarkdownTableFixture.table(Chunk.empty[String], Chunk.empty[Chunk[String]])
+            assert(Printer.greedy.print(emptyCols, 80) == "")
+
+            val headersOnly = MarkdownTableFixture.table(Chunk("A", "B"), Chunk.empty[Chunk[String]])
+            val rendered    = Printer.greedy.print(headersOnly, 80)
+            val expected    = Seq(
+                "| A    | B    |",
+                "| :--- | :--- |"
+            ).mkString("\n")
+            assert(rendered == expected)
+        }
+
+        "parity across greedy, optimal, and scalafmt printer engines" in {
+            val headers = Chunk("Item", "Qty", "Cost")
+            val rows    = Chunk(
+                Chunk("Widget", "5", "$10.00"),
+                Chunk("Super Gadget Deluxe", "100", "$1,250.00"),
+                Chunk("Part", "1", "$0.50")
+            )
+            val doc     = MarkdownTableFixture.table(headers, rows)
+            val greedy  = Printer.greedy.print(doc, 100)
+            val optimal = Printer.optimal.print(doc, 100)
+            val fmt     = Printer.scalafmt.print(doc, 100)
+
+            assert(greedy == optimal)
+            assert(greedy == fmt)
+            verifyTableDelimiters(greedy)
+        }
+
+        "streaming printStream produces identical output to buffered print" in {
+            val headers = Chunk("Field", "Type")
+            val rows    = Chunk(
+                Chunk("name", "String"),
+                Chunk("age", "Int"),
+                Chunk("attributes", "Map[String, Any]")
+            )
+            val doc      = MarkdownTableFixture.table(headers, rows)
+            val expected = Printer.greedy.print(doc, 100)
+
+            val greedyStream  = Printer.greedy.printStream(doc, 100).run.eval.mkString
+            val optimalStream = Printer.optimal.printStream(doc, 100).run.eval.mkString
+
+            assert(greedyStream == expected)
+            assert(optimalStream == expected)
+        }
+
+        "compact printer handles markdown table gracefully" in {
+            val headers  = Chunk("A", "B")
+            val rows     = Chunk(Chunk("1", "2"))
+            val doc      = MarkdownTableFixture.table(headers, rows)
+            val rendered = Printer.compact.print(doc, 80)
+            assert(rendered.contains("| A | B |"))
+            assert(rendered.contains("| :--- | :--- |"))
+            assert(rendered.contains("| 1 | 2 |"))
+        }
+    }
+
 end PrinterTest
+
+object MarkdownTableFixture:
+
+    enum ColumnAlign derives CanEqual:
+        case Left, Center, Right
+
+    final case class Column(title: Doc, align: ColumnAlign = ColumnAlign.Left)
+
+    object Column:
+        def apply(title: String): Column                     = Column(Doc.text(title), ColumnAlign.Left)
+        def apply(title: String, align: ColumnAlign): Column = Column(Doc.text(title), align)
+
+    def table(
+        columns: Chunk[Column],
+        rows: Chunk[Chunk[Doc]]
+    ): Doc =
+        val numCols = math.max(columns.length, rows.foldLeft(0)((m, r) => math.max(m, r.length)))
+        if numCols <= 0 then Doc.empty
+        else
+            Doc.align(numCols) { cols =>
+                def formatRow(cells: Chunk[Doc]): Doc =
+                    val cellDocs = Chunk.tabulate(numCols) { i =>
+                        val content = if i < cells.length then cells(i) else Doc.empty
+                        Doc.concat(Doc.space, content, Doc.space, cols(i))
+                    }
+                    Doc.concat(Doc.text("|"), Doc.join(Doc.text("|"))(cellDocs), Doc.text("|"))
+                end formatRow
+
+                val headerCells = Chunk.tabulate(numCols) { i =>
+                    if i < columns.length then columns(i).title else Doc.empty
+                }
+
+                val sepCells = Chunk.tabulate(numCols) { i =>
+                    val alignment = if i < columns.length then columns(i).align else ColumnAlign.Left
+                    val marker    = alignment match
+                        case ColumnAlign.Left   => Doc.text(":---")
+                        case ColumnAlign.Center => Doc.text(":---:")
+                        case ColumnAlign.Right  => Doc.text("---:")
+                    Doc.concat(Doc.space, marker, Doc.space, cols(i))
+                }
+                val sepRow = Doc.concat(Doc.text("|"), Doc.join(Doc.text("|"))(sepCells), Doc.text("|"))
+
+                val headerRow = formatRow(headerCells)
+                val dataRows  = rows.map(formatRow)
+                Doc.stack(headerRow +: sepRow +: dataRows)
+            }
+        end if
+    end table
+
+    @scala.annotation.targetName("tableStrings")
+    def table(
+        headers: Chunk[String],
+        rows: Chunk[Chunk[String]]
+    ): Doc =
+        table(
+            headers.map(h => Column(Doc.text(h), ColumnAlign.Left)),
+            rows.map(r => r.map(Doc.text))
+        )
+
+end MarkdownTableFixture
