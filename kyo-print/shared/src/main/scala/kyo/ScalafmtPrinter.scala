@@ -117,8 +117,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 case Doc.HardNewline           => None
                 case Doc.Indent(_, inner)      => flatWidth(inner)
                 case Doc.Align(inner)          => flatWidth(inner)
-                case Doc.Group(inner)          => flatWidth(inner)
-                case Doc.Choice(flat, _)       => flatWidth(flat)
+                case Doc.Group(inner, _)       => flatWidth(inner)
+                case Doc.Choice(flat, _, _)    => flatWidth(flat)
                 case Doc.Concat(first, second) =>
                     for
                         a <- flatWidth(first)
@@ -235,7 +235,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                     render(first, base, flat)
                     render(second, base, flat)
 
-                case Doc.Group(inner) =>
+                case Doc.Group(inner, _) =>
                     if flat then render(inner, base, true)
                     else
                         flatWidth(inner) match
@@ -243,7 +243,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                             case _                           => render(inner, base, false)
                     end if
 
-                case Doc.Choice(flatAlt, broken) =>
+                case Doc.Choice(flatAlt, broken, _) =>
                     render(if flat then flatAlt else broken, base, flat)
 
                 case Doc.Alignment(_, offset) =>
@@ -357,8 +357,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 case Doc.Concat(first, second) => docString(first) + docString(second)
                 case Doc.Indent(_, inner)      => docString(inner)
                 case Doc.Align(inner)          => docString(inner)
-                case Doc.Group(inner)          => docString(inner)
-                case Doc.Choice(_, broken)     => docString(broken)
+                case Doc.Group(inner, _)       => docString(inner)
+                case Doc.Choice(_, broken, _)  => docString(broken)
                 case _                         => ""
             end match
         end docString

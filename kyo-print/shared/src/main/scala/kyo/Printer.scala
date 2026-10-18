@@ -115,9 +115,9 @@ object Printer:
                                 fits(budget, Work(head.indent, head.isFlat, inner) :: rest)
                             case Doc.Concat(first, second) =>
                                 fits(budget, Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: rest)
-                            case Doc.Group(inner) =>
+                            case Doc.Group(inner, _) =>
                                 fits(budget, Work(head.indent, head.isFlat, inner) :: rest)
-                            case Doc.Choice(flat, broken) =>
+                            case Doc.Choice(flat, broken, _) =>
                                 if head.isFlat then
                                     fits(budget, Work(head.indent, true, flat) :: rest)
                                 else
@@ -195,7 +195,7 @@ object Printer:
                         case Doc.Concat(first, second) =>
                             work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
 
-                        case Doc.Choice(flat, broken) =>
+                        case Doc.Choice(flat, broken, _) =>
                             if head.isFlat then
                                 work = Work(head.indent, true, flat) :: work
                             else
@@ -215,7 +215,7 @@ object Printer:
                         case c: Doc.Clause =>
                             work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
 
-                        case Doc.Group(inner) =>
+                        case Doc.Group(inner, _) =>
                             if head.isFlat then
                                 work = Work(head.indent, true, inner) :: work
                             else
@@ -305,7 +305,7 @@ object Printer:
                     case Doc.Concat(first, second) =>
                         work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
 
-                    case Doc.Choice(flat, broken) =>
+                    case Doc.Choice(flat, broken, _) =>
                         if head.isFlat then
                             work = Work(head.indent, true, flat) :: work
                         else
@@ -325,7 +325,7 @@ object Printer:
                     case c: Doc.Clause =>
                         work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
 
-                    case Doc.Group(inner) =>
+                    case Doc.Group(inner, _) =>
                         if head.isFlat then
                             work = Work(head.indent, true, inner) :: work
                         else
@@ -408,10 +408,10 @@ object Printer:
                         case Doc.Concat(first, second) =>
                             work = first :: second :: work
 
-                        case Doc.Group(inner) =>
+                        case Doc.Group(inner, _) =>
                             work = inner :: work
 
-                        case Doc.Choice(flat, _) =>
+                        case Doc.Choice(flat, _, _) =>
                             work = flat :: work
 
                         case Doc.Alignment(_, offset) =>
@@ -465,10 +465,10 @@ object Printer:
                     case Doc.Concat(first, second) =>
                         work = first :: second :: work
 
-                    case Doc.Group(inner) =>
+                    case Doc.Group(inner, _) =>
                         work = inner :: work
 
-                    case Doc.Choice(flat, _) =>
+                    case Doc.Choice(flat, _, _) =>
                         work = flat :: work
 
                     case Doc.Alignment(_, offset) =>
@@ -676,7 +676,7 @@ object Printer:
                         val leftMs = resolve(first, col, indent, pendingIndent, mode, width, memo)
                         processConcat(leftMs, m1 => resolve(second, m1.last, indent, m1.pendingIndent, mode, width, memo))
 
-                    case Doc.Group(inner) =>
+                    case Doc.Group(inner, _) =>
                         mode match
                             case Mode.Flat =>
                                 resolve(inner, col, indent, pendingIndent, Mode.Flat, width, memo)
@@ -690,7 +690,7 @@ object Printer:
                                     brokenMs
                                 end if
 
-                    case Doc.Choice(flat, broken) =>
+                    case Doc.Choice(flat, broken, _) =>
                         mode match
                             case Mode.Flat =>
                                 resolve(flat, col, indent, pendingIndent, Mode.Flat, width, memo)

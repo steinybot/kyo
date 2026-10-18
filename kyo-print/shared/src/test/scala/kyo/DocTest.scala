@@ -189,6 +189,113 @@ class DocTest extends kyo.test.Test[Any]:
         "idempotent" in {
             assert(a.group.group == a.group)
         }
+
+        "scoped choice factory" - {
+            "passes ChoiceFactory with non-negative id" in {
+                var factoryId = -1
+                val doc       = Doc.group { choice =>
+                    factoryId = choice.id
+                    Doc.concat(
+                        Doc.text("val x ="),
+                        choice(Doc.space, Doc.newline.indent(2)),
+                        Doc.text("42")
+                    )
+                }
+                assert(factoryId >= 0)
+                assert(doc == Doc.Group(
+                    Doc.Concat(
+                        Doc.Concat(Doc.text("val x ="), Doc.Choice(Doc.space, Doc.newline.indent(2), factoryId)),
+                        Doc.text("42")
+                    ),
+                    factoryId
+                ))
+            }
+
+            "successive group blocks receive distinct IDs" in {
+                var id1 = -1
+                var id2 = -1
+                val _   = Doc.group { choice =>
+                    id1 = choice.id
+                    a
+                }
+                val _ = Doc.group { choice =>
+                    id2 = choice.id
+                    b
+                }
+                assert(id1 != id2)
+            }
+
+            "nested groups receive distinct choice factory IDs" in {
+                var outerId = -1
+                var innerId = -1
+                val doc     = Doc.group { outer =>
+                    outerId = outer.id
+                    Doc.concat(
+                        outer.spaceOrNewline,
+                        Doc.group { inner =>
+                            innerId = inner.id
+                            inner.emptyOrNewline
+                        }
+                    )
+                }
+                assert(outerId != innerId)
+                assert(doc == Doc.Group(
+                    Doc.Concat(
+                        Doc.Choice(Doc.space, Doc.newline, outerId),
+                        Doc.Group(Doc.Choice(Doc.empty, Doc.newline, innerId), innerId)
+                    ),
+                    outerId
+                ))
+            }
+
+            "choice factory spaceOrNewline and emptyOrNewline" in {
+                val _ = Doc.group { choice =>
+                    val sn = choice.spaceOrNewline
+                    assert(sn == Doc.Choice(Doc.space, Doc.newline, choice.id))
+                    val en = choice.emptyOrNewline
+                    assert(en == Doc.Choice(Doc.empty, Doc.newline, choice.id))
+                    a
+                }
+            }
+
+            "choice factory or combinator" in {
+                val _ = Doc.group { choice =>
+                    assert(choice.or(a, b) == Doc.Choice(a, b, choice.id))
+                    a
+                }
+            }
+
+            "choice factory normalizes identical alternatives" in {
+                val _ = Doc.group { choice =>
+                    assert(choice(a, a) eq a)
+                    a
+                }
+            }
+
+            "choice factory multiple alternatives chunk and varargs" in {
+                val _ = Doc.group { choice =>
+                    assert(choice(Chunk.empty) == Doc.empty)
+                    assert(choice(Chunk(a)) eq a)
+                    assert(choice(Chunk(a, b, c)) == Doc.Choice(a, Doc.Choice(b, c, choice.id), choice.id))
+                    assert(choice(a, b, c) == Doc.Choice(a, Doc.Choice(b, c, choice.id), choice.id))
+                    a
+                }
+            }
+
+            "empty document inside scoped group returns empty" in {
+                val doc = Doc.group { _ => Doc.empty }
+                assert(doc == Doc.empty)
+            }
+
+            "grouped alias delegates to group" in {
+                var capturedId = -1
+                val doc        = Doc.grouped { choice =>
+                    capturedId = choice.id
+                    a
+                }
+                assert(doc == Doc.Group(a, capturedId))
+            }
+        }
     }
 
     "align" - {
@@ -395,15 +502,19 @@ class DocTest extends kyo.test.Test[Any]:
     "pattern matching" in {
         def describe(doc: Doc): String =
             doc match
-                case Doc.Empty                                       => "empty"
-                case Doc.Text(t)                                     => s"text($t)"
-                case Doc.Newline                                     => "newline"
-                case Doc.HardNewline                                 => "hardNewline"
-                case Doc.Indent(n, d)                                => s"indent($n, ${describe(d)})"
-                case Doc.Align(d)                                    => s"align(${describe(d)})"
-                case Doc.Concat(d1, d2)                              => s"concat(${describe(d1)}, ${describe(d2)})"
-                case Doc.Group(d)                                    => s"group(${describe(d)})"
-                case Doc.Choice(flat, broken)                        => s"choice(${describe(flat)}, ${describe(broken)})"
+                case Doc.Empty          => "empty"
+                case Doc.Text(t)        => s"text($t)"
+                case Doc.Newline        => "newline"
+                case Doc.HardNewline    => "hardNewline"
+                case Doc.Indent(n, d)   => s"indent($n, ${describe(d)})"
+                case Doc.Align(d)       => s"align(${describe(d)})"
+                case Doc.Concat(d1, d2) => s"concat(${describe(d1)}, ${describe(d2)})"
+                case Doc.Group(d, id)   =>
+                    if id >= 0 then s"group#$id(${describe(d)})"
+                    else s"group(${describe(d)})"
+                case Doc.Choice(flat, broken, id) =>
+                    if id >= 0 then s"choice#$id(${describe(flat)}, ${describe(broken)})"
+                    else s"choice(${describe(flat)}, ${describe(broken)})"
                 case Doc.Alignment(id, offset)                       => s"alignment($id, $offset)"
                 case Doc.Clause(p, open, close, elems, sep, _, _, _) =>
                     s"clause(${p.site}, ${describe(open)}, ${describe(close)}, ${elems.length}, ${describe(sep)})"
@@ -424,6 +535,17 @@ class DocTest extends kyo.test.Test[Any]:
         }
         assert(describe(testMarker) == s"alignment(${testMarker.id}, 0)")
         assert(describe(testMarker.indent(4)) == s"alignment(${testMarker.id}, 4)")
+        var testChoice: Doc = null
+        val testGroup       = Doc.group { choice =>
+            testChoice = choice(a, b)
+            testChoice
+        }
+        val factoryId = testGroup match
+            case Doc.Group(_, id) => id
+            case _                => -1
+        assert(factoryId >= 0)
+        assert(describe(testGroup) == s"group#$factoryId(choice#$factoryId(text(a), text(b)))")
+        assert(describe(testChoice) == s"choice#$factoryId(text(a), text(b))")
         assert(
             describe(Doc.Clause(
                 Doc.ClausePolicy(

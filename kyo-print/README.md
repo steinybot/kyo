@@ -42,8 +42,8 @@ def widthOf(doc: Doc): Int = doc match
     case Doc.Indent(_, d) => widthOf(d)
     case Doc.Align(d)     => widthOf(d)
     case Doc.Concat(a, b) => widthOf(a) + widthOf(b)
-    case Doc.Group(d)     => widthOf(d)
-    case Doc.Choice(_, _) => 0 // decided by the printer
+    case Doc.Group(d, _)     => widthOf(d)
+    case Doc.Choice(_, _, _) => 0 // decided by the printer
     case Doc.Newline      => 1
     case Doc.HardNewline  => 0
 

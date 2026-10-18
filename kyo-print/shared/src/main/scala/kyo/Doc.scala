@@ -55,21 +55,59 @@ end Doc
   */
 object Doc:
 
-    case object Empty                          extends Doc
-    case class Text(text: String)              extends Doc
-    case object Newline                        extends Doc
-    case object HardNewline                    extends Doc
-    case class Indent(spaces: Int, doc: Doc)   extends Doc
-    case class Align(doc: Doc)                 extends Doc
-    case class Concat(first: Doc, second: Doc) extends Doc
-    case class Group(doc: Doc)                 extends Doc
-    case class Choice(flat: Doc, broken: Doc)  extends Doc
+    case object Empty                                            extends Doc
+    case class Text(text: String)                                extends Doc
+    case object Newline                                          extends Doc
+    case object HardNewline                                      extends Doc
+    case class Indent(spaces: Int, doc: Doc)                     extends Doc
+    case class Align(doc: Doc)                                   extends Doc
+    case class Concat(first: Doc, second: Doc)                   extends Doc
+    case class Group(doc: Doc, id: Int = -1)                     extends Doc
+    case class Choice(flat: Doc, broken: Doc, groupId: Int = -1) extends Doc
 
     final case class Alignment private[kyo] (id: Int, offset: Int = 0) extends Doc derives CanEqual:
         override def indent(spaces: Int = 4): Alignment =
             if spaces == 0 then this
             else Alignment(id, offset + spaces)
     end Alignment
+
+    /** Factory for creating layout choices coordinated across a scoped group.
+      *
+      * When formatting a document, a scoped group makes an all-or-nothing
+      * decision: if the entire group fits on the current line, every choice
+      * created by this factory adopts its flat alternative. If the group does
+      * not fit, every choice adopts its broken alternative.
+      *
+      * This coordination eliminates the need to duplicate common sub-trees
+      * when formatting related line breaks or delimiters across a structured
+      * block (such as parameter lists, collections, or control flow).
+      *
+      * Each factory is associated with a unique group identifier, ensuring that
+      * choices from nested groups resolve independently.
+      */
+    final case class ChoiceFactory private[kyo] (id: Int) derives CanEqual:
+
+        def apply(flat: Doc, broken: Doc): Doc =
+            if flat == broken then flat
+            else Choice(flat, broken, id)
+
+        def apply(alts: Chunk[Doc]): Doc =
+            if alts.isEmpty then empty
+            else if alts.length == 1 then alts.head
+            else alts.reduceRight((flat, broken) => apply(flat, broken))
+
+        def apply(alts: Doc*): Doc =
+            apply(Chunk.from(alts))
+
+        def or(flat: Doc, broken: Doc): Doc =
+            apply(flat, broken)
+
+        val spaceOrNewline: Doc =
+            apply(singleSpace, newline)
+
+        val emptyOrNewline: Doc =
+            apply(empty, newline)
+    end ChoiceFactory
     case class Clause(
         policy: Doc.ClausePolicy,
         open: Doc,
@@ -202,12 +240,31 @@ object Doc:
                 case _ =>
                     Indent(spaces, doc)
 
+    private val nextGroupId = new java.util.concurrent.atomic.AtomicInteger(0)
+
     def group(doc: Doc): Doc =
         if (doc eq Empty) || doc.isInstanceOf[Group] then doc
         else Group(doc)
 
     def grouped(doc: Doc): Doc =
         group(doc)
+
+    /** Builds a scoped group whose layout choices are coordinated together.
+      *
+      * Passes a [[ChoiceFactory]] to `f`, allowing choices created within the
+      * block to share an all-or-nothing layout decision: either the entire
+      * group fits flat within the available line width, or all choices adopt
+      * their broken alternatives.
+      */
+    def group(f: ChoiceFactory => Doc): Doc =
+        val factory = ChoiceFactory(nextGroupId.getAndIncrement())
+        val body    = f(factory)
+        if body eq Empty then Empty
+        else Group(body, factory.id)
+    end group
+
+    def grouped(f: ChoiceFactory => Doc): Doc =
+        group(f)
 
     private val nextAlignmentId = new java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -523,11 +580,11 @@ object Doc:
 
     private def resolveSeparators(sep: Doc): (Doc, Doc) =
         sep match
-            case Choice(flat, broken) => (broken, flat)
-            case Newline              => (Newline, singleSpace)
-            case HardNewline          => (HardNewline, singleSpace)
-            case Empty                => (newline, Empty)
-            case _                    =>
+            case Choice(flat, broken, _) => (broken, flat)
+            case Newline                 => (Newline, singleSpace)
+            case HardNewline             => (HardNewline, singleSpace)
+            case Empty                   => (newline, Empty)
+            case _                       =>
                 val stripped = stripTrailingSpace(sep)
                 if stripped ne sep then
                     (stripped.append(newline), sep)
