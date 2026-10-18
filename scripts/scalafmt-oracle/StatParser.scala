@@ -4,7 +4,8 @@
 // free of top-level statements: scala-cli hoists it as plain definitions.
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
+import java.nio.file.Files
+import java.nio.file.Path
 import scala.collection.mutable
 import scala.util.matching.Regex
 
@@ -26,6 +27,7 @@ object StatParser:
         else if trimmed.startsWith("SKIP ") then (trimmed.drop(5), Some("SKIP"))
         else if trimmed == "ONLY" || trimmed == "SKIP" then ("", Some(trimmed))
         else (name, None)
+        end if
     end stripMarker
 
     /** Parses one .stat file the way scalafmt's HasTests.parseDiffTests does.
@@ -33,10 +35,10 @@ object StatParser:
       * that upstream CI would reject.
       */
     def parseStat(path: Path, family: String): Option[List[(String, Fixture)]] =
-        val content    = new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
-        val sep        = if content.contains("\r\n") then "\r\n" else "\n"
-        val splitIdx   = content.indexOf(s"${sep}<<< ")
-        val firstIdx   =
+        val content  = new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
+        val sep      = if content.contains("\r\n") then "\r\n" else "\n"
+        val splitIdx = content.indexOf(s"${sep}<<< ")
+        val firstIdx =
             if content.startsWith("<<< ") then 0
             else if splitIdx >= 0 then splitIdx + sep.length
             else -1
@@ -57,20 +59,25 @@ object StatParser:
             val m = regex.findFirstMatchIn(chunk).getOrElse(
                 sys.error(s"invalid test block in $path:\n$chunk")
             )
-            val rawName = m.group(1)
+            val rawName        = m.group(1)
             val (name, marker) = stripMarker(rawName)
             marker match
                 case Some("SKIP") => // dropped: upstream would not run it
-                case _ =>
+                case _            =>
                     val extra = Option(m.group(2)).getOrElse("")
-                    out += ((name, Fixture(
-                        id = s"$family/${path.getFileName}:$name",
-                        family = family,
-                        style = style,
-                        extraConfig = extra,
-                        original = m.group(3),
-                        expected = m.group(5).trim + "\n"
-                    )))
+                    out +=
+                        ((
+                            name,
+                            Fixture(
+                                id = s"$family/${path.getFileName}:$name",
+                                family = family,
+                                style = style,
+                                extraConfig = extra,
+                                original = m.group(3),
+                                expected = m.group(5).trim + "\n"
+                            )
+                        ))
+            end match
         end for
         Some(out.toList)
     end parseStat
