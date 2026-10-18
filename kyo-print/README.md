@@ -12,7 +12,7 @@ val args = Chunk(Doc.text("alpha"), Doc.text("beta"), Doc.text("gamma"))
 
 # kyo-print
 
-A `Doc` is a description of a layout, not a string. You build an immutable tree of text, indentation, line breaks, and grouped alternatives; nothing decides where lines break until a `Printer` renders the tree against a column budget. The same `Doc` renders wide, narrow, or fully minified without being rebuilt. The vocabulary is small: soft line breaks (`Doc.newline`) collapse to a single space when their enclosing group fits; hard line breaks (`Doc.hardNewline`) always emit a newline; `Doc.group` marks a region the printer may flatten as a unit; `Doc.choice` offers explicit alternative layouts that the printer selects between; `Doc.indent` and `Doc.align` control where broken lines continue.
+A `Doc` is a description of a layout, not a string. You build an immutable tree of text, indentation, line breaks, and grouped alternatives; nothing decides where lines break until a `Printer` renders the tree against a column budget. The same `Doc` renders wide, narrow, or fully minified without being rebuilt. The vocabulary builds from leaves up: atomic text and line breaks (`Doc.text`, `Doc.empty`, `Doc.newline`, `Doc.hardNewline`); sequential composition (`append`, `Doc.concat`) and indentation (`indent`); branching choices (`Doc.choice`, `or`); scoped groups coordinating layout alternatives (`Doc.group`); and first-class alignment markers (`Doc.align`, `col.indent`).
 
 Documents are usually authored with the `doc` string interpolator, whose source indentation is normalized away so templates read like their output, and rendered with one of three engines: `Printer.greedy` (linear-time Wadler-Lindig lookahead), `Printer.optimal` (dynamic-programming search minimizing overflow, then line count), or `Printer.compact` (minified single-line output). For code-generation work that must reproduce scalafmt's documented break styles, `ScalafmtConfig` models the relevant option subset (max column, per-site indents, dangling parens, open-paren alignment, bin-packing) as an inert configuration value; user code either maps it to the bracketing combinators or hands it to `Printer.scalafmt`, the parity engine that resolves the same options at layout time over policy-carrying clauses.
 
@@ -37,22 +37,28 @@ Reach for a `Doc` whenever produced text must adapt to a column budget: generate
 import kyo.*
 
 def widthOf(doc: Doc): Int = doc match
-    case Doc.Empty        => 0
-    case Doc.Text(text)   => text.length
-    case Doc.Indent(_, d) => widthOf(d)
-    case Doc.Align(d)     => widthOf(d)
-    case Doc.Concat(a, b) => widthOf(a) + widthOf(b)
+    case Doc.Empty           => 0
+    case Doc.Text(text)      => text.length
+    case Doc.Indent(_, d)    => widthOf(d)
+    case Doc.Align(d)        => widthOf(d)
+    case Doc.Concat(a, b)    => widthOf(a) + widthOf(b)
     case Doc.Group(d, _)     => widthOf(d)
     case Doc.Choice(_, _, _) => 0 // decided by the printer
-    case Doc.Newline      => 1
-    case Doc.HardNewline  => 0
+    case Doc.Newline         => 1
+    case Doc.HardNewline     => 0
+    case _: Doc.Alignment    => 0 // resolved at layout time
+    case _: Doc.Clause       => 0 // resolved at layout time
 
 assert(widthOf(Doc.text("abc")) == 3)
 ```
 
 > **Note:** The companion object's constructors normalize trivial cases (`Doc.text("")` yields `Doc.empty`, `Doc.char(' ')` yields the shared single-space document, `Doc.indent(0, d)` yields `d`), so a matched tree is canonical: you never see a stacked `Indent(2, Indent(3, d))` node.
 
-### Text, characters, and the empty document
+## Atomic leaves
+
+The tree leaves represent unconditional text, space, and line breaks.
+
+### Text, characters, and spaces
 
 When a document has no internal structure, the atomic constructors are `Doc.text` for a literal string, `Doc.char` for a single character, `Doc.space` for one column of space, and `Doc.empty` as the identity for concatenation.
 
@@ -86,11 +92,21 @@ assert(Printer.greedy.print(forced, 80) == "a\nb")
 
 > **Note:** A group containing a `hardNewline` can never fully flatten. The printer measures the flat form as fitting only up to the hard break, so the soft breaks around it still collapse, but the hard break itself is always emitted.
 
-### Indentation and alignment
+## Sequential composition and indentation
 
-When lines break, two documents control where the next line starts. `indent` adds a fixed margin relative to the current indentation level; `align` continues broken lines at the current output column instead of a fixed margin.
+Documents combine linearly through concatenation and indentation margins.
+
+### Concatenation and fixed indentation
+
+`append` joins two documents sequentially, and `Doc.concat` joins a collection or varargs list. When lines break, `indent` adds a fixed margin relative to the current indentation level.
 
 ```scala
+val a = Doc.text("a")
+val b = Doc.text("b")
+
+assert(a.append(b) == Doc.Concat(a, b))
+assert(Doc.concat(a, Doc.space, b) == a.append(Doc.space).append(b))
+
 val steps = Doc.text("stepOne").append(Doc.newline).append(Doc.text("stepTwo"))
 
 assert(Printer.greedy.print(steps.indent(2), 80) ==
@@ -101,29 +117,101 @@ assert(Printer.greedy.print(steps.indent(), 80) ==
     """stepOne
       |    stepTwo""".stripMargin) // default: 4 spaces
 
-val pair = Doc.text("pair: ").append(
-    Doc.align(Doc.text("one").append(Doc.newline).append(Doc.text("two")))
-)
-
-assert(Printer.greedy.print(pair, 80) ==
-    """pair: one
-      |      two""".stripMargin)
-```
-
-Nested `indent` calls merge additively into a single node, and negative indents cancel, so indentation arithmetic happens in the tree rather than accumulating wrappers:
-
-```scala
-val a = Doc.text("a")
-
 assert(a.indent(2).indent(3) == Doc.Indent(5, a))
 assert(a.indent(2).indent(-2) == a)
 ```
 
-Both `group` and `align` are idempotent (`Doc.group(Doc.group(d)) == Doc.group(d)`), and `Doc.grouped` / `Doc.aligned` are aliases of the companion methods of the same name.
+Nested `indent` calls merge additively into a single node, and negative indents cancel, so indentation arithmetic happens in the tree rather than accumulating wrappers.
+
+### Sequences and separators
+
+When a document is built from many pieces rather than two, the sequence combinators interleave a separator or wrap the whole run in delimiters, in a fixed arrangement that does not adapt to width. Each has a method form on `Chunk[Doc]` and a companion form.
+
+```scala
+val params = Chunk(Doc.text("id: Long"), Doc.text("name: String"))
+
+assert(Printer.greedy.print(params.separate(Doc.text(", ")), 80) == "id: Long, name: String")
+
+assert(
+    Printer.greedy.print(
+        params.join(Doc.text("["), Doc.text("; "), Doc.text("]")),
+        80
+    ) == "[id: Long; name: String]"
+)
+
+assert(Printer.greedy.print(Doc.stack(Doc.text("first"), Doc.text("second")), 80) ==
+    """first
+      |second""".stripMargin)
+
+assert(Printer.greedy.print(Doc.space(Doc.text("val"), Doc.text("x"), Doc.text("="), Doc.text("1")), 80) ==
+    "val x = 1")
+```
+
+`separate` places one separator document between consecutive elements; `join` additionally wraps the run in open and close delimiters. `stack` (alias `lines`) lays documents out vertically separated by soft newlines; `space` (alias `spaced`) lays them out horizontally separated by single spaces. Wrap the result in `group` to make either arrangement width-sensitive.
+
+### Delimiting a body
+
+`between` wraps a single body in open and close delimiters; `enclose` is its curried form, convenient when the same delimiters frame many different bodies. `frame` wraps each element in delimiters on both sides.
+
+```scala
+val quoted = Doc.between(Doc.text("\""), Doc.text("hello"), Doc.text("\""))
+assert(Printer.greedy.print(quoted, 80) == "\"hello\"")
+
+val parenthesized = Doc.enclose(Doc.text("("), Doc.text(")"))(Doc.text("1 + 2"))
+assert(Printer.greedy.print(parenthesized, 80) == "(1 + 2)")
+
+val framed = Doc.frame(Doc.text("|"))(Doc.text("a"), Doc.text("b"))
+assert(Printer.greedy.print(framed, 80) == "|a||b|")
+```
+
+## Branching and layout choices
+
+When the layouts you want are not just "same content, flat or broken" but genuinely different renderings, `Doc.choice` describes explicit alternatives.
+
+### Explicit alternatives
+
+The binary form is `Doc.choice(flat, broken)`. The varargs and `Chunk` forms chain alternatives right-associatively from most preferred (usually the widest flat layout) to last resort. The method `doc.or(that)` (alias `doc.fallback(that)`) delegates to `Doc.choice(doc, that)`. Identical adjacent alternatives collapse to a single document.
+
+```scala
+val flatAlt   = Doc.text("short")
+val brokenAlt = Doc.text("a very long description that breaks")
+val binary    = Doc.choice(flatAlt, brokenAlt)
+
+assert(binary == flatAlt.or(brokenAlt))
+assert(binary == flatAlt.fallback(brokenAlt))
+
+val name = Doc.choice(
+    Doc.text("long alternative that exceeds width"),
+    Doc.text("medium alt"),
+    Doc.text("short")
+)
+
+assert(Printer.optimal.print(name, 50) == "long alternative that exceeds width")
+assert(Printer.optimal.print(name, 15) == "medium alt")
+assert(Printer.optimal.print(name, 8) == "short")
+```
+
+> **Caution:** A bare `Doc.choice` outside any group always renders its broken alternative under `Printer.greedy`, because greedy only measures when it enters a `group`. Wrap choices in a group for flat-or-broken selection under `greedy`, or reach for `Printer.optimal` when a tree contains more than two alternatives per choice point.
+
+### Choice conveniences
+
+Two companion values capture the most frequent layout choices:
+
+- `Doc.spaceOrNewline`: chooses between a single space when flat and a soft newline when broken (`Doc.choice(Doc.space, Doc.newline)`).
+- `Doc.emptyOrNewline`: chooses between an empty document when flat and a soft newline when broken (`Doc.choice(Doc.empty, Doc.newline)`).
+
+```scala
+assert(Doc.spaceOrNewline == Doc.choice(Doc.space, Doc.newline))
+assert(Doc.emptyOrNewline == Doc.choice(Doc.empty, Doc.newline))
+```
+
+## Groups and scoped layout decisions
+
+A group establishes a boundary within which a printer evaluates whether a layout fits the available column budget.
 
 ### Groups: flat when they fit
 
-When a region should render on one line if the column budget allows and break otherwise, wrap it in `group`. This is the workhorse idiom: soft newlines inside a group are the candidate break points, and the printer decides among them by measuring whether the flattened region fits in the remaining columns.
+When a region should render on one line if the column budget allows and break otherwise, wrap it in `group`. Soft newlines inside a group are the candidate break points: if the flattened region fits in the remaining columns, every soft newline becomes a space; if not, every soft newline breaks.
 
 ```scala
 val call = Doc.group(
@@ -141,81 +229,65 @@ assert(Printer.greedy.print(call, 12) ==
       |gamma)""".stripMargin)
 ```
 
-A group is measured as a unit: if the flat form fits, every soft newline inside it becomes a space; if not, every soft newline inside it breaks. The bracketing combinators in [Breaking bracketed clauses](#breaking-bracketed-clauses) build exactly this shape for you, so most documents never assemble groups by hand.
+`Doc.group` is idempotent (`Doc.group(Doc.group(d)) == Doc.group(d)`), and `doc.group` / `Doc.grouped` are aliases.
 
-### Choices: alternative layouts
+### Scoped groups: coordinated choices
 
-When the layouts you want are not "same content, flat or broken" but genuinely different renderings, `choice` describes explicit alternatives. The binary form is `Doc.choice(broken, flat)`; the varargs and `Chunk` forms chain it right-associatively with the alternatives ordered from most preferred (usually the widest) to last resort, and `d.fallback(that)` is `Doc.choice(d, that)`. Identical adjacent alternatives collapse to a single document.
+When formatting structured code (argument lists, collection literals, control flow), related delimiters and separators must make an all-or-nothing decision together: either the entire block fits flat, or all related choices adopt their broken alternative.
 
-```scala
-val name = Doc.choice(
-    Doc.text("long alternative that exceeds width"),
-    Doc.text("medium alt"),
-    Doc.text("short")
-)
-
-assert(Printer.optimal.print(name, 50) == "long alternative that exceeds width")
-assert(Printer.optimal.print(name, 15) == "medium alt")
-assert(Printer.optimal.print(name, 8) == "short")
-```
-
-> **Caution:** A bare `Doc.choice` outside any group always renders its first (broken) alternative under `Printer.greedy`, because greedy only measures when it enters a `group`. Wrap a binary choice in a group for flat-or-broken selection under `greedy` (this is what `chop` and friends do internally), and reach for `Printer.optimal` when a tree contains more than two alternatives per choice point.
-
-## Sequences and separators
-
-When a document is built from many pieces rather than two, the sequence combinators interleave a separator or wrap the whole run in delimiters, in a fixed arrangement that does not adapt to width. Each has a method form on `Chunk[Doc]` and a companion form.
-
-### Interleaving with a separator
-
-`separate` places one separator document between consecutive elements; `join` additionally wraps the run in open and close delimiters.
+Passing a block `Doc.group { choice => ... }` gives you a `ChoiceFactory`. Choices created through `choice(flat, broken)`, `choice.spaceOrNewline`, `choice.emptyOrNewline`, or `choice.or` share the group's layout decision:
 
 ```scala
-val params = Chunk(Doc.text("id: Long"), Doc.text("name: String"))
+val invocation = Doc.group { choice =>
+    Doc.concat(
+        Doc.text("send("),
+        choice(Doc.empty, Doc.newline.indent(4)),
+        Doc.text("alpha,"),
+        choice(Doc.space, Doc.newline.indent(4)),
+        Doc.text("beta,"),
+        choice(Doc.space, Doc.newline.indent(4)),
+        Doc.text("gamma)")
+    )
+}
 
-assert(Printer.greedy.print(params.separate(Doc.text(", ")), 80) == "id: Long, name: String")
-
-assert(
-    Printer.greedy.print(
-        params.join(Doc.text("["), Doc.text("; "), Doc.text("]")),
-        80
-    ) == "[id: Long; name: String]"
-)
+assert(Printer.greedy.print(invocation, 80) == "send(alpha, beta, gamma)")
+assert(Printer.greedy.print(invocation, 15) ==
+    """send(
+      |    alpha,
+      |    beta,
+      |    gamma)""".stripMargin)
 ```
 
-An empty chunk yields `Doc.empty` from `separate` and the concatenated delimiters from `join`; a single-element chunk yields the element with no separator.
-
-### Vertical and horizontal layout
-
-`stack` (alias `lines`) lays documents out vertically separated by soft newlines; `space` (alias `spaced`) lays them out horizontally separated by single spaces. Neither adapts to width on its own: `stack` always breaks its soft newlines and `space` never breaks them. Wrap the result in `group` to make either arrangement width-sensitive.
+This coordination eliminates duplicating sub-trees to express related breaks. Nested scoped groups maintain distinct group identifiers, so nested expressions resolve their layout independently:
 
 ```scala
-assert(Printer.greedy.print(Doc.stack(Doc.text("first"), Doc.text("second")), 80) ==
-    """first
-      |second""".stripMargin)
+val nested = Doc.group { outer =>
+    Doc.concat(
+        Doc.text("outer("),
+        outer(Doc.empty, Doc.newline.indent(2)),
+        Doc.group { inner =>
+            Doc.concat(
+                Doc.text("inner("),
+                inner(Doc.empty, Doc.newline.indent(4)),
+                Doc.text("x, y)")
+            )
+        },
+        outer(Doc.empty, Doc.newline),
+        Doc.text(")")
+    )
+}
 
-assert(Printer.greedy.print(Doc.space(Doc.text("val"), Doc.text("x"), Doc.text("="), Doc.text("1")), 80) ==
-    "val x = 1")
+// When width is 15, outer breaks, but inner("inner(x, y)") fits flat in 15 columns.
+assert(Printer.greedy.print(nested, 15) == "outer(\n  inner(x, y)\n)")
 ```
 
-### Delimiting a body
+### Breaking bracketed clauses
 
-`between` wraps a single body in open and close delimiters; `enclose` is its curried form, convenient when the same delimiters frame many different bodies.
+When the structure is an open delimiter, a separator, and a close delimiter around many items (argument lists, parameter lists, collection literals), four combinators built on scoped groups provide standard breaking strategies.
 
-```scala
-val quoted = Doc.between(Doc.text("\""), Doc.text("hello"), Doc.text("\""))
-assert(Printer.greedy.print(quoted, 80) == "\"hello\"")
+All four share the shape `combinator(open, sep, close)(docs: Chunk[Doc])` with an equivalent extension method on `Chunk[Doc]`. The examples below all use `val args = Chunk(Doc.text("alpha"), Doc.text("beta"), Doc.text("gamma"))` and render it inside a `send(...)` clause.
 
-val parenthesized = Doc.enclose(Doc.text("("), Doc.text(")"))(Doc.text("1 + 2"))
-assert(Printer.greedy.print(parenthesized, 80) == "(1 + 2)")
-```
-
-## Breaking bracketed clauses
-
-When the structure is an open delimiter, a separator, and a close delimiter around many items (argument lists, parameter lists, collection literals), the interesting question is what happens when the clause does not fit. Four combinators answer it with four strategies, differing in where the close delimiter lands and how continuation lines indent. These are the layer scalafmt break styles are built from.
-
-All four share the shape `combinator(open, sep, close)(docs: Chunk[Doc])` with an equivalent method form on `Chunk[Doc]`, and all four render flat when the flat form fits the budget. The examples below all use `val args = Chunk(Doc.text("alpha"), Doc.text("beta"), Doc.text("gamma"))` and render it inside a `send(...)` clause.
-
-### `chop`: one item per line, dangling close
+#### `chop`: one item per line, dangling close
 
 When a clause breaks and the close delimiter should sit on its own line aligned with the opening (scalafmt's dangling parentheses), use `chop`. Broken items are indented by a fixed margin, 4 spaces by default, configurable as the fourth parameter.
 
@@ -239,7 +311,7 @@ assert(Printer.greedy.print(args.chop(Doc.text("send("), Doc.text(","), Doc.text
       |)""".stripMargin)
 ```
 
-### `chopClosed`: one item per line, attached close
+#### `chopClosed`: one item per line, attached close
 
 When the close delimiter should stick to the last item instead of getting its own line, use `chopClosed`. It differs from `chop` in nothing else: same broken body, same indent parameter, same flat form.
 
@@ -255,7 +327,7 @@ assert(Printer.greedy.print(callClosed, 15) ==
 
 `chop` and `chopClosed` divide the dangling question between them. When your style guide closes brackets on their own line (the scalafmt `danglingParentheses` default), use `chop`; when the close must hug the final item, use `chopClosed`.
 
-### `hang`: continuations under the opening
+#### `hang`: continuations under the opening
 
 When broken lines should align under the opening delimiter rather than at a fixed margin, use `hang`. It aligns the broken body to the output column where the opening ends, which suits short openers; it takes no indent parameter because the indent is derived from the opener.
 
@@ -268,7 +340,7 @@ assert(Printer.greedy.print(aligned, 15) ==
       |     gamma)""".stripMargin)
 ```
 
-### `wrap`: fill lines within the budget
+#### `wrap`: fill lines within the budget
 
 When items should pack onto each line as the column budget allows, like text wrapping, rather than breaking all-or-nothing, use `wrap`. Unlike the other three, it groups each separator individually, so line N can be full while line N+1 continues; the close delimiter attaches to the last item and continuation lines align under the opening.
 
@@ -293,6 +365,114 @@ assert(Printer.greedy.print(packed, 20) ==
 `chop`, `chopClosed`, and `hang` are all-or-nothing: the clause either renders flat or breaks at every separator. `wrap` fills lines greedily instead. Use the first three for code-like output where one-per-line is the broken convention; use `wrap` for data-like lists where any number of items per line is acceptable.
 
 > **Note:** For a single-element chunk, `hang` and `wrap` bypass breaking entirely and render `open + item + close` with no alternative, while `chop` and `chopClosed` still build a broken/flat choice with the lone element indented. An empty chunk renders as the concatenated delimiters for all four.
+
+## Alignment and tabular layout
+
+Alignment controls output columns dynamically during layout rather than using static indentation margins.
+
+### Aligning continuation lines
+
+`Doc.align(doc)` (alias `doc.align` or `Doc.aligned`) marks a region where broken lines continue at the current output column instead of returning to the ambient indentation level.
+
+```scala
+val pair = Doc.text("pair: ").append(
+    Doc.align(Doc.text("one").append(Doc.newline).append(Doc.text("two")))
+)
+
+assert(Printer.greedy.print(pair, 80) ==
+    """pair: one
+      |      two""".stripMargin)
+```
+
+`Doc.align` is idempotent (`Doc.align(Doc.align(d)) == Doc.align(d)`).
+
+### First-class alignment markers
+
+When content across multiple lines must line up at a shared column boundary (such as variable assignments, record fields, or type annotations), use `Doc.align { col => ... }`. The parameter `col` is a first-class `Doc.Alignment` marker.
+
+Placing `col` in the document marks a column boundary. The printer measures the width of preceding content across all lines within the align block, and pads with spaces so that the content immediately following `col` starts at the maximum column reached:
+
+```scala
+val assignments = Doc.align { col =>
+    Doc.concat(
+        Doc.text("val a "),
+        col,
+        Doc.text("= 1"),
+        Doc.newline,
+        Doc.text("val longerName "),
+        col,
+        Doc.text("= 2")
+    )
+}
+
+assert(Printer.greedy.print(assignments, 80) ==
+    """val a          = 1
+      |val longerName = 2""".stripMargin)
+```
+
+Calling `col.indent(n)` adds an offset of `n` spaces to that column boundary:
+
+```scala
+val offsetAssignments = Doc.align { col =>
+    Doc.concat(
+        Doc.text("val a "),
+        col.indent(2),
+        Doc.text("= 1"),
+        Doc.newline,
+        Doc.text("val longerName "),
+        col.indent(2),
+        Doc.text("= 2")
+    )
+}
+
+assert(Printer.greedy.print(offsetAssignments, 80) ==
+    """val a            = 1
+      |val longerName   = 2""".stripMargin)
+```
+
+Placing an alignment marker immediately following a newline aligns the continuation line to that column:
+
+```scala
+val continuation = Doc.text("prefix: ").append(
+    Doc.align { col =>
+        Doc.text("line1").append(Doc.newline).append(col).append(Doc.text("line2"))
+    }
+)
+
+assert(Printer.greedy.print(continuation, 80) ==
+    """prefix: line1
+      |        line2""".stripMargin)
+```
+
+### Multi-column alignment and tables
+
+When a layout requires multiple independent column boundaries, `Doc.align(n) { cols => ... }` allocates `n` distinct alignment markers. Each column tracks its own maximum width across all rows.
+
+This makes tabular layouts such as Markdown tables straightforward to express:
+
+```scala
+def formatRow(cols: Chunk[Doc.Alignment], cells: Chunk[String]): Doc =
+    val padded = cells.zipWithIndex.map { (text, i) =>
+        Doc.concat(Doc.space, Doc.text(text), Doc.space, cols(i))
+    }
+    Doc.concat(Doc.text("|"), Doc.join(Doc.text("|"))(padded), Doc.text("|"))
+end formatRow
+
+val table = Doc.align(3) { cols =>
+    Doc.stack(
+        formatRow(cols, Chunk("Package", "Version", "Status")),
+        formatRow(cols, Chunk(":---", ":---", ":---")),
+        formatRow(cols, Chunk("kyo-core", "0.1.0", "stable")),
+        formatRow(cols, Chunk("kyo-print", "0.1.0-SNAPSHOT", "experimental"))
+    )
+}
+
+assert(Printer.greedy.print(table, 80) ==
+    """| Package   | Version        | Status       |
+      || :---      | :---           | :---         |
+      || kyo-core  | 0.1.0          | stable       |
+      || kyo-print | 0.1.0-SNAPSHOT | experimental |""".stripMargin)
+```
 
 ## Authoring templates with the doc interpolator
 
