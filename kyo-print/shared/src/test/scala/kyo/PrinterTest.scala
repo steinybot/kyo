@@ -149,17 +149,17 @@ class PrinterTest extends kyo.test.Test[Any]:
 
         "choice" - {
             "selects flat alternative when group fits" in {
-                val doc = Doc.group(Doc.choice(broken = Doc.text("broken"), flat = Doc.text("flat")))
+                val doc = Doc.group(Doc.choice(flat = Doc.text("flat"), broken = Doc.text("broken")))
                 assert(Printer.greedy.print(doc, 10) == "flat")
             }
 
             "selects broken alternative when group overflows" in {
-                val doc = Doc.group(Doc.choice(broken = Doc.text("broken"), flat = Doc.text("flat")))
+                val doc = Doc.group(Doc.choice(flat = Doc.text("flat"), broken = Doc.text("broken")))
                 assert(Printer.greedy.print(doc, 3) == "broken")
             }
 
             "selects broken alternative outside group" in {
-                val doc = Doc.choice(broken = Doc.text("broken"), flat = Doc.text("flat"))
+                val doc = Doc.choice(flat = Doc.text("flat"), broken = Doc.text("broken"))
                 assert(Printer.greedy.print(doc, 80) == "broken")
             }
         }
@@ -310,14 +310,14 @@ class PrinterTest extends kyo.test.Test[Any]:
             }
 
             "choice selects flat alternative" in {
-                val doc = Doc.choice(broken = Doc.text("broken"), flat = Doc.text("flat"))
+                val doc = Doc.choice(flat = Doc.text("flat"), broken = Doc.text("broken"))
                 assert(Printer.compact.print(doc, 80) == "flat")
             }
 
             "nested choice selects flat alternative" in {
                 val doc = Doc.choice(
-                    broken = Doc.text("outerBroken"),
-                    flat = Doc.choice(broken = Doc.text("innerBroken"), flat = Doc.text("innerFlat"))
+                    flat = Doc.choice(flat = Doc.text("innerFlat"), broken = Doc.text("innerBroken")),
+                    broken = Doc.text("outerBroken")
                 )
                 assert(Printer.compact.print(doc, 80) == "innerFlat")
             }

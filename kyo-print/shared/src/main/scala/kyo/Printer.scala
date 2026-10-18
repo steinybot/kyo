@@ -117,7 +117,7 @@ object Printer:
                                 fits(budget, Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: rest)
                             case Doc.Group(inner) =>
                                 fits(budget, Work(head.indent, head.isFlat, inner) :: rest)
-                            case Doc.Choice(broken, flat) =>
+                            case Doc.Choice(flat, broken) =>
                                 if head.isFlat then
                                     fits(budget, Work(head.indent, true, flat) :: rest)
                                 else
@@ -193,7 +193,7 @@ object Printer:
                         case Doc.Concat(first, second) =>
                             work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
 
-                        case Doc.Choice(broken, flat) =>
+                        case Doc.Choice(flat, broken) =>
                             if head.isFlat then
                                 work = Work(head.indent, true, flat) :: work
                             else
@@ -293,7 +293,7 @@ object Printer:
                     case Doc.Concat(first, second) =>
                         work = Work(head.indent, head.isFlat, first) :: Work(head.indent, head.isFlat, second) :: work
 
-                    case Doc.Choice(broken, flat) =>
+                    case Doc.Choice(flat, broken) =>
                         if head.isFlat then
                             work = Work(head.indent, true, flat) :: work
                         else
@@ -389,7 +389,7 @@ object Printer:
                         case Doc.Group(inner) =>
                             work = inner :: work
 
-                        case Doc.Choice(_, flat) =>
+                        case Doc.Choice(flat, _) =>
                             work = flat :: work
 
                         case c: Doc.Clause =>
@@ -437,7 +437,7 @@ object Printer:
                     case Doc.Group(inner) =>
                         work = inner :: work
 
-                    case Doc.Choice(_, flat) =>
+                    case Doc.Choice(flat, _) =>
                         work = flat :: work
 
                     case c: Doc.Clause =>
@@ -650,24 +650,24 @@ object Printer:
                                     brokenMs
                                 end if
 
-                    case Doc.Choice(broken, flat) =>
+                    case Doc.Choice(flat, broken) =>
                         mode match
                             case Mode.Flat =>
                                 resolve(flat, col, indent, pendingIndent, Mode.Flat, width, memo)
                             case Mode.BrokenGroup =>
                                 resolve(broken, col, indent, pendingIndent, Mode.BrokenGroup, width, memo)
                             case Mode.General =>
-                                val brokenMs   = resolve(broken, col, indent, pendingIndent, Mode.General, width, memo)
-                                val brokenBest = brokenMs.minBy(_.cost.overflow)
-                                if brokenBest.cost.overflow == 0 then
-                                    brokenMs
+                                val flatMs   = resolve(flat, col, indent, pendingIndent, Mode.General, width, memo)
+                                val flatBest = flatMs.minBy(_.cost.overflow)
+                                if flatBest.cost.overflow == 0 then
+                                    flatMs
                                 else
-                                    val flatMs   = resolve(flat, col, indent, pendingIndent, Mode.General, width, memo)
-                                    val flatBest = flatMs.minBy(_.cost.overflow)
-                                    if flatBest.cost.overflow < brokenBest.cost.overflow then
-                                        flatMs
-                                    else
+                                    val brokenMs   = resolve(broken, col, indent, pendingIndent, Mode.General, width, memo)
+                                    val brokenBest = brokenMs.minBy(_.cost.overflow)
+                                    if brokenBest.cost.overflow < flatBest.cost.overflow then
                                         brokenMs
+                                    else
+                                        flatMs
                                     end if
                                 end if
 

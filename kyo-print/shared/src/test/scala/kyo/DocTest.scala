@@ -48,8 +48,8 @@ class DocTest extends kyo.test.Test[Any]:
 
         "Choice" in {
             val ch = Doc.Choice(a, b)
-            assert(ch.broken == a)
-            assert(ch.flat == b)
+            assert(ch.flat == a)
+            assert(ch.broken == b)
         }
 
         "Clause" in {
@@ -209,17 +209,20 @@ class DocTest extends kyo.test.Test[Any]:
         }
     }
 
-    "choice and fallback" - {
-        "fallback delegates to choice" in {
+    "choice, or, and fallback" - {
+        "or delegates to choice" in {
+            assert(a.or(b) == Doc.choice(a, b))
             assert(a.fallback(b) == Doc.choice(a, b))
         }
 
         "identical alternatives collapse" in {
             assert(Doc.choice(a, a) == a)
+            assert(a.or(a) == a)
         }
 
         "two distinct alternatives" in {
             assert(Doc.choice(a, b) == Doc.Choice(a, b))
+            assert(a.or(b) == Doc.Choice(a, b))
         }
 
         "multi-alternative choice" - {
@@ -238,6 +241,101 @@ class DocTest extends kyo.test.Test[Any]:
                 assert(Doc.choice(Chunk(a, b, c)) == Doc.Choice(a, Doc.Choice(b, c)))
             }
         }
+
+        "spaceOrNewline and emptyOrNewline" in {
+            assert(Doc.spaceOrNewline == Doc.choice(Doc.space, Doc.newline))
+            assert(Doc.emptyOrNewline == Doc.choice(Doc.empty, Doc.newline))
+        }
+    }
+
+    "concat" - {
+        "two docs" in {
+            assert(Doc.concat(a, b) == a.append(b))
+        }
+
+        "empty chunk returns empty" in {
+            assert(Doc.concat(Chunk.empty[Doc]) == Doc.empty)
+            assert(Doc.concat() == Doc.empty)
+        }
+
+        "single element" in {
+            assert(Doc.concat(Chunk(a)) == a)
+            assert(Doc.concat(a) == a)
+        }
+
+        "multiple elements" in {
+            assert(Doc.concat(Chunk(a, b, c)) == a.append(b).append(c))
+            assert(Doc.concat(a, b, c) == a.append(b).append(c))
+        }
+    }
+
+    "join, enclose, and frame" - {
+        val comma = Doc.text(",")
+        val pipe  = Doc.text("|")
+        val left  = Doc.text("(")
+        val right = Doc.text(")")
+
+        "join" - {
+            "empty collection" in {
+                assert(Doc.join(comma)() == Doc.empty)
+                assert(Doc.join(comma)(Chunk.empty[Doc]) == Doc.empty)
+            }
+
+            "single element" in {
+                assert(Doc.join(comma)(a) == a)
+                assert(Doc.join(comma)(Chunk(a)) == a)
+            }
+
+            "multiple elements" in {
+                val expected = a.append(comma).append(b).append(comma).append(c)
+                assert(Doc.join(comma)(a, b, c) == expected)
+                assert(Doc.join(comma)(Chunk(a, b, c)) == expected)
+            }
+        }
+
+        "enclose" - {
+            "single body" in {
+                assert(Doc.enclose(left, right)(a) == left.append(a).append(right))
+            }
+
+            "collection with open, sep, close" - {
+                "empty" in {
+                    assert(Doc.enclose(left, comma, right)() == left.append(right))
+                    assert(Doc.enclose(left, comma, right)(Chunk.empty[Doc]) == left.append(right))
+                }
+
+                "single element" in {
+                    assert(Doc.enclose(left, comma, right)(a) == left.append(a).append(right))
+                    assert(Doc.enclose(left, comma, right)(Chunk(a)) == left.append(a).append(right))
+                }
+
+                "multiple elements" in {
+                    val inner    = a.append(comma).append(b).append(comma).append(c)
+                    val expected = left.append(inner).append(right)
+                    assert(Doc.enclose(left, comma, right)(a, b, c) == expected)
+                    assert(Doc.enclose(left, comma, right)(Chunk(a, b, c)) == expected)
+                }
+            }
+        }
+
+        "frame" - {
+            "empty" in {
+                assert(Doc.frame(pipe)() == Doc.empty)
+                assert(Doc.frame(pipe)(Chunk.empty[Doc]) == Doc.empty)
+            }
+
+            "single element" in {
+                val expected = pipe.append(a).append(pipe)
+                assert(Doc.frame(pipe)(a) == expected)
+                assert(Doc.frame(pipe)(Chunk(a)) == expected)
+            }
+
+            "multiple elements" in {
+                val expected = pipe.append(a).append(pipe).append(b).append(pipe).append(c).append(pipe)
+                assert(Doc.frame(pipe)(a, b, c) == expected)
+                assert(Doc.frame(pipe)(Chunk(a, b, c)) == expected)
+            }
+        }
     }
 
     "pattern matching" in {
@@ -251,7 +349,7 @@ class DocTest extends kyo.test.Test[Any]:
                 case Doc.Align(d)                                    => s"align(${describe(d)})"
                 case Doc.Concat(d1, d2)                              => s"concat(${describe(d1)}, ${describe(d2)})"
                 case Doc.Group(d)                                    => s"group(${describe(d)})"
-                case Doc.Choice(broken, flat)                        => s"choice(${describe(broken)}, ${describe(flat)})"
+                case Doc.Choice(flat, broken)                        => s"choice(${describe(flat)}, ${describe(broken)})"
                 case Doc.Clause(p, open, close, elems, sep, _, _, _) =>
                     s"clause(${p.site}, ${describe(open)}, ${describe(close)}, ${elems.length}, ${describe(sep)})"
 
@@ -398,7 +496,7 @@ class DocTest extends kyo.test.Test[Any]:
         "single element" in {
             val broken   = open.append(Doc.newline).append(a.indent(4)).append(Doc.newline).append(close)
             val flat     = open.append(a).append(close)
-            val expected = Doc.group(Doc.choice(broken, flat))
+            val expected = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chop(open, sep, close)(a) == expected)
             assert(Doc.chop(open, sep, close)(Chunk(a)) == expected)
         }
@@ -410,7 +508,7 @@ class DocTest extends kyo.test.Test[Any]:
             val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
             val flatInner   = a.append(flatSep).append(b)
             val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(broken, flat))
+            val expected    = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chop(open, sep, close)(a, b) == expected)
             assert(Doc.chop(open, sep, close)(Chunk(a, b)) == expected)
         }
@@ -420,17 +518,17 @@ class DocTest extends kyo.test.Test[Any]:
             val brokenInner = a.append(brokenSep).append(b).indent(2)
             val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
             val flat        = open.append(a.append(sep.append(Doc.space)).append(b)).append(close)
-            val expected    = Doc.group(Doc.choice(broken, flat))
+            val expected    = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chop(open, sep, close, indent = 2)(a, b) == expected)
         }
 
         "choice separator preserves zero-trailing-whitespace invariant" in {
-            val commaSep    = Doc.choice(broken = Doc.text(",").append(Doc.newline), flat = Doc.text(", "))
+            val commaSep    = Doc.choice(flat = Doc.text(", "), broken = Doc.text(",").append(Doc.newline))
             val brokenInner = a.append(Doc.text(",").append(Doc.newline)).append(b).indent(4)
             val broken      = open.append(Doc.newline).append(brokenInner).append(Doc.newline).append(close)
             val flatInner   = a.append(Doc.text(", ")).append(b)
             val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(broken, flat))
+            val expected    = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chop(open, commaSep, close)(a, b) == expected)
         }
     }
@@ -448,7 +546,7 @@ class DocTest extends kyo.test.Test[Any]:
         "single element" in {
             val broken   = open.append(Doc.newline).append(a.indent(4)).append(close)
             val flat     = open.append(a).append(close)
-            val expected = Doc.group(Doc.choice(broken, flat))
+            val expected = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chopClosed(open, sep, close)(a) == expected)
             assert(Doc.chopClosed(open, sep, close)(Chunk(a)) == expected)
         }
@@ -460,7 +558,7 @@ class DocTest extends kyo.test.Test[Any]:
             val broken      = open.append(Doc.newline).append(brokenInner).append(close)
             val flatInner   = a.append(flatSep).append(b)
             val flat        = open.append(flatInner).append(close)
-            val expected    = Doc.group(Doc.choice(broken, flat))
+            val expected    = Doc.group(Doc.choice(flat, broken))
             assert(Doc.chopClosed(open, sep, close)(a, b) == expected)
             assert(Doc.chopClosed(open, sep, close)(Chunk(a, b)) == expected)
         }
@@ -486,7 +584,7 @@ class DocTest extends kyo.test.Test[Any]:
             val flatSep   = sep.append(Doc.space)
             val broken    = open.append(Doc.align(a.append(brokenSep).append(b).append(close)))
             val flat      = open.append(a.append(flatSep).append(b)).append(close)
-            val expected  = Doc.group(Doc.choice(broken, flat))
+            val expected  = Doc.group(Doc.choice(flat, broken))
             assert(Doc.hang(open, sep, close)(a, b) == expected)
             assert(Doc.hang(open, sep, close)(Chunk(a, b)) == expected)
         }
@@ -508,7 +606,7 @@ class DocTest extends kyo.test.Test[Any]:
         }
 
         "multiple elements" in {
-            val softSep  = Doc.group(Doc.choice(sep.append(Doc.newline), sep.append(Doc.space)))
+            val softSep  = Doc.group(Doc.choice(flat = sep.append(Doc.space), broken = sep.append(Doc.newline)))
             val body     = Doc.align(a.append(softSep).append(b))
             val expected = open.append(body).append(close)
             assert(Doc.wrap(open, sep, close)(a, b) == expected)

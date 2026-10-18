@@ -118,7 +118,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 case Doc.Indent(_, inner)      => flatWidth(inner)
                 case Doc.Align(inner)          => flatWidth(inner)
                 case Doc.Group(inner)          => flatWidth(inner)
-                case Doc.Choice(_, flat)       => flatWidth(flat)
+                case Doc.Choice(flat, _)       => flatWidth(flat)
                 case Doc.Concat(first, second) =>
                     for
                         a <- flatWidth(first)
@@ -242,7 +242,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                             case _                           => render(inner, base, false)
                     end if
 
-                case Doc.Choice(broken, flatAlt) =>
+                case Doc.Choice(flatAlt, broken) =>
                     render(if flat then flatAlt else broken, base, flat)
 
                 case c: Doc.Clause =>
@@ -354,7 +354,7 @@ private[kyo] object ScalafmtPrinter extends Printer:
                 case Doc.Indent(_, inner)      => docString(inner)
                 case Doc.Align(inner)          => docString(inner)
                 case Doc.Group(inner)          => docString(inner)
-                case Doc.Choice(broken, _)     => docString(broken)
+                case Doc.Choice(_, broken)     => docString(broken)
                 case _                         => ""
             end match
         end docString

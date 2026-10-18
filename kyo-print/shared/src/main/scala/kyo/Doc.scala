@@ -29,8 +29,11 @@ sealed trait Doc derives CanEqual:
     def indent(spaces: Int = 4): Doc =
         Doc.indent(spaces, this)
 
-    def fallback(that: Doc): Doc =
+    def or(that: Doc): Doc =
         Doc.choice(this, that)
+
+    def fallback(that: Doc): Doc =
+        or(that)
 
     def group: Doc =
         Doc.group(this)
@@ -60,7 +63,7 @@ object Doc:
     case class Align(doc: Doc)                 extends Doc
     case class Concat(first: Doc, second: Doc) extends Doc
     case class Group(doc: Doc)                 extends Doc
-    case class Choice(broken: Doc, flat: Doc)  extends Doc
+    case class Choice(flat: Doc, broken: Doc)  extends Doc
     case class Clause(
         policy: Doc.ClausePolicy,
         open: Doc,
@@ -207,17 +210,39 @@ object Doc:
     def aligned(doc: Doc): Doc =
         align(doc)
 
-    def choice(broken: Doc, flat: Doc): Doc =
-        if broken == flat then broken
-        else Choice(broken, flat)
+    def concat(first: Doc, second: Doc): Doc =
+        first.append(second)
+
+    def concat(docs: Chunk[Doc]): Doc =
+        if docs.isEmpty then empty
+        else if docs.length == 1 then docs.head
+        else
+            var acc = docs.head
+            var i   = 1
+            while i < docs.length do
+                acc = acc.append(docs(i))
+                i += 1
+            end while
+            acc
+
+    def concat(docs: Doc*): Doc =
+        concat(Chunk.from(docs))
+
+    def choice(flat: Doc, broken: Doc): Doc =
+        if flat == broken then flat
+        else Choice(flat, broken)
 
     def choice(alts: Chunk[Doc]): Doc =
         if alts.isEmpty then empty
         else if alts.length == 1 then alts.head
-        else alts.reduceRight(choice)
+        else alts.reduceRight((flat, broken) => choice(flat, broken))
 
     def choice(alts: Doc*): Doc =
         choice(Chunk.from(alts))
+
+    val spaceOrNewline: Doc = choice(singleSpace, newline)
+
+    val emptyOrNewline: Doc = choice(empty, newline)
 
     /** Builds a clause: a delimited element list whose break style is decided
       * at layout time by the site policy.
@@ -363,7 +388,7 @@ object Doc:
             else
                 val broken = lowerBroken(c, elems)
                 val flat   = c.open.append(separate(c.sep.append(singleSpace))(elems)).append(c.close)
-                group(choice(broken, flat))
+                group(choice(flat, broken))
             end if
         end if
     end lowerClause
@@ -371,7 +396,7 @@ object Doc:
     private def lowerExtend(c: Clause, elems: Chunk[Doc]): Doc =
         val broken = c.open.append(newline).append(separate(newline)(elems).indent(c.policy.indent))
         val flat   = c.open.append(separate(singleSpace)(elems))
-        group(choice(broken, flat))
+        group(choice(flat, broken))
     end lowerExtend
 
     private def lowerBroken(c: Clause, elems: Chunk[Doc]): Doc =
@@ -382,29 +407,61 @@ object Doc:
         else body.append(c.close)
     end lowerBroken
 
-    def separate(sep: Doc)(docs: Chunk[Doc]): Doc =
-        if docs.isEmpty then empty
-        else if docs.length == 1 then docs.head
+    def join(sep: Doc)(elems: Chunk[Doc]): Doc =
+        if elems.isEmpty then empty
+        else if elems.length == 1 then elems.head
         else
-            var acc = docs.head
+            var acc = elems.head
             var i   = 1
-            while i < docs.length do
-                acc = acc.append(sep).append(docs(i))
+            while i < elems.length do
+                acc = acc.append(sep).append(elems(i))
                 i += 1
             acc
 
+    def join(sep: Doc)(elems: Doc*): Doc =
+        join(sep)(Chunk.from(elems))
+
+    def separate(sep: Doc)(docs: Chunk[Doc]): Doc =
+        join(sep)(docs)
+
     def separate(sep: Doc)(docs: Doc*): Doc =
-        separate(sep)(Chunk.from(docs))
+        join(sep)(Chunk.from(docs))
 
     def join(start: Doc, sep: Doc, end: Doc)(docs: Chunk[Doc]): Doc =
-        if docs.isEmpty then start.append(end)
-        else start.append(separate(sep)(docs)).append(end)
+        enclose(start, sep, end)(docs)
 
     def join(start: Doc, sep: Doc, end: Doc)(docs: Doc*): Doc =
-        join(start, sep, end)(Chunk.from(docs))
+        enclose(start, sep, end)(Chunk.from(docs))
+
+    def between(open: Doc, body: Doc, close: Doc): Doc =
+        open.append(body).append(close)
+
+    def enclose(open: Doc, close: Doc)(body: Doc): Doc =
+        between(open, body, close)
+
+    def enclose(open: Doc, sep: Doc, close: Doc)(elems: Chunk[Doc]): Doc =
+        if elems.isEmpty then open.append(close)
+        else open.append(join(sep)(elems)).append(close)
+
+    def enclose(open: Doc, sep: Doc, close: Doc)(elems: Doc*): Doc =
+        enclose(open, sep, close)(Chunk.from(elems))
+
+    def frame(delim: Doc)(elems: Chunk[Doc]): Doc =
+        if elems.isEmpty then empty
+        else
+            var acc = delim
+            var i   = 0
+            while i < elems.length do
+                acc = acc.append(elems(i)).append(delim)
+                i += 1
+            end while
+            acc
+
+    def frame(delim: Doc)(elems: Doc*): Doc =
+        frame(delim)(Chunk.from(elems))
 
     def stack(docs: Chunk[Doc]): Doc =
-        separate(newline)(docs)
+        join(newline)(docs)
 
     def stack(docs: Doc*): Doc =
         stack(Chunk.from(docs))
@@ -416,7 +473,7 @@ object Doc:
         stack(Chunk.from(docs))
 
     def space(docs: Chunk[Doc]): Doc =
-        separate(singleSpace)(docs)
+        join(singleSpace)(docs)
 
     def space(first: Doc, rest: Doc*): Doc =
         space(Chunk.from(first +: rest))
@@ -426,12 +483,6 @@ object Doc:
 
     def spaced(docs: Doc*): Doc =
         space(Chunk.from(docs))
-
-    def between(open: Doc, body: Doc, close: Doc): Doc =
-        open.append(body).append(close)
-
-    def enclose(open: Doc, close: Doc)(body: Doc): Doc =
-        between(open, body, close)
 
     private def stripTrailingSpace(doc: Doc): Doc =
         doc match
@@ -446,7 +497,7 @@ object Doc:
 
     private def resolveSeparators(sep: Doc): (Doc, Doc) =
         sep match
-            case Choice(broken, flat) => (broken, flat)
+            case Choice(flat, broken) => (broken, flat)
             case Newline              => (Newline, singleSpace)
             case HardNewline          => (HardNewline, singleSpace)
             case Empty                => (newline, Empty)
@@ -467,7 +518,7 @@ object Doc:
                 else separate(brokenSep)(docs).indent(indent)
             val broken = open.append(newline).append(brokenInner).append(newline).append(close)
             val flat   = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(broken, flat))
+            group(choice(flat, broken))
 
     def chop(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
         chop(open, sep, close, 4)(docs)
@@ -490,7 +541,7 @@ object Doc:
                 else separate(brokenSep)(docs).indent(indent)
             val broken = open.append(newline).append(brokenInner).append(close)
             val flat   = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(broken, flat))
+            group(choice(flat, broken))
 
     def chopClosed(open: Doc, sep: Doc, close: Doc)(docs: Chunk[Doc]): Doc =
         chopClosed(open, sep, close, 4)(docs)
@@ -511,7 +562,7 @@ object Doc:
             val (brokenSep, flatSep) = resolveSeparators(sep)
             val broken               = open.append(align(separate(brokenSep)(docs).append(close)))
             val flat                 = open.append(separate(flatSep)(docs)).append(close)
-            group(choice(broken, flat))
+            group(choice(flat, broken))
 
     def hang(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
         hang(open, sep, close)(Chunk.from(first +: rest))
@@ -524,7 +575,7 @@ object Doc:
         else if docs.length == 1 then open.append(docs.head).append(close)
         else
             val (brokenSep, flatSep) = resolveSeparators(sep)
-            val softSep              = group(choice(brokenSep, flatSep))
+            val softSep              = group(choice(flatSep, brokenSep))
             open.append(align(separate(softSep)(docs))).append(close)
 
     def wrap(open: Doc, sep: Doc, close: Doc)(first: Doc, rest: Doc*): Doc =
