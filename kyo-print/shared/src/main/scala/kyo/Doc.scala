@@ -64,6 +64,12 @@ object Doc:
     case class Concat(first: Doc, second: Doc) extends Doc
     case class Group(doc: Doc)                 extends Doc
     case class Choice(flat: Doc, broken: Doc)  extends Doc
+
+    final case class Alignment private[kyo] (id: Int, offset: Int = 0) extends Doc derives CanEqual:
+        override def indent(spaces: Int = 4): Alignment =
+            if spaces == 0 then this
+            else Alignment(id, offset + spaces)
+    end Alignment
     case class Clause(
         policy: Doc.ClausePolicy,
         open: Doc,
@@ -203,12 +209,32 @@ object Doc:
     def grouped(doc: Doc): Doc =
         group(doc)
 
+    private val nextAlignmentId = new java.util.concurrent.atomic.AtomicInteger(0)
+
     def align(doc: Doc): Doc =
         if (doc eq Empty) || doc.isInstanceOf[Align] then doc
         else Align(doc)
 
     def aligned(doc: Doc): Doc =
         align(doc)
+
+    def align(f: Alignment => Doc): Doc =
+        val marker = Alignment(nextAlignmentId.getAndIncrement(), 0)
+        val body   = f(marker)
+        if body eq Empty then Empty
+        else Align(body)
+    end align
+
+    def align(n: Int)(f: Chunk[Alignment] => Doc): Doc =
+        if n <= 0 then
+            val body = f(Chunk.empty)
+            if body eq Empty then Empty
+            else Align(body)
+        else
+            val markers = Chunk.tabulate(n)(_ => Alignment(nextAlignmentId.getAndIncrement(), 0))
+            val body    = f(markers)
+            if body eq Empty then Empty
+            else Align(body)
 
     def concat(first: Doc, second: Doc): Doc =
         first.append(second)

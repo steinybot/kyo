@@ -207,6 +207,60 @@ class DocTest extends kyo.test.Test[Any]:
         "idempotent" in {
             assert(a.align.align == a.align)
         }
+
+        "scoped alignment marker" - {
+            "passes Alignment marker with offset 0" in {
+                var captured: Doc.Alignment = null
+                val res                     = Doc.align { col =>
+                    captured = col
+                    col.append(a)
+                }
+                assert(captured != null)
+                assert(captured.offset == 0)
+                assert(captured.id >= 0)
+                assert(res == Doc.Align(captured.append(a)))
+            }
+
+            "col.indent adds offset" in {
+                val _ = Doc.align { col =>
+                    val ind2 = col.indent(2)
+                    assert(ind2.id == col.id)
+                    assert(ind2.offset == 2)
+
+                    val ind5 = ind2.indent(3)
+                    assert(ind5.id == col.id)
+                    assert(ind5.offset == 5)
+
+                    assert(col.indent(0) eq col)
+                    a
+                }
+            }
+
+            "successive align blocks receive distinct IDs" in {
+                var id1 = -1
+                var id2 = -1
+                val _   = Doc.align { col =>
+                    id1 = col.id
+                    a
+                }
+                val _ = Doc.align { col =>
+                    id2 = col.id
+                    b
+                }
+                assert(id1 != id2)
+            }
+
+            "multi-column align produces multiple distinct markers" in {
+                val res = Doc.align(3) { cols =>
+                    assert(cols.length == 3)
+                    assert(cols(0).id != cols(1).id)
+                    assert(cols(1).id != cols(2).id)
+                    assert(cols.forall(_.offset == 0))
+                    a
+                }
+                assert(res == Doc.Align(a))
+            }
+        }
     }
 
     "choice, or, and fallback" - {
@@ -350,6 +404,7 @@ class DocTest extends kyo.test.Test[Any]:
                 case Doc.Concat(d1, d2)                              => s"concat(${describe(d1)}, ${describe(d2)})"
                 case Doc.Group(d)                                    => s"group(${describe(d)})"
                 case Doc.Choice(flat, broken)                        => s"choice(${describe(flat)}, ${describe(broken)})"
+                case Doc.Alignment(id, offset)                       => s"alignment($id, $offset)"
                 case Doc.Clause(p, open, close, elems, sep, _, _, _) =>
                     s"clause(${p.site}, ${describe(open)}, ${describe(close)}, ${elems.length}, ${describe(sep)})"
 
@@ -362,6 +417,13 @@ class DocTest extends kyo.test.Test[Any]:
         assert(describe(Doc.Concat(a, b)) == "concat(text(a), text(b))")
         assert(describe(Doc.Group(a)) == "group(text(a))")
         assert(describe(Doc.Choice(a, b)) == "choice(text(a), text(b))")
+        var testMarker: Doc.Alignment = null
+        val _                         = Doc.align { col =>
+            testMarker = col
+            a
+        }
+        assert(describe(testMarker) == s"alignment(${testMarker.id}, 0)")
+        assert(describe(testMarker.indent(4)) == s"alignment(${testMarker.id}, 4)")
         assert(
             describe(Doc.Clause(
                 Doc.ClausePolicy(

@@ -122,6 +122,8 @@ object Printer:
                                     fits(budget, Work(head.indent, true, flat) :: rest)
                                 else
                                     fits(budget, Work(head.indent, false, broken) :: rest)
+                            case Doc.Alignment(_, offset) =>
+                                fits(budget - math.max(0, offset), rest)
                             case c: Doc.Clause =>
                                 fits(budget, Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: rest)
 
@@ -198,6 +200,16 @@ object Printer:
                                 work = Work(head.indent, true, flat) :: work
                             else
                                 work = Work(head.indent, false, broken) :: work
+                            end if
+
+                        case Doc.Alignment(_, offset) =>
+                            if offset > 0 then
+                                var i = 0
+                                while i < offset do
+                                    sb.append(' ')
+                                    i += 1
+                                end while
+                                col += offset
                             end if
 
                         case c: Doc.Clause =>
@@ -300,6 +312,16 @@ object Printer:
                             work = Work(head.indent, false, broken) :: work
                         end if
 
+                    case Doc.Alignment(_, offset) =>
+                        if offset > 0 then
+                            var i = 0
+                            while i < offset do
+                                sb.append(' ')
+                                i += 1
+                            end while
+                            col += offset
+                        end if
+
                     case c: Doc.Clause =>
                         work = Work(head.indent, head.isFlat, Doc.lowerClause(c)) :: work
 
@@ -392,6 +414,15 @@ object Printer:
                         case Doc.Choice(flat, _) =>
                             work = flat :: work
 
+                        case Doc.Alignment(_, offset) =>
+                            if offset > 0 then
+                                var i = 0
+                                while i < offset do
+                                    sb.append(' ')
+                                    i += 1
+                                end while
+                            end if
+
                         case c: Doc.Clause =>
                             work = Doc.lowerClause(c) :: work
                     end match
@@ -439,6 +470,15 @@ object Printer:
 
                     case Doc.Choice(flat, _) =>
                         work = flat :: work
+
+                    case Doc.Alignment(_, offset) =>
+                        if offset > 0 then
+                            var i = 0
+                            while i < offset do
+                                sb.append(' ')
+                                i += 1
+                            end while
+                        end if
 
                     case c: Doc.Clause =>
                         work = Doc.lowerClause(c) :: work
@@ -670,6 +710,13 @@ object Printer:
                                         flatMs
                                     end if
                                 end if
+
+                    case a: Doc.Alignment =>
+                        val spaces = math.max(0, a.offset)
+                        val newCol = col + spaces
+                        val cost   = textCost(col, spaces, width)
+                        val tok    = if spaces > 0 then TText(" " * spaces) :: Nil else Nil
+                        List(Measure(newCol, pendingIndent, cost, tok))
 
                     case c: Doc.Clause =>
                         resolve(Doc.lowerClause(c), col, indent, pendingIndent, mode, width, memo)

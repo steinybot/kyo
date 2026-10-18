@@ -124,7 +124,8 @@ private[kyo] object ScalafmtPrinter extends Printer:
                         a <- flatWidth(first)
                         b <- flatWidth(second)
                     yield a + b
-                case c: Doc.Clause => clauseFlatWidth(c)
+                case Doc.Alignment(_, offset) => Some(math.max(0, offset))
+                case c: Doc.Clause            => clauseFlatWidth(c)
             end match
         end flatWidth
 
@@ -244,6 +245,9 @@ private[kyo] object ScalafmtPrinter extends Printer:
 
                 case Doc.Choice(flatAlt, broken) =>
                     render(if flat then flatAlt else broken, base, flat)
+
+                case Doc.Alignment(_, offset) =>
+                    if offset > 0 then emitText(" " * offset)
 
                 case c: Doc.Clause =>
                     if flat then renderFlatClause(c, base)
