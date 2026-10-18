@@ -293,6 +293,12 @@ object Doc:
             if body eq Empty then Empty
             else Align(body)
 
+    def aligned(f: Alignment => Doc): Doc =
+        align(f)
+
+    def aligned(n: Int)(f: Chunk[Alignment] => Doc): Doc =
+        align(n)(f)
+
     def concat(first: Doc, second: Doc): Doc =
         first.append(second)
 

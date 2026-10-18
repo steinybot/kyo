@@ -285,27 +285,27 @@ object Printer:
                                 col += 1
                             else
                                 sb.append('\n')
-                                col = head.indent
+                                col = 0
                                 pendingIndent = head.indent
                             end if
 
                         case Doc.HardNewline =>
                             sb.append('\n')
-                            col = head.indent
+                            col = 0
                             pendingIndent = head.indent
 
                         case Doc.Indent(spaces, inner) =>
                             val newIndent = head.indent + spaces
                             if pendingIndent >= 0 then
                                 pendingIndent = newIndent
-                                col = newIndent
                             end if
                             work = Work(newIndent, head.isFlat, inner, head.alignTargets, head.groupDecisions) :: work
 
                         case Doc.Align(inner) =>
-                            val innerTargets = computeAlignments(inner, col, col)
+                            val alignCol     = if pendingIndent >= 0 then math.max(col, pendingIndent) else col
+                            val innerTargets = computeAlignments(inner, alignCol, alignCol)
                             val nextTargets  = if innerTargets.isEmpty then head.alignTargets else head.alignTargets ++ innerTargets
-                            work = Work(col, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
+                            work = Work(alignCol, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
 
                         case Doc.Concat(first, second) =>
                             work = Work(head.indent, head.isFlat, first, head.alignTargets, head.groupDecisions) ::
@@ -326,11 +326,12 @@ object Printer:
                             end if
 
                         case Doc.Alignment(id, offset) =>
-                            val targetCol = head.alignTargets.get(id) match
+                            val effectiveCol = if pendingIndent >= 0 then col + math.max(0, pendingIndent) else col
+                            val targetCol    = head.alignTargets.get(id) match
                                 case Some(t) => t + offset
-                                case None    => col + math.max(0, offset)
-                            val spaces = math.max(0, targetCol - col)
-                            if spaces > 0 then
+                                case None    => effectiveCol + math.max(0, offset)
+                            val alignSpaces = math.max(0, targetCol - effectiveCol)
+                            if alignSpaces > 0 then
                                 if pendingIndent >= 0 then
                                     val indentSpaces = math.max(0, pendingIndent)
                                     var i            = 0
@@ -342,11 +343,11 @@ object Printer:
                                     pendingIndent = -1
                                 end if
                                 var i = 0
-                                while i < spaces do
+                                while i < alignSpaces do
                                     sb.append(' ')
                                     i += 1
                                 end while
-                                col += spaces
+                                col += alignSpaces
                             end if
 
                         case c: Doc.Clause =>
@@ -419,7 +420,7 @@ object Printer:
                             col += 1
                         else
                             sb.append('\n')
-                            col = head.indent
+                            col = 0
                             pendingIndent = head.indent
                             finishedLine = true
                             nextState = Some(StreamState(work, col, pendingIndent))
@@ -427,7 +428,7 @@ object Printer:
 
                     case Doc.HardNewline =>
                         sb.append('\n')
-                        col = head.indent
+                        col = 0
                         pendingIndent = head.indent
                         finishedLine = true
                         nextState = Some(StreamState(work, col, pendingIndent))
@@ -436,14 +437,14 @@ object Printer:
                         val newIndent = head.indent + spaces
                         if pendingIndent >= 0 then
                             pendingIndent = newIndent
-                            col = newIndent
                         end if
                         work = Work(newIndent, head.isFlat, inner, head.alignTargets, head.groupDecisions) :: work
 
                     case Doc.Align(inner) =>
-                        val innerTargets = computeAlignments(inner, col, col)
+                        val alignCol     = if pendingIndent >= 0 then math.max(col, pendingIndent) else col
+                        val innerTargets = computeAlignments(inner, alignCol, alignCol)
                         val nextTargets  = if innerTargets.isEmpty then head.alignTargets else head.alignTargets ++ innerTargets
-                        work = Work(col, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
+                        work = Work(alignCol, head.isFlat, inner, nextTargets, head.groupDecisions) :: work
 
                     case Doc.Concat(first, second) =>
                         work = Work(head.indent, head.isFlat, first, head.alignTargets, head.groupDecisions) ::
@@ -464,11 +465,12 @@ object Printer:
                         end if
 
                     case Doc.Alignment(id, offset) =>
-                        val targetCol = head.alignTargets.get(id) match
+                        val effectiveCol = if pendingIndent >= 0 then col + math.max(0, pendingIndent) else col
+                        val targetCol    = head.alignTargets.get(id) match
                             case Some(t) => t + offset
-                            case None    => col + math.max(0, offset)
-                        val spaces = math.max(0, targetCol - col)
-                        if spaces > 0 then
+                            case None    => effectiveCol + math.max(0, offset)
+                        val alignSpaces = math.max(0, targetCol - effectiveCol)
+                        if alignSpaces > 0 then
                             if pendingIndent >= 0 then
                                 val indentSpaces = math.max(0, pendingIndent)
                                 var i            = 0
@@ -480,11 +482,11 @@ object Printer:
                                 pendingIndent = -1
                             end if
                             var i = 0
-                            while i < spaces do
+                            while i < alignSpaces do
                                 sb.append(' ')
                                 i += 1
                             end while
-                            col += spaces
+                            col += alignSpaces
                         end if
 
                     case c: Doc.Clause =>
@@ -926,14 +928,24 @@ object Printer:
                         end match
 
                     case a: Doc.Alignment =>
-                        val targetCol = alignTargets.get(a.id) match
+                        val effectiveCol = if pendingIndent >= 0 then pendingIndent else col
+                        val targetCol    = alignTargets.get(a.id) match
                             case Some(t) => t + a.offset
-                            case None    => col + math.max(0, a.offset)
-                        val spaces = math.max(0, targetCol - col)
-                        val newCol = col + spaces
-                        val cost   = textCost(col, spaces, width)
-                        val tok    = if spaces > 0 then TText(" " * spaces) :: Nil else Nil
-                        List(Measure(newCol, pendingIndent, cost, tok))
+                            case None    => effectiveCol + math.max(0, a.offset)
+                        val spaces = math.max(0, targetCol - effectiveCol)
+                        if spaces > 0 then
+                            val newCol = effectiveCol + spaces
+                            val cost   = textCost(effectiveCol, spaces, width)
+                            val toks   =
+                                if pendingIndent >= 0 then
+                                    val ind = if pendingIndent > 0 then List(TIndent(pendingIndent)) else Nil
+                                    ind :+ TText(" " * spaces)
+                                else
+                                    List(TText(" " * spaces))
+                            List(Measure(newCol, -1, cost, toks))
+                        else
+                            List(Measure(effectiveCol, pendingIndent, Cost(0, 0), Nil))
+                        end if
 
                     case c: Doc.Clause =>
                         resolve(Doc.lowerClause(c), col, indent, pendingIndent, mode, width, memo, alignTargets, groupDecisions)

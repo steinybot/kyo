@@ -367,6 +367,27 @@ class DocTest extends kyo.test.Test[Any]:
                 }
                 assert(res == Doc.Align(a))
             }
+
+            "multi-column align with non-positive count" in {
+                var captured: Chunk[Doc.Alignment] = null
+                val res                            = Doc.align(0) { cols =>
+                    captured = cols
+                    a
+                }
+                assert(captured == Chunk.empty)
+                assert(res == Doc.Align(a))
+
+                val emptyRes = Doc.align(0) { _ => Doc.empty }
+                assert(emptyRes == Doc.empty)
+            }
+
+            "aligned aliases delegate to align" in {
+                val r1 = Doc.aligned { col => col.append(a) }
+                assert(r1.isInstanceOf[Doc.Align])
+
+                val r2 = Doc.aligned(2) { cols => cols(0).append(cols(1)) }
+                assert(r2.isInstanceOf[Doc.Align])
+            }
         }
     }
 
